@@ -1,0 +1,283 @@
+"""Single source of truth for anomaly use-cases.
+
+Each UC owns a stable slug — the slug becomes part of the NATS subject
+(`anomaly.<slug>.<severity>`) which the knx-nats-bridge writer-rules
+resolves to a KNX-GA. Once published, do NOT rename a slug; the mapping
+ConfigMap and Basalte notification rules pin to it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class UnivariateMetric:
+    """A single (CAGG, column) pair scored by z-score against the matching
+    `<source>_baseline_30d` hour×weekday profile.
+
+    `group_cols` carries the extra columns the source-CAGG groups by beyond
+    `bucket` (e.g. `inverter_id` for solaredge, `ga` for knx). The detector
+    joins per group on both sides and emits one anomaly row per group.
+    """
+
+    uc: str
+    source_cagg: str
+    baseline_cagg: str
+    metric: str
+    stats_field: str
+    group_cols: tuple[str, ...] = ()
+    severity_floor: str = "info"
+    warmup_days: int = 7
+    silenced: bool = False
+
+
+@dataclass(frozen=True)
+class IsolationForestUseCase:
+    """Multivariate features fit by IsolationForest, scored hourly.
+
+    One model per group-value combination (e.g. per inverter_id, per
+    meter_id) — a 2nd inverter doesn't poison the existing fit.
+
+    `include_hour_of_day=True` appends EXTRACT(hour FROM bucket) — used
+    for diurnal metrics (PV) where the same value can be normal at noon
+    and anomalous at midnight.
+    """
+
+    uc: str
+    source_cagg: str
+    feature_cols: tuple[str, ...]
+    group_cols: tuple[str, ...] = ()
+    include_hour_of_day: bool = False
+    lookback_days: int = 60
+    contamination: float = 0.005
+    severity_floor: str = "info"
+    warmup_days: int = 7
+    silenced: bool = False
+
+
+@dataclass(frozen=True)
+class KnxJoinUseCase:
+    """Rule-based detector against per-room KNX-Joins.
+
+    Each UC's SQL + threshold logic lives in `detect_knx_join`; this
+    registry only enumerates slugs so the dispatcher can iterate them
+    and ops can silence individual UCs without code changes.
+    """
+
+    uc: str
+    silenced: bool = False
+
+
+@dataclass(frozen=True)
+class SeasonalModel:
+    """statsforecast MSTL+AutoARIMA target metric.
+
+    Univariate for now — train_seasonal fits one model per UC over the
+    last `lookback_days` of the named CAGG column. Exogenous variables
+    (outdoor temp for heating, etc.) are a follow-up once the framework
+    proves itself.
+
+    `forecast_horizon_hours` is how far the score-job projects on each
+    run. Stored alongside the model so a registry change doesn't break
+    in-flight forecasts mid-day.
+    """
+
+    uc: str
+    source_cagg: str
+    metric: str
+    season_length: tuple[int, ...] = (24, 168)
+    lookback_days: int = 365
+    forecast_horizon_hours: int = 24
+    sigma_threshold: float = 3.0
+    severity_floor: str = "info"
+    warmup_days: int = 14
+    silenced: bool = False
+
+
+UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
+    # Heating boiler — `ems_esp_boiler_1h` × `ems_esp_boiler_baseline_30d`.
+    UnivariateMetric(
+        uc="boiler_curburnpow",
+        source_cagg="ems_esp_boiler_1h",
+        baseline_cagg="ems_esp_boiler_baseline_30d",
+        metric="curburnpow_avg",
+        stats_field="curburnpow_stats",
+    ),
+    UnivariateMetric(
+        uc="boiler_curflowtemp",
+        source_cagg="ems_esp_boiler_1h",
+        baseline_cagg="ems_esp_boiler_baseline_30d",
+        metric="curflowtemp_avg",
+        stats_field="curflowtemp_stats",
+    ),
+    UnivariateMetric(
+        uc="boiler_rettemp",
+        source_cagg="ems_esp_boiler_1h",
+        baseline_cagg="ems_esp_boiler_baseline_30d",
+        metric="rettemp_avg",
+        stats_field="rettemp_stats",
+    ),
+    UnivariateMetric(
+        uc="boiler_heatingactive",
+        source_cagg="ems_esp_boiler_1h",
+        baseline_cagg="ems_esp_boiler_baseline_30d",
+        metric="heatingactive_samples",
+        stats_field="heatingactive_stats",
+    ),
+    # DHW — `ems_esp_dhw_1h` × `ems_esp_dhw_baseline_30d`.
+    UnivariateMetric(
+        uc="dhw_curtemp",
+        source_cagg="ems_esp_dhw_1h",
+        baseline_cagg="ems_esp_dhw_baseline_30d",
+        metric="curtemp_avg",
+        stats_field="curtemp_stats",
+    ),
+    UnivariateMetric(
+        uc="dhw_curflow",
+        source_cagg="ems_esp_dhw_1h",
+        baseline_cagg="ems_esp_dhw_baseline_30d",
+        metric="curflow_avg",
+        stats_field="curflow_stats",
+    ),
+    # SolarEdge inverter — group on `inverter_id`.
+    UnivariateMetric(
+        uc="solar_ac_power",
+        source_cagg="solaredge_inverter_1h",
+        baseline_cagg="solaredge_inverter_baseline_30d",
+        metric="ac_power_avg",
+        stats_field="ac_power_stats",
+        group_cols=("inverter_id",),
+    ),
+    UnivariateMetric(
+        uc="solar_inverter_temperature",
+        source_cagg="solaredge_inverter_1h",
+        baseline_cagg="solaredge_inverter_baseline_30d",
+        metric="temperature_avg",
+        stats_field="temperature_stats",
+        group_cols=("inverter_id",),
+    ),
+    # SolarEdge powerflow — group on `inverter_id`.
+    UnivariateMetric(
+        uc="pv_production",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="pv_production_avg",
+        stats_field="pv_production_stats",
+        group_cols=("inverter_id",),
+    ),
+    UnivariateMetric(
+        uc="consumer_total",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="consumer_total_avg",
+        stats_field="consumer_total_stats",
+        group_cols=("inverter_id",),
+    ),
+    UnivariateMetric(
+        uc="grid_power",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="grid_power_avg",
+        stats_field="grid_power_stats",
+        group_cols=("inverter_id",),
+    ),
+    # Wallbox meter — group on `meter_id`.
+    UnivariateMetric(
+        uc="wallbox_power_total",
+        source_cagg="warp_meter_1h",
+        baseline_cagg="warp_meter_baseline_30d",
+        metric="power_total_avg",
+        stats_field="power_total_stats",
+        group_cols=("meter_id",),
+    ),
+    # KNX — group on `(ga, knx_name)`. One UC for all values; the anomaly
+    # row carries the GA so insights tools can join against ga_catalog
+    # for the human-readable name and the source room/function.
+    UnivariateMetric(
+        uc="knx_value",
+        source_cagg="knx_1h",
+        baseline_cagg="knx_baseline_30d",
+        metric="avg_value",
+        stats_field="value_stats",
+        group_cols=("ga", "knx_name"),
+    ),
+)
+IFOREST_USECASES: tuple[IsolationForestUseCase, ...] = (
+    # Heating boiler — single boiler, no group_cols. heatingactive_samples
+    # gives the IF a coarse "is the burner firing this hour" signal that
+    # disambiguates legitimate low-power idle from a sensor stall at zero.
+    IsolationForestUseCase(
+        uc="heating_iforest",
+        source_cagg="ems_esp_boiler_1h",
+        feature_cols=(
+            "curburnpow_avg",
+            "curflowtemp_avg",
+            "rettemp_avg",
+            "outdoortemp_avg",
+            "heatingactive_samples",
+        ),
+    ),
+    # PV powerflow — group on inverter_id; hour-of-day matters because PV
+    # production is zero by 22:00 and very different at 06:00 vs 12:00.
+    IsolationForestUseCase(
+        uc="pv_iforest",
+        source_cagg="solaredge_powerflow_1h",
+        feature_cols=(
+            "pv_production_avg",
+            "consumer_total_avg",
+            "grid_power_avg",
+            "grid_consumption_avg",
+            "grid_delivery_avg",
+        ),
+        group_cols=("inverter_id",),
+        include_hour_of_day=True,
+    ),
+    # Wallbox meter — group on meter_id. Voltage + current per phase
+    # catches phase imbalance and brownouts that power_total alone hides.
+    IsolationForestUseCase(
+        uc="wallbox_iforest",
+        source_cagg="warp_meter_1h",
+        feature_cols=(
+            "power_total_avg",
+            "voltage_l1_avg",
+            "voltage_l2_avg",
+            "voltage_l3_avg",
+            "current_l1_avg",
+            "current_l2_avg",
+            "current_l3_avg",
+        ),
+        group_cols=("meter_id",),
+    ),
+)
+KNX_JOIN_USECASES: tuple[KnxJoinUseCase, ...] = (
+    # Per-room rule: FBH-Stellwert open >50% AND room stays >=1°C below
+    # setpoint for >=2h. Detects stuck valves, bled circuits, or
+    # sensor mismatches the IF would not isolate.
+    KnxJoinUseCase(uc="fbh_cold"),
+    # Per-room rule: window open while FBH is heating with outdoor
+    # temp <12°C. Catches "heater pumping into open window" — a
+    # comfort + energy waste pattern that the Basalte UI shouldn't
+    # need to remember to surface.
+    KnxJoinUseCase(uc="window_while_heating"),
+)
+SEASONAL_MODELS: tuple[SeasonalModel, ...] = (
+    # Heating burner activity per hour — the most directly weather-
+    # sensitive signal in the house. With <2 years of data the model
+    # only learns daily + weekly seasonality (24 + 168); annual
+    # seasonality (8766) gets added once we have the data.
+    SeasonalModel(
+        uc="heating_activity_seasonal",
+        source_cagg="ems_esp_boiler_1h",
+        metric="heatingactive_samples",
+    ),
+)
+
+
+def all_slugs() -> set[str]:
+    return (
+        {m.uc for m in UNIVARIATE_METRICS}
+        | {u.uc for u in IFOREST_USECASES}
+        | {k.uc for k in KNX_JOIN_USECASES}
+        | {s.uc for s in SEASONAL_MODELS}
+    )
