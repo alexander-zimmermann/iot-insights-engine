@@ -71,8 +71,9 @@ def _fit_and_save(settings: Settings, uc: SeasonalModel, df: pd.DataFrame) -> bo
         models=[MSTL(season_length=list(uc.season_length), trend_forecaster=AutoARIMA())],
         freq="h",
     )
-    # `fitted=True` is required to populate forecast_fitted_values();
-    # plain sf.fit() does not.
+    # fit() persists the model for score_seasonal's predict(); forecast(fitted=True)
+    # is the only way to populate forecast_fitted_values() for residuals.
+    sf.fit(df=df)
     sf.forecast(df=df, h=uc.forecast_horizon_hours, fitted=True)
     fitted = sf.forecast_fitted_values()
     residuals = fitted["y"].to_numpy() - fitted["MSTL"].to_numpy()
