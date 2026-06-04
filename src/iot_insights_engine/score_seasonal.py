@@ -1,14 +1,22 @@
-"""Hourly forecast + anomaly-check for each registered seasonal UC.
+"""Hourly fit + forecast + anomaly-check per registered seasonal UC.
 
-Loads the persisted statsforecast model, generates the next
-`forecast_horizon_hours` of point estimates + sigma-based confidence
-bounds, upserts them into `mcp_forecasts`, then compares the most
-recent completed bucket against its predicted value. A deviation
-beyond `sigma_threshold * residual_stddev` becomes an anomaly row
-on `mcp_anomalies` and a `anomaly.<uc>.<severity>` NATS publish.
+Replaces the older train/score split that pickled a fitted
+StatsForecast model to rustfs — statsforecast 2.x has two API quirks
+that made the pickle path brittle (see fix history of v0.1.1 + 0.1.2).
+Now everything runs inline each hour:
 
-Cold-start safe — until train_seasonal runs once, load_model returns
-None and the UC is silently skipped.
+1. Load the last `lookback_days` of (bucket, metric) from the
+   source-CAGG into a long-form DataFrame.
+2. Fit `MSTL(season_length=[24,168]) + AutoARIMA` against it.
+3. Generate `forecast_horizon_hours` of point + sigma bounds, upsert
+   into `mcp_forecasts`.
+4. Compute residual_stddev from in-sample fitted values.
+5. Compare the most recent completed bucket against its forecast.
+   |z| >= 1σ info, >= 1.5σ warning, >= 2.5σ critical (clamped by
+   `severity_floor`); during the first `warmup_days` after a UC was
+   added everything is demoted to info.
+
+Cost: ~30s per UC per hour (MSTL+AutoARIMA fit on ~8k hourly samples).
 """
 
 from __future__ import annotations
@@ -19,31 +27,26 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import numpy as np
+import pandas as pd
 import psycopg
+from statsforecast import StatsForecast
+from statsforecast.models import MSTL, AutoARIMA
 
-from . import artifacts, nats_publisher
+from . import nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
 from .registry import SEASONAL_MODELS, SeasonalModel
-from .seasonal_common import DETECTOR_NAME, ModelEnvelope
 
 log = get_logger(__name__)
 
+DETECTOR_NAME = "seasonal"
+MIN_TRAIN_SAMPLES = 24 * 14
+
 
 def _classify(z: float, severity_floor: str) -> str | None:
-    """Severity from |z|:
-    * >=2.5 → critical
-    * >=1.5 → warning
-    * >=1.0 → info
-    Lower than info is no-anomaly.
-
-    `severity_floor` is the minimum severity that gets emitted — UCs
-    that flap at info can set floor='warning' to suppress noise without
-    losing the genuinely-actionable warning/critical events.
-    """
     abs_z = abs(z)
-    severity: str | None
     if abs_z >= 2.5:
         severity = "critical"
     elif abs_z >= 1.5:
@@ -58,11 +61,29 @@ def _classify(z: float, severity_floor: str) -> str | None:
     return severity
 
 
-def _warmup_demote(envelope: ModelEnvelope, severity: str, warmup_days: int) -> str:
-    trained_at = datetime.fromisoformat(envelope.trained_at)
-    if datetime.now(tz=UTC) - trained_at < timedelta(days=warmup_days):
-        return "info"
-    return severity
+def _warmup_active(uc_added_at: datetime, warmup_days: int) -> bool:
+    return datetime.now(tz=UTC) - uc_added_at < timedelta(days=warmup_days)
+
+
+def _load_training_frame(
+    conn: psycopg.Connection[Any], uc: SeasonalModel
+) -> pd.DataFrame:
+    sql = f"""
+        SELECT bucket AS ds, {uc.metric}::float AS y
+        FROM {uc.source_cagg}
+        WHERE bucket > now() - interval '{uc.lookback_days} days'
+          AND {uc.metric} IS NOT NULL
+        ORDER BY bucket
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["unique_id", "ds", "y"])
+    df = pd.DataFrame(rows)
+    df["ds"] = pd.to_datetime(df["ds"], utc=True).dt.tz_convert(None)
+    df["unique_id"] = uc.uc
+    return df[["unique_id", "ds", "y"]]
 
 
 def _upsert_forecast_row(
@@ -171,16 +192,46 @@ def _score_uc(
     settings: Settings, conn: psycopg.Connection[Any], uc: SeasonalModel
 ) -> tuple[int, int, int]:
     """Returns (forecast_rows, anomaly_inserts, publishes)."""
-    envelope: ModelEnvelope | None = artifacts.load_model(settings, DETECTOR_NAME, uc.uc)
-    if envelope is None:
+    df = _load_training_frame(conn, uc)
+    n_samples = int(df.shape[0])
+    if n_samples < MIN_TRAIN_SAMPLES:
+        log.info(
+            "seasonal_insufficient_samples",
+            uc=uc.uc,
+            n=n_samples,
+            min_required=MIN_TRAIN_SAMPLES,
+        )
         return 0, 0, 0
-    forecast_df = envelope.sf.predict(h=envelope.forecast_horizon_hours)
-    # statsforecast returns columns: unique_id, ds, MSTL
+
+    sf = StatsForecast(
+        models=[MSTL(season_length=list(uc.season_length), trend_forecaster=AutoARIMA())],
+        freq="h",
+    )
+    # forecast(fitted=True) fits AND returns the prediction we'll upsert
+    # below — single API call, no second predict() round-trip needed.
+    forecast_df = sf.forecast(
+        df=df, h=uc.forecast_horizon_hours, fitted=True
+    )
+    fitted = sf.forecast_fitted_values()
+    residuals = fitted["y"].to_numpy() - fitted["MSTL"].to_numpy()
+    residual_stddev = float(np.nanstd(residuals, ddof=1))
+    if residual_stddev <= 0 or math.isnan(residual_stddev):
+        log.warning("seasonal_zero_stddev", uc=uc.uc)
+        return 0, 0, 0
+
+    log.info(
+        "seasonal_fit",
+        uc=uc.uc,
+        n_samples=n_samples,
+        residual_stddev=residual_stddev,
+        season_length=list(uc.season_length),
+    )
+
+    sigma = uc.sigma_threshold * residual_stddev
     forecast_rows = 0
     for _, row in forecast_df.iterrows():
         forecast_for = row["ds"]
         value = float(row["MSTL"])
-        sigma = envelope.sigma_threshold * envelope.residual_stddev
         _upsert_forecast_row(
             conn,
             uc=uc,
@@ -191,7 +242,6 @@ def _score_uc(
         )
         forecast_rows += 1
 
-    # Now compare the last actual against its forecast (which we just wrote).
     actual_pair = _last_actual(conn, uc)
     if actual_pair is None:
         return forecast_rows, 0, 0
@@ -199,27 +249,24 @@ def _score_uc(
     actual_ts = bucket.astimezone(UTC).replace(tzinfo=None)
     match = forecast_df[forecast_df["ds"] == actual_ts]
     if match.empty:
-        log.info(
-            "seasonal_no_forecast_for_actual",
-            uc=uc.uc,
-            actual_bucket=bucket.isoformat(),
-        )
         return forecast_rows, 0, 0
     expected = float(match["MSTL"].iloc[0])
-    stddev = envelope.residual_stddev
-    if stddev <= 0 or math.isnan(stddev):
-        return forecast_rows, 0, 0
-    z = (actual - expected) / stddev
+    z = (actual - expected) / residual_stddev
     severity = _classify(z, uc.severity_floor)
     if severity is None:
         return forecast_rows, 0, 0
-    severity = _warmup_demote(envelope, severity, uc.warmup_days)
+
+    earliest = df["ds"].min()
+    uc_added_at = earliest.tz_localize(UTC) if earliest.tzinfo is None else earliest
+    if _warmup_active(uc_added_at, uc.warmup_days):
+        severity = "info"
+
     payload = {
         "actual": actual,
         "expected": expected,
         "z": z,
-        "residual_stddev": stddev,
-        "sigma_threshold": envelope.sigma_threshold,
+        "residual_stddev": residual_stddev,
+        "sigma_threshold": uc.sigma_threshold,
         "bucket": bucket.isoformat(),
     }
     inserted = _insert_anomaly(
@@ -256,7 +303,7 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                 continue
             try:
                 fc, ins, pub = _score_uc(settings, conn, uc)
-            except psycopg.Error:
+            except (psycopg.Error, ValueError):
                 log.exception("seasonal_score_failed", uc=uc.uc)
                 continue
             total_forecasts += fc
