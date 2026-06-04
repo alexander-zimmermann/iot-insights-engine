@@ -71,7 +71,9 @@ def _fit_and_save(settings: Settings, uc: SeasonalModel, df: pd.DataFrame) -> bo
         models=[MSTL(season_length=list(uc.season_length), trend_forecaster=AutoARIMA())],
         freq="h",
     )
-    sf.fit(df=df)
+    # `fitted=True` is required to populate forecast_fitted_values();
+    # plain sf.fit() does not.
+    sf.forecast(df=df, h=uc.forecast_horizon_hours, fitted=True)
     fitted = sf.forecast_fitted_values()
     residuals = fitted["y"].to_numpy() - fitted["MSTL"].to_numpy()
     residual_stddev = float(np.nanstd(residuals, ddof=1))
