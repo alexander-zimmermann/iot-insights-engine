@@ -32,10 +32,9 @@ iot-insights-engine <subcommand>
 |-------------------------|-------------------------------|--------------|
 | `detect-univariate`     | `*/15 * * * *`                | Per-metric z-score vs `<source>_baseline_30d` |
 | `detect-knx-join`       | `*/15 * * * *`                | Rule-based per-room joins (FBH-kalt, window+heating) |
-| `train-iforest`         | `30 2 * * *`                  | Daily fit of IsolationForest per (uc, group) |
-| `score-iforest`         | `5,20,35,50 * * * *`          | Score last hour against IF model |
-| `train-seasonal`        | `30 3 * * *`                  | Daily fit of MSTL+AutoARIMA per UC |
-| `score-seasonal`        | `25 * * * *`                  | Forecast 24h + anomaly-check last bucket |
+| `train-iforest`         | `30 2 * * *`                  | Daily fit of IsolationForest per (uc, group) — pickled to rustfs |
+| `score-iforest`         | `5,20,35,50 * * * *`          | Score last hour against the persisted IF model |
+| `score-seasonal`        | `25 * * * *`                  | Fit MSTL+AutoARIMA inline, forecast 24h, anomaly-check last bucket |
 | `forecast-solar`        | `15 * * * *`                  | Pull PV forecast → `mcp_forecasts` |
 | `weekly-report`         | `0 8 * * 1`                   | Weekly Markdown digest via SMTP |
 
