@@ -25,10 +25,10 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "statsforecast>=2.0.3",
     "joblib>=1.5.3",
-    "boto3>=1.43.23",
+    "boto3>=1.43.24",
     "pandas>=3.0.3",
     "numpy>=2.4.6",
-    "nats-py[nkeys]>=2.14.0",
+    "nats-py[nkeys]>=2.15.0",
 ]
 
 [project.optional-dependencies]
