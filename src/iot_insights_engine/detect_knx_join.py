@@ -1,12 +1,15 @@
-"""Rule-based detectors that JOIN `knx_1h` × `ga_catalog` to score per
-room. Two UCs:
+"""Rule-based KNX detectors. Three UCs:
 
 * ``fbh_cold`` — FBH valve open AND room stays below setpoint for >=2h.
-  Stuck valve / bled circuit / sensor mismatch.
+  Stuck valve / bled circuit / sensor mismatch. JOINs `knx_1h` × `ga_catalog`.
 * ``window_while_heating`` — window open AND FBH heating AND it's cold
-  outside. Comfort + energy-waste pattern.
+  outside. Comfort + energy-waste pattern. JOINs `knx_1h` × `ga_catalog`.
+* ``appliance_runtime`` — appliance drawing current above the standby valley
+  for several consecutive hours ("left on"), gated to normally-idle loads.
+  Reads `knx_appliance_1h` (no catalog join — the CAGG already scopes to
+  `%Stromwert` channels).
 
-Both insert into ``mcp_anomalies`` idempotently (one row per
+All insert into ``mcp_anomalies`` idempotently (one row per
 ``(time, source, metric, detector)``) and publish on
 ``anomaly.<uc>.<severity>`` only on new inserts.
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any
 
 import psycopg
@@ -43,6 +47,21 @@ WIN_STELLWERT_WARNING_PCT = 25.0
 WIN_STELLWERT_CRITICAL_PCT = 50.0
 WIN_OUTDOORTEMP_MAX_C = 12.0
 
+# appliance_runtime thresholds. An hour counts as "active" when at least half
+# its samples sit above the standby valley (the `on_samples` FILTER threshold
+# baked into knx_appliance_1h). "Left on" escalates with the trailing run of
+# consecutive active hours ending at the current bucket.
+APPLIANCE_ACTIVE_HOUR_FRACTION = 0.5
+APPLIANCE_RUNTIME_LOOKBACK_HOURS = 24
+APPLIANCE_PROFILE_DAYS = 30
+APPLIANCE_RUNTIME_INFO_HOURS = 3
+APPLIANCE_RUNTIME_WARNING_HOURS = 6
+APPLIANCE_RUNTIME_CRITICAL_HOURS = 9
+# Appliances active in more than this fraction of the last 30d of hours are
+# treated as always-on (fridge, network rack, circulation pump) and skipped —
+# "left on" is meaningless for a load that is on by design.
+APPLIANCE_NORMALLY_IDLE_MAX_RATE = 0.5
+
 
 def _classify_fbh(gap_c: float) -> str | None:
     if gap_c >= FBH_GAP_CRITICAL_C:
@@ -64,6 +83,35 @@ def _classify_window(stellwert_pct: float) -> str | None:
     return None
 
 
+def _classify_runtime(streak_hours: int) -> str | None:
+    if streak_hours >= APPLIANCE_RUNTIME_CRITICAL_HOURS:
+        return "critical"
+    if streak_hours >= APPLIANCE_RUNTIME_WARNING_HOURS:
+        return "warning"
+    if streak_hours >= APPLIANCE_RUNTIME_INFO_HOURS:
+        return "info"
+    return None
+
+
+def _trailing_active_streak(rows_desc: list[tuple[Any, bool]]) -> int:
+    """Count consecutive active, hourly-contiguous buckets from the newest.
+
+    ``rows_desc`` is ``(bucket, is_active)`` ordered newest → oldest. The run
+    ends at the first inactive hour or the first gap (buckets not exactly one
+    hour apart) — a missing hour breaks "left on" rather than bridging it.
+    """
+    streak = 0
+    prev_bucket = None
+    for bucket, is_active in rows_desc:
+        if prev_bucket is not None and (prev_bucket - bucket) != timedelta(hours=1):
+            break
+        if not is_active:
+            break
+        streak += 1
+        prev_bucket = bucket
+    return streak
+
+
 def _insert_anomaly(
     conn: psycopg.Connection[Any],
     *,
@@ -73,6 +121,7 @@ def _insert_anomaly(
     severity: str,
     score: float,
     payload: dict[str, Any],
+    source: str = SOURCE,
 ) -> bool:
     sql = """
         INSERT INTO mcp_anomalies (
@@ -91,7 +140,7 @@ def _insert_anomaly(
     with conn.cursor() as cur:
         cur.execute(
             sql,
-            (bucket, SOURCE, metric, DETECTOR_NAME, severity, uc, score, json.dumps(payload)),
+            (bucket, source, metric, DETECTOR_NAME, severity, uc, score, json.dumps(payload)),
         )
         result = cur.fetchone()
     return bool(result and result["inserted"])
@@ -258,11 +307,115 @@ def _detect_window_while_heating(
     return inserted, published
 
 
+# --- UC: appliance_runtime -------------------------------------------------
+
+_APPLIANCE_LAST_BUCKET_SQL = """
+    SELECT max(bucket) AS bucket FROM knx_appliance_1h
+    WHERE bucket <= date_trunc('hour', now()) - interval '1 hour'
+"""
+
+# Recent hours per appliance, newest first — the trailing run is walked in
+# Python (clearer than a gaps-and-islands window for a 24h slice).
+_APPLIANCE_RECENT_SQL = f"""
+    WITH lb AS ({_APPLIANCE_LAST_BUCKET_SQL})
+    SELECT ga, knx_name, bucket, on_samples, total_samples
+    FROM knx_appliance_1h
+    WHERE bucket >  (SELECT bucket FROM lb)
+                    - interval '{APPLIANCE_RUNTIME_LOOKBACK_HOURS} hours'
+      AND bucket <= (SELECT bucket FROM lb)
+    ORDER BY ga, knx_name, bucket DESC
+"""
+
+# 30d active-rate per appliance — the always-on gate.
+_APPLIANCE_PROFILE_SQL = f"""
+    WITH lb AS ({_APPLIANCE_LAST_BUCKET_SQL})
+    SELECT ga, knx_name,
+      avg((total_samples > 0
+           AND on_samples::float / NULLIF(total_samples, 0)
+               >= {APPLIANCE_ACTIVE_HOUR_FRACTION})::int::float) AS active_rate
+    FROM knx_appliance_1h
+    WHERE bucket >  (SELECT bucket FROM lb)
+                    - interval '{APPLIANCE_PROFILE_DAYS} days'
+      AND bucket <= (SELECT bucket FROM lb)
+    GROUP BY ga, knx_name
+"""
+
+
+def _hour_is_active(on_samples: int | None, total_samples: int | None) -> bool:
+    if not total_samples or on_samples is None:
+        return False
+    return (on_samples / total_samples) >= APPLIANCE_ACTIVE_HOUR_FRACTION
+
+
+def _detect_appliance_runtime(
+    conn: psycopg.Connection[Any], settings: Settings
+) -> tuple[int, int]:
+    with conn.cursor() as cur:
+        cur.execute(_APPLIANCE_LAST_BUCKET_SQL)
+        lb_row = cur.fetchone()
+        last_bucket = lb_row["bucket"] if lb_row else None
+        if last_bucket is None:
+            return 0, 0
+        cur.execute(_APPLIANCE_PROFILE_SQL)
+        active_rate = {
+            (r["ga"], r["knx_name"]): float(r["active_rate"])
+            for r in cur.fetchall()
+            if r["active_rate"] is not None
+        }
+        cur.execute(_APPLIANCE_RECENT_SQL)
+        recent = cur.fetchall()
+
+    # Group the (already bucket-DESC ordered) recent rows per appliance.
+    by_appliance: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in recent:
+        by_appliance.setdefault((row["ga"], row["knx_name"]), []).append(row)
+
+    inserted = published = 0
+    for (ga, knx_name), rows in by_appliance.items():
+        # Must be active in the current bucket to count as "left on".
+        if rows[0]["bucket"] != last_bucket:
+            continue
+        # Always-on loads (high active-rate) are on by design — skip.
+        rate = active_rate.get((ga, knx_name))
+        if rate is None or rate >= APPLIANCE_NORMALLY_IDLE_MAX_RATE:
+            continue
+        streak = _trailing_active_streak(
+            [(r["bucket"], _hour_is_active(r["on_samples"], r["total_samples"])) for r in rows]
+        )
+        severity = _classify_runtime(streak)
+        if severity is None:
+            continue
+        payload = {
+            "ga": ga,
+            "knx_name": knx_name,
+            "streak_hours": streak,
+            "active_rate_30d": round(rate, 3),
+            "bucket": last_bucket.isoformat(),
+        }
+        ok = _insert_anomaly(
+            conn,
+            bucket=last_bucket,
+            uc="appliance_runtime",
+            room=f"{ga},{knx_name}",
+            severity=severity,
+            score=float(streak),
+            payload=payload,
+            source="knx_appliance_1h",
+        )
+        if not ok:
+            continue
+        inserted += 1
+        _publish(settings, "appliance_runtime", severity, payload)
+        published += 1
+    return inserted, published
+
+
 # --- dispatcher ------------------------------------------------------------
 
 _DETECTORS = {
     "fbh_cold": _detect_fbh_cold,
     "window_while_heating": _detect_window_while_heating,
+    "appliance_runtime": _detect_appliance_runtime,
 }
 
 

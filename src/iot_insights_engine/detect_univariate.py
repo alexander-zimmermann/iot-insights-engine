@@ -57,6 +57,27 @@ def _classify(zscore: float) -> str | None:
     return None
 
 
+def _zscore(
+    actual: float, mean: float, stddev: float, metric: UnivariateMetric
+) -> float | None:
+    """Z-score with a stddev floor and a deadband, both per-metric and each
+    expressible absolutely and/or relative to ``|mean|``.
+
+    The floor stops a near-constant baseline (variance → 0) from producing
+    absurd scores — e.g. a lux channel sitting at ~0.10 overnight where a
+    0.14-vs-0.10 wobble otherwise lands at ``z ≈ 4e15``. The deadband drops
+    deviations too small to be worth surfacing. With the defaults (0.0) this
+    reduces to the textbook ``(actual - mean) / stddev``.
+    """
+    eff_std = max(stddev, metric.min_stddev_rel * abs(mean), metric.min_stddev_abs)
+    if eff_std <= 0:
+        return None
+    deadband = max(metric.deadband_abs, metric.deadband_rel * abs(mean))
+    if abs(actual - mean) < deadband:
+        return None
+    return float((actual - mean) / eff_std)
+
+
 def _scan_metric(
     conn: psycopg.Connection[Any], metric: UnivariateMetric
 ) -> list[_Hit]:
@@ -76,6 +97,10 @@ def _scan_metric(
         else "TRUE"
     )
     outer_group_by_clause = f", {outer_group_select}" if outer_group_select else ""
+    # Optional row-level scope on the source CAGG (e.g. exclude bursty
+    # appliance channels that a dedicated detector owns). Trusted registry
+    # input, never user data.
+    source_filter_clause = f"AND {metric.source_filter}" if metric.source_filter else ""
 
     sql = f"""
         WITH last_bucket AS (
@@ -85,6 +110,7 @@ def _scan_metric(
                 SELECT max(bucket) FROM {metric.source_cagg}
                 WHERE bucket <= date_trunc('hour', now()) - interval '1 hour'
             )
+            {source_filter_clause}
         )
         SELECT
             lb.bucket{outer_group_select_prefix},
@@ -107,11 +133,13 @@ def _scan_metric(
             actual = row["actual"]
             mean = row["mean"]
             stddev = row["stddev"]
-            if actual is None or mean is None or stddev is None or stddev == 0:
+            if actual is None or mean is None or stddev is None:
                 continue
             if math.isnan(actual) or math.isnan(mean) or math.isnan(stddev):
                 continue
-            zscore = (actual - mean) / stddev
+            zscore = _zscore(float(actual), float(mean), float(stddev), metric)
+            if zscore is None:
+                continue
             severity = _classify(zscore)
             if severity is None:
                 continue

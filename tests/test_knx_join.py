@@ -7,7 +7,16 @@ smoke tests after deploy. Here we exercise the pure-Python classification
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from iot_insights_engine import detect_knx_join, registry
+
+
+def _hours(*active: bool) -> list[tuple[datetime, bool]]:
+    """Build newest→oldest hourly (bucket, is_active) rows from `active[0]`
+    as the most recent hour."""
+    base = datetime(2026, 6, 8, 20, tzinfo=UTC)
+    return [(base - timedelta(hours=i), a) for i, a in enumerate(active)]
 
 
 def test_classify_fbh_thresholds() -> None:
@@ -70,3 +79,46 @@ def test_classify_window_constants_monotonic() -> None:
         < detect_knx_join.WIN_STELLWERT_WARNING_PCT
         < detect_knx_join.WIN_STELLWERT_CRITICAL_PCT
     )
+
+
+def test_classify_runtime_thresholds() -> None:
+    assert detect_knx_join._classify_runtime(2) is None
+    assert detect_knx_join._classify_runtime(3) == "info"
+    assert detect_knx_join._classify_runtime(5) == "info"
+    assert detect_knx_join._classify_runtime(6) == "warning"
+    assert detect_knx_join._classify_runtime(8) == "warning"
+    assert detect_knx_join._classify_runtime(9) == "critical"
+
+
+def test_classify_runtime_constants_monotonic() -> None:
+    assert (
+        detect_knx_join.APPLIANCE_RUNTIME_INFO_HOURS
+        < detect_knx_join.APPLIANCE_RUNTIME_WARNING_HOURS
+        < detect_knx_join.APPLIANCE_RUNTIME_CRITICAL_HOURS
+    )
+
+
+def test_hour_is_active() -> None:
+    # >=50% of samples above the standby valley → active.
+    assert detect_knx_join._hour_is_active(30, 60) is True
+    assert detect_knx_join._hour_is_active(29, 60) is False
+    assert detect_knx_join._hour_is_active(0, 60) is False
+    # No samples / null → not active (never bridges a streak).
+    assert detect_knx_join._hour_is_active(0, 0) is False
+    assert detect_knx_join._hour_is_active(None, 0) is False
+
+
+def test_trailing_active_streak_counts_from_newest() -> None:
+    assert detect_knx_join._trailing_active_streak(_hours(True, True, True)) == 3
+    # Stops at the first inactive hour, even with active hours behind it.
+    assert detect_knx_join._trailing_active_streak(_hours(True, False, True)) == 1
+    # Not currently active → no streak.
+    assert detect_knx_join._trailing_active_streak(_hours(False, True, True)) == 0
+    assert detect_knx_join._trailing_active_streak([]) == 0
+
+
+def test_trailing_active_streak_breaks_on_gap() -> None:
+    base = datetime(2026, 6, 8, 20, tzinfo=UTC)
+    # 20:00 active, then a 2h gap to 18:00 active → streak is just the newest.
+    rows = [(base, True), (base - timedelta(hours=2), True)]
+    assert detect_knx_join._trailing_active_streak(rows) == 1

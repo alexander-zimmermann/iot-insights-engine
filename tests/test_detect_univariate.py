@@ -9,6 +9,27 @@ tests after deploy. Here we only exercise the pure-Python helpers.
 from __future__ import annotations
 
 from iot_insights_engine import detect_univariate, registry
+from iot_insights_engine.registry import UnivariateMetric
+
+
+def _metric(
+    *,
+    min_stddev_rel: float = 0.0,
+    min_stddev_abs: float = 0.0,
+    deadband_abs: float = 0.0,
+    deadband_rel: float = 0.0,
+) -> UnivariateMetric:
+    return UnivariateMetric(
+        uc="t",
+        source_cagg="x_1h",
+        baseline_cagg="x_baseline_30d",
+        metric="v",
+        stats_field="v_stats",
+        min_stddev_rel=min_stddev_rel,
+        min_stddev_abs=min_stddev_abs,
+        deadband_abs=deadband_abs,
+        deadband_rel=deadband_rel,
+    )
 
 
 def test_classify_thresholds() -> None:
@@ -20,6 +41,39 @@ def test_classify_thresholds() -> None:
     assert detect_univariate._classify(-5.9) == "warning"
     assert detect_univariate._classify(6.0) == "critical"
     assert detect_univariate._classify(-10.0) == "critical"
+
+
+def test_zscore_plain_default() -> None:
+    """With default knobs (0.0) the score is the textbook z-score."""
+    m = _metric()
+    assert detect_univariate._zscore(10.0, 4.0, 2.0, m) == 3.0
+    # Degenerate variance with no floor → skipped (no division by zero).
+    assert detect_univariate._zscore(0.14, 0.10, 0.0, m) is None
+
+
+def test_zscore_stddev_floor_tames_near_constant() -> None:
+    """The lux 1e15 case: tiny stddev + a relative floor → sane, sub-threshold."""
+    m = _metric(min_stddev_rel=0.15, deadband_rel=0.25)
+    z = detect_univariate._zscore(0.14, 0.10, 1e-17, m)
+    # eff_std = max(1e-17, 0.15*0.10) = 0.015 → z = 0.04/0.015 ≈ 2.67, not 4e15.
+    assert z is not None
+    assert abs(z) < detect_univariate.SEVERITY_INFO_THRESHOLD
+    assert detect_univariate._classify(z) is None
+
+
+def test_zscore_relative_deadband_drops_trivial_deviation() -> None:
+    m = _metric(min_stddev_rel=0.15, deadband_rel=0.25)
+    # 0.11 vs 0.10 → |dev| 0.01 < 0.25*0.10 = 0.025 → dropped outright.
+    assert detect_univariate._zscore(0.11, 0.10, 1e-17, m) is None
+
+
+def test_zscore_absolute_floor_and_deadband_appliance_standby() -> None:
+    m = _metric(min_stddev_rel=0.10, min_stddev_abs=5.0, deadband_abs=20.0)
+    # Standby creep 43 → 300 fires hard (phantom load).
+    z = detect_univariate._zscore(300.0, 43.0, 0.5, m)
+    assert z is not None and detect_univariate._classify(z) == "critical"
+    # A 43 → 50 wobble is below the 20-unit deadband → dropped.
+    assert detect_univariate._zscore(50.0, 43.0, 0.5, m) is None
 
 
 def test_registry_slugs_unique() -> None:
