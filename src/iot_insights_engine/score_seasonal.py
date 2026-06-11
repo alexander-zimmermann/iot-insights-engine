@@ -13,8 +13,10 @@ Now everything runs inline each hour:
 4. Compute residual_stddev from in-sample fitted values.
 5. Compare the most recent completed bucket against its forecast.
    |z| >= 1σ info, >= 1.5σ warning, >= 2.5σ critical (clamped by
-   `severity_floor`); during the first `warmup_days` after a UC was
-   added everything is demoted to info.
+   `severity_floor`). While the earliest sample in the lookback window
+   is younger than `warmup_days` (proxy for "UC recently added with
+   little history") everything is demoted to info; with a full
+   lookback of data the model is mature and warmup never triggers.
 
 Cost: ~30s per UC per hour (MSTL+AutoARIMA fit on ~8k hourly samples).
 """
@@ -38,6 +40,7 @@ from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
 from .registry import SEASONAL_MODELS, SeasonalModel
+from .severity import escalated, meets_floor
 
 log = get_logger(__name__)
 
@@ -55,8 +58,7 @@ def _classify(z: float, severity_floor: str) -> str | None:
         severity = "info"
     else:
         return None
-    order = ["info", "warning", "critical"]
-    if order.index(severity) < order.index(severity_floor):
+    if not meets_floor(severity, severity_floor):
         return None
     return severity
 
@@ -152,8 +154,15 @@ def _insert_anomaly(
     z: float,
     severity: str,
     payload: dict[str, Any],
-) -> bool:
+) -> tuple[bool, str | None]:
+    """Returns (inserted, old_severity) — old_severity is the
+    pre-statement value on conflict (NULL on fresh insert) so the
+    caller can re-publish on escalation."""
     sql = """
+        WITH existing AS (
+            SELECT severity FROM mcp_anomalies
+            WHERE time = %s AND source = %s AND metric = %s AND detector = %s
+        )
         INSERT INTO mcp_anomalies (
             time, source, metric, detector, severity, uc,
             actual, expected, score, payload
@@ -166,12 +175,17 @@ def _insert_anomaly(
             score    = EXCLUDED.score,
             payload  = EXCLUDED.payload,
             uc       = EXCLUDED.uc
-        RETURNING xmax = 0 AS inserted
+        RETURNING xmax = 0 AS inserted,
+                  (SELECT severity FROM existing) AS old_severity
     """
     with conn.cursor() as cur:
         cur.execute(
             sql,
             (
+                bucket,
+                uc.source_cagg,
+                uc.metric,
+                DETECTOR_NAME,
                 bucket,
                 uc.source_cagg,
                 uc.metric,
@@ -185,7 +199,9 @@ def _insert_anomaly(
             ),
         )
         result = cur.fetchone()
-    return bool(result and result["inserted"])
+    if not result:
+        return False, None
+    return bool(result["inserted"]), result["old_severity"]
 
 
 def _score_uc(
@@ -230,7 +246,9 @@ def _score_uc(
     sigma = uc.sigma_threshold * residual_stddev
     forecast_rows = 0
     for _, row in forecast_df.iterrows():
-        forecast_for = row["ds"]
+        # ds is UTC-naive (tz stripped before the fit) — re-attach UTC so
+        # the TIMESTAMPTZ insert doesn't depend on the session timezone.
+        forecast_for = row["ds"].tz_localize(UTC)
         value = float(row["MSTL"])
         _upsert_forecast_row(
             conn,
@@ -269,7 +287,7 @@ def _score_uc(
         "sigma_threshold": uc.sigma_threshold,
         "bucket": bucket.isoformat(),
     }
-    inserted = _insert_anomaly(
+    inserted, old_severity = _insert_anomaly(
         conn,
         uc=uc,
         bucket=bucket,
@@ -279,7 +297,8 @@ def _score_uc(
         severity=severity,
         payload=payload,
     )
-    if not inserted:
+    inserts = 1 if inserted else 0
+    if not inserted and not escalated(old_severity, severity):
         return forecast_rows, 0, 0
     try:
         nats_publisher.publish_anomaly(
@@ -288,10 +307,10 @@ def _score_uc(
             severity=severity,
             payload={"source": uc.source_cagg, "metric": uc.metric, **payload},
         )
-        return forecast_rows, 1, 1
+        return forecast_rows, inserts, 1
     except Exception:
         log.exception("nats_publish_failed", uc=uc.uc)
-        return forecast_rows, 1, 0
+        return forecast_rows, inserts, 0
 
 
 def run(settings: Settings, _argv: Sequence[str]) -> int:

@@ -11,7 +11,8 @@
 
 All insert into ``mcp_anomalies`` idempotently (one row per
 ``(time, source, metric, detector)``) and publish on
-``anomaly.<uc>.<severity>`` only on new inserts.
+``anomaly.<uc>.<severity>`` only on new inserts or severity
+escalations.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
 from .registry import KNX_JOIN_USECASES
+from .severity import escalated
 
 log = get_logger(__name__)
 
@@ -122,8 +124,15 @@ def _insert_anomaly(
     score: float,
     payload: dict[str, Any],
     source: str = SOURCE,
-) -> bool:
+) -> tuple[bool, str | None]:
+    """Returns (inserted, old_severity) — old_severity is the
+    pre-statement value on conflict (NULL on fresh insert) so the
+    caller can re-publish on escalation."""
     sql = """
+        WITH existing AS (
+            SELECT severity FROM mcp_anomalies
+            WHERE time = %s AND source = %s AND metric = %s AND detector = %s
+        )
         INSERT INTO mcp_anomalies (
             time, source, metric, detector, severity, uc,
             actual, expected, score, payload
@@ -134,16 +143,32 @@ def _insert_anomaly(
             score    = EXCLUDED.score,
             payload  = EXCLUDED.payload,
             uc       = EXCLUDED.uc
-        RETURNING xmax = 0 AS inserted
+        RETURNING xmax = 0 AS inserted,
+                  (SELECT severity FROM existing) AS old_severity
     """
     metric = f"{uc}[{room}]"
     with conn.cursor() as cur:
         cur.execute(
             sql,
-            (bucket, source, metric, DETECTOR_NAME, severity, uc, score, json.dumps(payload)),
+            (
+                bucket,
+                source,
+                metric,
+                DETECTOR_NAME,
+                bucket,
+                source,
+                metric,
+                DETECTOR_NAME,
+                severity,
+                uc,
+                score,
+                json.dumps(payload),
+            ),
         )
         result = cur.fetchone()
-    return bool(result and result["inserted"])
+    if not result:
+        return False, None
+    return bool(result["inserted"]), result["old_severity"]
 
 
 def _publish(settings: Settings, uc: str, severity: str, payload: dict[str, Any]) -> None:
@@ -155,6 +180,10 @@ def _publish(settings: Settings, uc: str, severity: str, payload: dict[str, Any]
 
 # --- UC: fbh_cold ----------------------------------------------------------
 
+# Both SQL constants are executed WITHOUT bind parameters, so `%` is a
+# plain SQL LIKE wildcard here. If you ever add bind params, escape the
+# wildcards as `%%` — psycopg only treats `%` specially when params are
+# passed.
 _FBH_COLD_SQL = f"""
     WITH last_bucket AS (
         SELECT max(bucket) AS bucket FROM knx_1h
@@ -163,13 +192,13 @@ _FBH_COLD_SQL = f"""
     per_room AS (
         SELECT c.room,
           avg(k.avg_value) FILTER (
-            WHERE c.name LIKE '%%FBH.Stellwert-Status'
+            WHERE c.name LIKE '%FBH.Stellwert-Status'
           ) AS stellwert_pct,
           avg(k.avg_value) FILTER (
-            WHERE c.name LIKE '%%FBH.Soll-Temperatur-Status'
+            WHERE c.name LIKE '%FBH.Soll-Temperatur-Status'
           ) AS soll_c,
           avg(k.avg_value) FILTER (
-            WHERE c.name LIKE '%%Sensor.Temperatur' AND c.function = 'Sensorik'
+            WHERE c.name LIKE '%Sensor.Temperatur' AND c.function = 'Sensorik'
           ) AS ist_c
         FROM knx_1h k
         JOIN ga_catalog c ON c.ga = k.ga
@@ -212,7 +241,7 @@ def _detect_fbh_cold(
             "lookback_hours": FBH_LOOKBACK_HOURS,
             "bucket": row["bucket"].isoformat(),
         }
-        ok = _insert_anomaly(
+        ok, old_severity = _insert_anomaly(
             conn,
             bucket=row["bucket"],
             uc="fbh_cold",
@@ -221,9 +250,10 @@ def _detect_fbh_cold(
             score=gap,
             payload=payload,
         )
-        if not ok:
+        if not ok and not escalated(old_severity, severity):
             continue
-        inserted += 1
+        if ok:
+            inserted += 1
         _publish(settings, "fbh_cold", severity, payload)
         published += 1
     return inserted, published
@@ -246,12 +276,12 @@ _WINDOW_HEATING_SQL = f"""
     per_room AS (
         SELECT c.room,
           max(k.avg_value) FILTER (
-            WHERE c.name LIKE '%%Fenster%%Geöffnet-Status'
-              AND c.name NOT LIKE '%%Stellung-%%'
+            WHERE c.name LIKE '%Fenster%Geöffnet-Status'
+              AND c.name NOT LIKE '%Stellung-%'
               AND c.function = 'Sicherheit'
           ) AS window_open,
           avg(k.avg_value) FILTER (
-            WHERE c.name LIKE '%%FBH.Stellwert-Status'
+            WHERE c.name LIKE '%FBH.Stellwert-Status'
           ) AS stellwert_pct
         FROM knx_1h k
         JOIN ga_catalog c ON c.ga = k.ga
@@ -290,7 +320,7 @@ def _detect_window_while_heating(
             "outdoortemp_c": float(row["outdoortemp_c"]),
             "bucket": row["bucket"].isoformat(),
         }
-        ok = _insert_anomaly(
+        ok, old_severity = _insert_anomaly(
             conn,
             bucket=row["bucket"],
             uc="window_while_heating",
@@ -299,9 +329,10 @@ def _detect_window_while_heating(
             score=stellwert,
             payload=payload,
         )
-        if not ok:
+        if not ok and not escalated(old_severity, severity):
             continue
-        inserted += 1
+        if ok:
+            inserted += 1
         _publish(settings, "window_while_heating", severity, payload)
         published += 1
     return inserted, published
@@ -392,7 +423,7 @@ def _detect_appliance_runtime(
             "active_rate_30d": round(rate, 3),
             "bucket": last_bucket.isoformat(),
         }
-        ok = _insert_anomaly(
+        ok, old_severity = _insert_anomaly(
             conn,
             bucket=last_bucket,
             uc="appliance_runtime",
@@ -402,9 +433,10 @@ def _detect_appliance_runtime(
             payload=payload,
             source="knx_appliance_1h",
         )
-        if not ok:
+        if not ok and not escalated(old_severity, severity):
             continue
-        inserted += 1
+        if ok:
+            inserted += 1
         _publish(settings, "appliance_runtime", severity, payload)
         published += 1
     return inserted, published

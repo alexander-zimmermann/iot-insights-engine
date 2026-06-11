@@ -17,8 +17,8 @@ def write_connection(settings: Settings) -> Iterator[psycopg.Connection[DictRow]
     """Open a short-lived synchronous write connection.
 
     Batch jobs are one-shot — open, work, close. No pool, because each
-    CronJob run is a fresh process and pooling buys nothing within a
-    sub-second job lifetime.
+    CronJob run is a fresh process holding a single connection for its
+    whole lifetime; there is nothing to multiplex.
     """
     conn = psycopg.connect(
         settings.db_write_dsn,

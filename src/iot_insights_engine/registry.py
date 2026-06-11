@@ -4,6 +4,10 @@ Each UC owns a stable slug — the slug becomes part of the NATS subject
 (`anomaly.<slug>.<severity>`) which the knx-nats-bridge writer-rules
 resolves to a KNX-GA. Once published, do NOT rename a slug; the mapping
 ConfigMap and Basalte notification rules pin to it.
+
+Identifier-typed fields (CAGG/column names) are interpolated into SQL
+as-is — they MUST stay plain `[a-z0-9_]` identifiers defined in this
+file, never user/DB input. `tests/test_registry.py` enforces this.
 """
 
 from __future__ import annotations
@@ -19,6 +23,10 @@ class UnivariateMetric:
     `group_cols` carries the extra columns the source-CAGG groups by beyond
     `bucket` (e.g. `inverter_id` for solaredge, `ga` for knx). The detector
     joins per group on both sides and emits one anomaly row per group.
+
+    No `warmup_days` here — there is no trained model to mature; the
+    30d baseline-CAGG is populated from existing raw data the moment a
+    metric is registered.
     """
 
     uc: str
@@ -28,7 +36,6 @@ class UnivariateMetric:
     stats_field: str
     group_cols: tuple[str, ...] = ()
     severity_floor: str = "info"
-    warmup_days: int = 7
     silenced: bool = False
     # Robustness knobs — all default to 0.0, reducing the detector to the
     # textbook z-score for existing metrics. The effective stddev is
@@ -86,14 +93,15 @@ class KnxJoinUseCase:
 class SeasonalModel:
     """statsforecast MSTL+AutoARIMA target metric.
 
-    Univariate for now — train_seasonal fits one model per UC over the
-    last `lookback_days` of the named CAGG column. Exogenous variables
-    (outdoor temp for heating, etc.) are a follow-up once the framework
-    proves itself.
+    Univariate for now — score_seasonal fits inline each hour over the
+    last `lookback_days` of the named CAGG column (no persisted model).
+    Exogenous variables (outdoor temp for heating, etc.) are a
+    follow-up once the framework proves itself.
 
-    `forecast_horizon_hours` is how far the score-job projects on each
-    run. Stored alongside the model so a registry change doesn't break
-    in-flight forecasts mid-day.
+    `forecast_horizon_hours` is how far each run projects ahead.
+    `sigma_threshold` only sets the width of the published forecast
+    bounds (± n·residual_stddev); anomaly severity uses the fixed
+    1.0/1.5/2.5σ tiers in `score_seasonal._classify`.
     """
 
     uc: str

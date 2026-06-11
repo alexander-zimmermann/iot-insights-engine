@@ -7,17 +7,18 @@ from typing import Any
 
 from .registry import IsolationForestUseCase
 
-# Pickle envelope written by train_iforest, consumed by score_iforest.
-# `thresholds` are score_samples quantiles computed on the training set:
-# score_samples(new) < threshold → that severity (sklearn returns
-# higher = less anomalous).
 DETECTOR_NAME = "iforest"
 
 
 @dataclass(frozen=True)
 class ModelEnvelope:
-    """Persisted alongside the sklearn pipeline so the score-job knows the
-    cutoff per severity without re-reading training data."""
+    """Pickle envelope written by train_iforest, consumed by score_iforest.
+
+    The thresholds are score_samples quantiles computed on the training
+    set: score_samples(new) < threshold → that severity (sklearn returns
+    higher = less anomalous). Persisted alongside the sklearn pipeline so
+    the score-job knows the cutoff per severity without re-reading
+    training data."""
 
     pipeline: Any  # sklearn Pipeline[StandardScaler, IsolationForest]
     feature_names: tuple[str, ...]

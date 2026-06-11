@@ -80,9 +80,7 @@ def _fit_and_save(
         ]
     )
     pipeline.fit(features)
-    scores = pipeline.named_steps["iforest"].score_samples(
-        pipeline.named_steps["scaler"].transform(features)
-    )
+    scores = pipeline.score_samples(features)
     threshold_warning = float(np.quantile(scores, WARNING_QUANTILE))
     threshold_critical = float(np.quantile(scores, CRITICAL_QUANTILE))
     envelope = ModelEnvelope(
