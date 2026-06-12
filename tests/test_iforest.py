@@ -8,13 +8,29 @@ smoke tests after deploy.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from iot_insights_engine import iforest_common, registry, score_iforest, train_iforest
+from iot_insights_engine.config import Settings
 from iot_insights_engine.iforest_common import ModelEnvelope
+from iot_insights_engine.registry import IsolationForestUseCase
+
+
+def _settings() -> Settings:
+    return Settings(
+        db_host="localhost",
+        db_name="x",
+        db_username="x",
+        db_password="x",  # noqa: S106 — test stub
+        db_write_username="x",
+        db_write_password="x",  # noqa: S106 — test stub
+    )
 
 
 def test_iforest_registry_slugs_unique_and_disjoint_from_univariate() -> None:
@@ -109,3 +125,31 @@ def test_train_threshold_quantiles_match_constants() -> None:
     warn_q = float(np.quantile(scores, train_iforest.WARNING_QUANTILE))
     crit_q = float(np.quantile(scores, train_iforest.CRITICAL_QUANTILE))
     assert crit_q < warn_q
+
+
+def test_run_isolates_per_uc_score_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient S3/rustfs hiccup scoring one UC must not abort the sweep —
+    the remaining UCs are still scored and the job exits 0."""
+
+    @contextmanager
+    def fake_conn(_settings: Settings) -> Iterator[MagicMock]:
+        yield MagicMock()
+
+    monkeypatch.setattr(score_iforest, "write_connection", fake_conn)
+    monkeypatch.setattr(score_iforest, "_load_last_bucket", lambda *_: [{"bucket": 1}])
+    calls: list[str] = []
+
+    def fake_score(
+        settings: Settings, conn: object, uc: IsolationForestUseCase, rows: object
+    ) -> tuple[int, int]:
+        calls.append(uc.uc)
+        if len(calls) == 1:
+            raise RuntimeError("rustfs read timeout")
+        return 0, 0
+
+    monkeypatch.setattr(score_iforest, "_score_group", fake_score)
+
+    rc = score_iforest.run(_settings(), [])
+    assert rc == 0
+    # All UCs attempted despite the first one raising.
+    assert len(calls) == len(registry.IFOREST_USECASES)
