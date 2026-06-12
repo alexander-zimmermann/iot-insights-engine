@@ -30,6 +30,19 @@ class UnivariateMetric:
     severity_floor: str = "info"
     warmup_days: int = 7
     silenced: bool = False
+    # Robustness knobs — all default to 0.0, reducing the detector to the
+    # textbook z-score for existing metrics. The effective stddev is
+    # `max(stddev, min_stddev_rel*|mean|, min_stddev_abs)` (floors a
+    # near-constant baseline so it can't explode); a hit is dropped unless
+    # `|actual-mean| >= max(deadband_abs, deadband_rel*|mean|)`.
+    min_stddev_rel: float = 0.0
+    min_stddev_abs: float = 0.0
+    deadband_abs: float = 0.0
+    deadband_rel: float = 0.0
+    # Optional SQL predicate on the source CAGG scoping which rows are scored
+    # (trusted registry input). Used to keep bursty channels out of a
+    # stationary z-score that a dedicated detector handles instead.
+    source_filter: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +214,33 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
+        # Heterogeneous units (lux, °C, azimuth, setpoints) → only *relative*
+        # knobs are safe here. The relative stddev floor caps the variance
+        # explosion on near-constant channels (lux ~0 overnight scoring 1e15);
+        # the relative deadband drops deviations below 25% of the baseline mean.
+        min_stddev_rel=0.15,
+        deadband_rel=0.25,
+        # Bursty appliance power is handled by the dedicated knx_appliance_*
+        # path (standby-drift + left-on); a stationary z-score here would just
+        # flag every normal use of the oven/coffee machine/etc.
+        source_filter="knx_name NOT LIKE '%Stromwert'",
+    ),
+    # KNX appliances — standby-drift on the hourly idle floor (`min(value)`).
+    # The source CAGG is pre-filtered to `%Stromwert` channels and carries a
+    # per-(ga, knx_name) min, so the baseline models each appliance's idle
+    # draw; a creep from e.g. 43 → 300 (phantom load / stuck relay) fires while
+    # normal on/off usage does not. Single native unit, so absolute floor +
+    # deadband are safe (standby valley sits well under 100; floors ≤ ~55).
+    UnivariateMetric(
+        uc="appliance_standby",
+        source_cagg="knx_appliance_1h",
+        baseline_cagg="knx_appliance_baseline_30d",
+        metric="idle_floor",
+        stats_field="idle_floor_stats",
+        group_cols=("ga", "knx_name"),
+        min_stddev_rel=0.10,
+        min_stddev_abs=5.0,
+        deadband_abs=20.0,
     ),
 )
 IFOREST_USECASES: tuple[IsolationForestUseCase, ...] = (
@@ -260,6 +300,11 @@ KNX_JOIN_USECASES: tuple[KnxJoinUseCase, ...] = (
     # comfort + energy waste pattern that the Basalte UI shouldn't
     # need to remember to surface.
     KnxJoinUseCase(uc="window_while_heating"),
+    # Appliance left on: current draw above the standby valley for several
+    # consecutive hours. Restricted to normally-idle appliances — always-on
+    # loads (fridge, network rack, circulation pump) drop out by their high
+    # 30d active-rate, so no per-GA exclusion list is needed.
+    KnxJoinUseCase(uc="appliance_runtime"),
 )
 SEASONAL_MODELS: tuple[SeasonalModel, ...] = (
     # Heating burner activity per hour — the most directly weather-
