@@ -201,7 +201,15 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
             if not rows:
                 log.info("iforest_no_bucket", uc=uc.uc)
                 continue
-            inserted, published = _score_group(settings, conn, uc, rows)
+            try:
+                inserted, published = _score_group(settings, conn, uc, rows)
+            except Exception:
+                # Scoring loads the model from S3 (rustfs) and writes anomalies —
+                # a transient object-store hiccup or DB blip must not abort the
+                # whole sweep, same isolation as the load step above. The next
+                # run retries; the bucket is unchanged within the hour.
+                log.exception("iforest_score_failed", uc=uc.uc)
+                continue
             total_inserted += inserted
             total_published += published
     log.info(
