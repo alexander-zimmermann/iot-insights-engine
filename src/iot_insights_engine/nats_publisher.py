@@ -21,7 +21,7 @@ def _connect_opts(settings: Settings) -> dict[str, Any]:
 
     opts: dict[str, Any] = {
         "servers": [s.strip() for s in settings.nats_servers.split(",") if s.strip()],
-        "name": "iot-mcp-bridge-jobs",
+        "name": "iot-insights-engine",
         "max_reconnect_attempts": 3,
         "connect_timeout": 5,
     }

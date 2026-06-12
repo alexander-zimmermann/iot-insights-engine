@@ -6,6 +6,7 @@ Network calls are mocked with respx; DB writes are not exercised here
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import httpx
@@ -111,6 +112,18 @@ def test_run_strips_api_key_from_log(
     # The job's structlog output is JSON-on-stdout, not via stdlib logging,
     # so the simplest invariant is: caplog (stdlib path) never sees the key.
     assert all("SECRET123" not in r.getMessage() for r in caplog.records)
+
+
+def test_to_utc_converts_winter_time() -> None:
+    """CET (UTC+1): 12:00 local → 11:00 UTC."""
+    got = forecast_solar._to_utc("2026-01-15 12:00:00", "Europe/Berlin")
+    assert got == datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
+
+
+def test_to_utc_converts_summer_time() -> None:
+    """CEST (UTC+2): 12:00 local → 10:00 UTC."""
+    got = forecast_solar._to_utc("2026-06-15 12:00:00", "Europe/Berlin")
+    assert got == datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
 
 
 def test_invalid_plane_json_returns_rc_2() -> None:

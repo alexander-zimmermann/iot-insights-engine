@@ -43,6 +43,13 @@ def test_classify_thresholds() -> None:
     assert detect_univariate._classify(-10.0) == "critical"
 
 
+def test_classify_severity_floor_suppresses_below() -> None:
+    assert detect_univariate._classify(3.0, "warning") is None
+    assert detect_univariate._classify(4.0, "warning") == "warning"
+    assert detect_univariate._classify(4.0, "critical") is None
+    assert detect_univariate._classify(6.0, "critical") == "critical"
+
+
 def test_zscore_plain_default() -> None:
     """With default knobs (0.0) the score is the textbook z-score."""
     m = _metric()

@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     forecast_solar_lon: float | None = None
     forecast_solar_planes: str = "[]"
     forecast_solar_base_url: str = "https://api.forecast.solar"
+    # forecast.solar returns naive local timestamps in the account's
+    # configured timezone — must match the account setting so the job
+    # can convert to UTC before writing to `mcp_forecasts.forecast_for`
+    # (TIMESTAMPTZ).
+    forecast_solar_timezone: str = "Europe/Berlin"
 
     @model_validator(mode="after")
     def _resolve_db_secret_files(self) -> Settings:

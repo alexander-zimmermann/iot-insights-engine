@@ -9,7 +9,7 @@ authors = [
     { name = "Alexander Zimmermann" },
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
@@ -35,7 +35,6 @@ dependencies = [
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
-    "pytest-cov>=7.1.0",
     "respx>=0.23.1",
     "ruff>=0.15.17",
     "mypy>=2.1.0",
@@ -89,7 +88,6 @@ module = [
     "statsforecast",
     "statsforecast.*",
     "pandas",
-    "pandas.*",
 ]
 ignore_missing_imports = true
 

@@ -5,10 +5,11 @@ Each registry entry maps a 1h-CAGG column to its baseline `stats_agg` field;
 we `rollup()` across the last 60 days to compute the mean and stddev for
 the current bucket's hour-of-day × weekday, then score the actual value.
 
-z-score tiers: `|z| >= 6 → critical`, `>= 4 → warning`, `>= 3 → info`.
-Tighter than the textbook 2σ on purpose — these run every 15 min on 12
-hot metrics each with multiple groups, so even 3σ produces a few alerts
-per day worth looking at.
+z-score tiers: `|z| >= 6 → critical`, `>= 4 → warning`, `>= 3 → info`,
+clamped by the registry entry's `severity_floor`. Tighter than the
+textbook 2σ on purpose — these run every 15 min on a dozen hot metrics
+each with multiple groups, so even 3σ produces a few alerts per day
+worth looking at.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
 from .registry import UNIVARIATE_METRICS, UnivariateMetric
+from .severity import escalated, meets_floor
 
 log = get_logger(__name__)
 
@@ -46,15 +48,19 @@ class _Hit:
     severity: str
 
 
-def _classify(zscore: float) -> str | None:
+def _classify(zscore: float, severity_floor: str = "info") -> str | None:
     abs_z = abs(zscore)
     if abs_z >= SEVERITY_CRITICAL_THRESHOLD:
-        return "critical"
-    if abs_z >= SEVERITY_WARNING_THRESHOLD:
-        return "warning"
-    if abs_z >= SEVERITY_INFO_THRESHOLD:
-        return "info"
-    return None
+        severity = "critical"
+    elif abs_z >= SEVERITY_WARNING_THRESHOLD:
+        severity = "warning"
+    elif abs_z >= SEVERITY_INFO_THRESHOLD:
+        severity = "info"
+    else:
+        return None
+    if not meets_floor(severity, severity_floor):
+        return None
+    return severity
 
 
 def _zscore(
@@ -140,7 +146,7 @@ def _scan_metric(
             zscore = _zscore(float(actual), float(mean), float(stddev), metric)
             if zscore is None:
                 continue
-            severity = _classify(zscore)
+            severity = _classify(zscore, metric.severity_floor)
             if severity is None:
                 continue
             group_values = tuple(row[c] for c in metric.group_cols)
@@ -162,10 +168,13 @@ def _insert_anomaly(
     conn: psycopg.Connection[Any],
     metric: UnivariateMetric,
     hit: _Hit,
-) -> bool:
-    """Returns True if a new row was inserted (xmax=0); False on no-op or
-    severity-equal update. The publisher fires only on True (or escalation,
-    which we don't track yet — covered in a follow-up)."""
+) -> tuple[bool, str | None]:
+    """Returns (inserted, old_severity). `inserted` is True for a fresh
+    row (xmax=0); `old_severity` carries the pre-statement severity on
+    conflict (NULL on fresh insert) so the caller can re-publish on
+    escalation. The CTE sees the pre-statement snapshot — safe because
+    each detector is the only writer for its (time, source, metric,
+    detector) keys."""
     payload = {
         "group": dict(zip(metric.group_cols, hit.group_values, strict=True)),
         "mean": hit.mean,
@@ -173,6 +182,10 @@ def _insert_anomaly(
         "zscore": hit.zscore,
     }
     sql = """
+        WITH existing AS (
+            SELECT severity FROM mcp_anomalies
+            WHERE time = %s AND source = %s AND metric = %s AND detector = %s
+        )
         INSERT INTO mcp_anomalies (
             time, source, metric, detector, severity, uc,
             actual, expected, score, payload
@@ -185,7 +198,8 @@ def _insert_anomaly(
             score    = EXCLUDED.score,
             payload  = EXCLUDED.payload,
             uc       = EXCLUDED.uc
-        RETURNING xmax = 0 AS inserted
+        RETURNING xmax = 0 AS inserted,
+                  (SELECT severity FROM existing) AS old_severity
     """
     metric_with_group = (
         f"{metric.metric}[{','.join(str(v) for v in hit.group_values)}]"
@@ -200,6 +214,10 @@ def _insert_anomaly(
                 metric.source_cagg,
                 metric_with_group,
                 "zscore",
+                hit.bucket,
+                metric.source_cagg,
+                metric_with_group,
+                "zscore",
                 hit.severity,
                 metric.uc,
                 hit.actual,
@@ -209,7 +227,9 @@ def _insert_anomaly(
             ),
         )
         result = cur.fetchone()
-    return bool(result and result["inserted"])
+    if not result:
+        return False, None
+    return bool(result["inserted"]), result["old_severity"]
 
 
 def run(settings: Settings, _argv: Sequence[str]) -> int:
@@ -222,15 +242,14 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                 continue
             try:
                 hits = _scan_metric(conn, metric)
-            except psycopg.Error as exc:
+            except psycopg.Error:
                 log.exception("metric_scan_failed", uc=metric.uc, source=metric.source_cagg)
                 # Keep going — one bad CAGG must not stop the whole sweep.
-                _ = exc
                 continue
             for hit in hits:
-                inserted = _insert_anomaly(conn, metric, hit)
+                inserted, old_severity = _insert_anomaly(conn, metric, hit)
                 total_hits += 1
-                if not inserted:
+                if not inserted and not escalated(old_severity, hit.severity):
                     continue
                 try:
                     nats_publisher.publish_anomaly(

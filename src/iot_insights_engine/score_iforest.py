@@ -1,6 +1,6 @@
 """Score the last completed 1h-bucket against the persisted IsolationForest
 model for each (uc, group). INSERT idempotent into mcp_anomalies, publish
-on `anomaly.<uc>.<severity>` only on new inserts.
+on `anomaly.<uc>.<severity>` only on new inserts or severity escalations.
 
 Warm-up: until `warmup_days` elapsed since trained_at, demote critical
 and warning to info — early models trained on partial baselines produce
@@ -23,6 +23,7 @@ from .db_write import write_connection
 from .iforest_common import DETECTOR_NAME, ModelEnvelope
 from .logging_setup import get_logger
 from .registry import IFOREST_USECASES, IsolationForestUseCase
+from .severity import escalated, meets_floor
 
 log = get_logger(__name__)
 
@@ -46,12 +47,18 @@ def _load_last_bucket(
         return list(cur.fetchall())
 
 
-def _classify(envelope: ModelEnvelope, score: float) -> str | None:
+def _classify(
+    envelope: ModelEnvelope, score: float, severity_floor: str = "info"
+) -> str | None:
     if score < envelope.threshold_critical:
-        return "critical"
-    if score < envelope.threshold_warning:
-        return "warning"
-    return None
+        severity = "critical"
+    elif score < envelope.threshold_warning:
+        severity = "warning"
+    else:
+        return None
+    if not meets_floor(severity, severity_floor):
+        return None
+    return severity
 
 
 def _warmup_demote(envelope: ModelEnvelope, severity: str, warmup_days: int) -> str:
@@ -69,7 +76,10 @@ def _insert_anomaly(
     score: float,
     severity: str,
     features: dict[str, float],
-) -> bool:
+) -> tuple[bool, str | None]:
+    """Returns (inserted, old_severity) — old_severity is the
+    pre-statement value on conflict (NULL on fresh insert) so the
+    caller can re-publish on escalation."""
     metric_with_group = (
         f"{uc.uc}[{','.join(str(v) for v in group_values)}]" if group_values else uc.uc
     )
@@ -79,6 +89,10 @@ def _insert_anomaly(
         "features": features,
     }
     sql = """
+        WITH existing AS (
+            SELECT severity FROM mcp_anomalies
+            WHERE time = %s AND source = %s AND metric = %s AND detector = %s
+        )
         INSERT INTO mcp_anomalies (
             time, source, metric, detector, severity, uc,
             actual, expected, score, payload
@@ -89,12 +103,17 @@ def _insert_anomaly(
             score    = EXCLUDED.score,
             payload  = EXCLUDED.payload,
             uc       = EXCLUDED.uc
-        RETURNING xmax = 0 AS inserted
+        RETURNING xmax = 0 AS inserted,
+                  (SELECT severity FROM existing) AS old_severity
     """
     with conn.cursor() as cur:
         cur.execute(
             sql,
             (
+                bucket,
+                uc.source_cagg,
+                metric_with_group,
+                DETECTOR_NAME,
                 bucket,
                 uc.source_cagg,
                 metric_with_group,
@@ -106,7 +125,9 @@ def _insert_anomaly(
             ),
         )
         result = cur.fetchone()
-    return bool(result and result["inserted"])
+    if not result:
+        return False, None
+    return bool(result["inserted"]), result["old_severity"]
 
 
 def _score_group(
@@ -131,21 +152,20 @@ def _score_group(
         feature_matrix = np.asarray(
             [[float(r[c]) for c in fnames] for r in group_rows], dtype=np.float64
         )
-        scores = envelope.pipeline.named_steps["iforest"].score_samples(
-            envelope.pipeline.named_steps["scaler"].transform(feature_matrix)
-        )
+        scores = envelope.pipeline.score_samples(feature_matrix)
         for row, score in zip(group_rows, scores, strict=True):
-            severity = _classify(envelope, float(score))
+            severity = _classify(envelope, float(score), uc.severity_floor)
             if severity is None:
                 continue
             severity = _warmup_demote(envelope, severity, uc.warmup_days)
             row_features = {c: float(row[c]) for c in fnames}
-            inserted = _insert_anomaly(
+            inserted, old_severity = _insert_anomaly(
                 conn, uc, row["bucket"], gvals, float(score), severity, row_features
             )
-            if not inserted:
+            if not inserted and not escalated(old_severity, severity):
                 continue
-            inserted_count += 1
+            if inserted:
+                inserted_count += 1
             try:
                 nats_publisher.publish_anomaly(
                     settings,

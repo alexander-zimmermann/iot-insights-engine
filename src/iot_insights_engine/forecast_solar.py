@@ -7,6 +7,11 @@ homelab's east+west roof fits one hourly call. Forecast values land in
 so a re-pull during the same hour overwrites the existing forecast
 instead of creating a duplicate.
 
+The API returns naive local timestamps (account timezone, see
+``MCP_FORECAST_SOLAR_TIMEZONE``); they are converted to UTC-aware
+datetimes before insert so ``forecast_for`` (TIMESTAMPTZ) lines up
+with the UTC-based seasonal forecasts in the same table.
+
 The companion comparison job — does actual production match what was
 forecast? — lives in ``score_solar_actual`` (TBD) and reads back from
 this same table.
@@ -16,8 +21,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
@@ -78,8 +84,15 @@ def _fetch_watts(url: str) -> dict[str, float]:
     return {k: float(v) for k, v in watts.items()}
 
 
+def _to_utc(ts_str: str, tz_name: str) -> datetime:
+    """forecast.solar emits naive ``YYYY-MM-DD HH:MM:SS`` strings in the
+    account's local timezone — attach it, then convert to UTC so the
+    TIMESTAMPTZ insert is unambiguous regardless of the session TZ."""
+    return datetime.fromisoformat(ts_str).replace(tzinfo=ZoneInfo(tz_name)).astimezone(UTC)
+
+
 def _insert_forecasts(
-    conn: psycopg.Connection[Any], watts: dict[str, float]
+    conn: psycopg.Connection[Any], watts: dict[str, float], tz_name: str
 ) -> int:
     sql = """
         INSERT INTO mcp_forecasts (
@@ -94,7 +107,7 @@ def _insert_forecasts(
     rows = 0
     with conn.cursor() as cur:
         for ts_str, value in watts.items():
-            forecast_for = datetime.fromisoformat(ts_str)
+            forecast_for = _to_utc(ts_str, tz_name)
             cur.execute(sql, (forecast_for, SOURCE, METRIC, MODEL, value))
             rows += 1
     return rows
@@ -117,7 +130,7 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
         log.warning("forecast_solar_empty_response", url=safe_url)
         return 0
     with write_connection(settings) as conn:
-        inserted = _insert_forecasts(conn, watts)
+        inserted = _insert_forecasts(conn, watts, settings.forecast_solar_timezone)
     log.info(
         "forecast_solar_done",
         url=safe_url,

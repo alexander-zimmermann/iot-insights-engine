@@ -77,6 +77,15 @@ def test_classify_thresholds() -> None:
     assert score_iforest._classify(env, -0.81) == "critical"
 
 
+def test_classify_severity_floor_suppresses_below() -> None:
+    env = _envelope(
+        threshold_warning=-0.5, threshold_critical=-0.8, trained_at=datetime.now(tz=UTC)
+    )
+    assert score_iforest._classify(env, -0.51, "critical") is None
+    assert score_iforest._classify(env, -0.81, "critical") == "critical"
+    assert score_iforest._classify(env, -0.51, "warning") == "warning"
+
+
 def test_warmup_demote_within_window() -> None:
     fresh = datetime.now(tz=UTC) - timedelta(days=3)
     env = _envelope(-0.5, -0.8, trained_at=fresh)
