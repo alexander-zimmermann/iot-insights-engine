@@ -1,4 +1,4 @@
-"""Rule-based KNX detectors. Three UCs:
+"""Rule-based KNX detectors. Four UCs:
 
 * ``fbh_cold`` — FBH valve open AND room stays below setpoint for >=2h.
   Stuck valve / bled circuit / sensor mismatch. JOINs `knx_1h` × `ga_catalog`.
@@ -8,6 +8,12 @@
   for several consecutive hours ("left on"), gated to normally-idle loads.
   Reads `knx_appliance_1h` (no catalog join — the CAGG already scopes to
   `%Stromwert` channels).
+* ``freezer_icing`` — the freezer compressor's median continuous run time at
+  warm kitchen ambient creeps up over weeks as the evaporator frosts over
+  (poor heat transfer → longer pull-down). Sessionises compressor runs from
+  raw `knx` over a trailing window, keeps only warm-ambient runs, and compares
+  their median against a fixed healthy baseline. Slow-drift detector — a
+  rolling baseline would absorb the very creep we want to catch.
 
 All insert into ``mcp_anomalies`` idempotently (one row per
 ``(time, source, metric, detector)``) and publish on
@@ -64,6 +70,34 @@ APPLIANCE_RUNTIME_CRITICAL_HOURS = 9
 # "left on" is meaningless for a load that is on by design.
 APPLIANCE_NORMALLY_IDLE_MAX_RATE = 0.5
 
+# freezer_icing. Channels are resolved by their stable `ga_catalog` *name*, not
+# by GA — a GA can be re-addressed in ETS, the semantic name does not move
+# (same convention as fbh_cold / window_while_heating). A compressor "run" is a
+# continuous stretch with current above the standby valley; the valley sits at
+# ~50-67 mA and running draw at 180-580 mA, so 120 mA cleanly separates the two
+# (same cut as the real-time KNX "door open" block). Only runs that *started*
+# while the kitchen was warm (>= 24 °C) count — below that, iced and healthy run
+# lengths are indistinguishable, so the signal only exists under thermal load.
+# Runs longer than the door-event floor are dropped: those are door-ajar /
+# defrost outliers (the real-time block owns them) and would skew the median.
+FREEZER_NAME_PATTERN = "%Gefrierschrank.Stromwert"
+KITCHEN_TEMP_NAME_PATTERN = "%Küche.Sensor.Temperatur"
+FREEZER_RUN_THRESHOLD_MA = 120.0
+FREEZER_WARM_AMBIENT_C = 24.0
+FREEZER_ICING_LOOKBACK_DAYS = 21
+FREEZER_ICING_DOOR_EVENT_MIN = 180.0
+# Need enough warm runs in the window for a stable median; in winter the
+# kitchen rarely reaches 24 °C, so the detector simply goes quiet — correct,
+# since there is no thermal load to expose icing then.
+FREEZER_ICING_MIN_WARM_RUNS = 15
+# Healthy warm-ambient median continuous run ≈ 30 min (a full known-good year,
+# door events excluded). Thresholds bracket the observed iced state (≈ 46 min).
+# Reconfirm against the post-defrost baseline and retune if needed.
+FREEZER_ICING_BASELINE_MIN = 30.0
+FREEZER_ICING_INFO_MIN = 38.0
+FREEZER_ICING_WARNING_MIN = 45.0
+FREEZER_ICING_CRITICAL_MIN = 55.0
+
 
 def _classify_fbh(gap_c: float) -> str | None:
     if gap_c >= FBH_GAP_CRITICAL_C:
@@ -91,6 +125,16 @@ def _classify_runtime(streak_hours: int) -> str | None:
     if streak_hours >= APPLIANCE_RUNTIME_WARNING_HOURS:
         return "warning"
     if streak_hours >= APPLIANCE_RUNTIME_INFO_HOURS:
+        return "info"
+    return None
+
+
+def _classify_icing(median_run_min: float) -> str | None:
+    if median_run_min >= FREEZER_ICING_CRITICAL_MIN:
+        return "critical"
+    if median_run_min >= FREEZER_ICING_WARNING_MIN:
+        return "warning"
+    if median_run_min >= FREEZER_ICING_INFO_MIN:
         return "info"
     return None
 
@@ -442,12 +486,126 @@ def _detect_appliance_runtime(
     return inserted, published
 
 
+# --- UC: freezer_icing -----------------------------------------------------
+
+# No bind params → `%` is a plain LIKE wildcard (see the fbh_cold note). GAs
+# are resolved by name from ga_catalog so a re-addressed channel keeps working;
+# an unresolved name yields `ga = NULL` → zero rows → the detector goes quiet
+# rather than crashing. The gaps-and-islands CTEs sessionise compressor runs
+# from raw knx, then the median is taken over warm-ambient, non-door runs.
+_FREEZER_ICING_SQL = f"""
+    WITH freezer AS (
+        SELECT ga, name AS knx_name FROM ga_catalog
+        WHERE name LIKE '{FREEZER_NAME_PATTERN}'
+        LIMIT 1
+    ),
+    kitchen_temp AS (
+        SELECT ga FROM ga_catalog
+        WHERE name LIKE '{KITCHEN_TEMP_NAME_PATTERN}' AND function = 'Sensorik'
+        LIMIT 1
+    ),
+    samples AS (
+        SELECT time,
+               (value >= {FREEZER_RUN_THRESHOLD_MA}) AS running,
+               lead(time) OVER (ORDER BY time) AS next_time
+        FROM knx
+        WHERE ga = (SELECT ga FROM freezer)
+          AND time > now() - interval '{FREEZER_ICING_LOOKBACK_DAYS} days'
+    ),
+    marked AS (
+        SELECT *,
+               CASE
+                 WHEN running
+                      AND NOT coalesce(lag(running) OVER (ORDER BY time), false)
+                 THEN 1 ELSE 0
+               END AS new_run
+        FROM samples
+    ),
+    grouped AS (
+        SELECT *, sum(new_run) OVER (ORDER BY time ROWS UNBOUNDED PRECEDING) AS run_id
+        FROM marked
+    ),
+    runs AS (
+        SELECT min(time) AS started_at,
+               extract(epoch FROM (max(next_time) - min(time))) / 60.0 AS dur_min
+        FROM grouped
+        WHERE running
+        GROUP BY run_id
+    ),
+    warm_runs AS (
+        SELECT r.dur_min
+        FROM runs r
+        WHERE r.dur_min < {FREEZER_ICING_DOOR_EVENT_MIN}
+          AND (
+              SELECT t.value FROM knx t
+              WHERE t.ga = (SELECT ga FROM kitchen_temp)
+                AND t.time <= r.started_at
+              ORDER BY t.time DESC
+              LIMIT 1
+          ) >= {FREEZER_WARM_AMBIENT_C}
+    )
+    SELECT
+        date_trunc('day', now()) AS bucket,
+        (SELECT ga FROM freezer) AS ga,
+        (SELECT knx_name FROM freezer) AS knx_name,
+        count(*) AS warm_run_count,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY dur_min) AS median_run_min
+    FROM warm_runs
+"""
+
+
+def _detect_freezer_icing(
+    conn: psycopg.Connection[Any], settings: Settings
+) -> tuple[int, int]:
+    with conn.cursor() as cur:
+        cur.execute(_FREEZER_ICING_SQL)
+        row = cur.fetchone()
+    if row is None or row["median_run_min"] is None:
+        return 0, 0
+    warm_run_count = int(row["warm_run_count"])
+    # Too few warm runs (winter / unresolved channel) → not enough signal.
+    if warm_run_count < FREEZER_ICING_MIN_WARM_RUNS:
+        return 0, 0
+    median_run_min = float(row["median_run_min"])
+    severity = _classify_icing(median_run_min)
+    if severity is None:
+        return 0, 0
+    bucket = row["bucket"]
+    ga = row["ga"]
+    knx_name = row["knx_name"]
+    payload = {
+        "ga": ga,
+        "knx_name": knx_name,
+        "median_run_min": round(median_run_min, 1),
+        "baseline_run_min": FREEZER_ICING_BASELINE_MIN,
+        "warm_run_count": warm_run_count,
+        "warm_ambient_c": FREEZER_WARM_AMBIENT_C,
+        "lookback_days": FREEZER_ICING_LOOKBACK_DAYS,
+        "bucket": bucket.isoformat(),
+    }
+    ok, old_severity = _insert_anomaly(
+        conn,
+        bucket=bucket,
+        uc="freezer_icing",
+        room=f"{ga},{knx_name}",
+        severity=severity,
+        score=median_run_min,
+        payload=payload,
+        source="knx",
+    )
+    if not ok and not escalated(old_severity, severity):
+        return 0, 0
+    _publish(settings, "freezer_icing", severity, payload)
+    return (1 if ok else 0), 1
+
+
 # --- dispatcher ------------------------------------------------------------
 
 _DETECTORS = {
     "fbh_cold": _detect_fbh_cold,
     "window_while_heating": _detect_window_while_heating,
     "appliance_runtime": _detect_appliance_runtime,
+    "freezer_icing": _detect_freezer_icing,
 }
 
 
