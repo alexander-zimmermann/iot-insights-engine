@@ -313,6 +313,11 @@ KNX_JOIN_USECASES: tuple[KnxJoinUseCase, ...] = (
     # loads (fridge, network rack, circulation pump) drop out by their high
     # 30d active-rate, so no per-GA exclusion list is needed.
     KnxJoinUseCase(uc="appliance_runtime"),
+    # Freezer evaporator icing: the median compressor run time at warm kitchen
+    # ambient creeps up over weeks as frost insulates the coil. Compared against
+    # a fixed healthy baseline (a rolling one would absorb the drift). Goes
+    # quiet in winter — the signal only exists under thermal load.
+    KnxJoinUseCase(uc="freezer_icing"),
 )
 SEASONAL_MODELS: tuple[SeasonalModel, ...] = (
     # Heating burner activity per hour — the most directly weather-

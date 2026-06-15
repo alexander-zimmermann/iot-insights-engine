@@ -98,6 +98,29 @@ def test_classify_runtime_constants_monotonic() -> None:
     )
 
 
+def test_classify_icing_thresholds() -> None:
+    assert detect_knx_join._classify_icing(37.9) is None
+    assert detect_knx_join._classify_icing(38.0) == "info"
+    assert detect_knx_join._classify_icing(44.9) == "info"
+    assert detect_knx_join._classify_icing(45.0) == "warning"
+    assert detect_knx_join._classify_icing(54.9) == "warning"
+    assert detect_knx_join._classify_icing(55.0) == "critical"
+    assert detect_knx_join._classify_icing(120.0) == "critical"
+
+
+def test_classify_icing_constants_monotonic() -> None:
+    # Baseline must sit below the first alert tier, tiers strictly increasing.
+    assert (
+        detect_knx_join.FREEZER_ICING_BASELINE_MIN
+        < detect_knx_join.FREEZER_ICING_INFO_MIN
+        < detect_knx_join.FREEZER_ICING_WARNING_MIN
+        < detect_knx_join.FREEZER_ICING_CRITICAL_MIN
+    )
+    # The door-event floor must exceed the heaviest icing tier, else genuine
+    # icing runs would be discarded as door-ajar outliers before the median.
+    assert detect_knx_join.FREEZER_ICING_CRITICAL_MIN < detect_knx_join.FREEZER_ICING_DOOR_EVENT_MIN
+
+
 def test_hour_is_active() -> None:
     # >=50% of samples above the standby valley → active.
     assert detect_knx_join._hour_is_active(30, 60) is True
