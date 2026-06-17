@@ -15,6 +15,15 @@ def meets_floor(severity: str, floor: str) -> bool:
     return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(floor)
 
 
+def severity_level(severity: str | None) -> int:
+    """Numeric tier for the KNX payload: clear/None=0, info=1, warning=2,
+    critical=3. The writer-rules write this 1-byte value (DPT 5.010) onto the
+    anomaly GA, and a Basalte LUT maps it to a notification."""
+    if severity is None:
+        return 0
+    return SEVERITY_ORDER.index(severity) + 1
+
+
 def escalated(old_severity: str | None, new_severity: str) -> bool:
     """True when an existing anomaly row was bumped to a higher tier.
 

@@ -256,6 +256,9 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                         settings,
                         uc=metric.uc,
                         severity=hit.severity,
+                        entity=nats_publisher.entity_slug(
+                            dict(zip(metric.group_cols, hit.group_values, strict=True))
+                        ),
                         payload={
                             "source": metric.source_cagg,
                             "metric": metric.metric,
