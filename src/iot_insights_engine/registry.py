@@ -187,6 +187,9 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         stats_field="pv_production_stats",
         group_cols=("inverter_id",),
     ),
+    # consumer_total/grid_power are house-level but the powerflow CAGG stores
+    # them under BOTH inverter_ids (duplicate values). Scope to inverter 1 so
+    # the anomaly fires once → one KNX-GA (entity slug `inv1`).
     UnivariateMetric(
         uc="consumer_total",
         source_cagg="solaredge_powerflow_1h",
@@ -194,6 +197,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="consumer_total_avg",
         stats_field="consumer_total_stats",
         group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
     ),
     UnivariateMetric(
         uc="grid_power",
@@ -202,6 +206,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="grid_power_avg",
         stats_field="grid_power_stats",
         group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
     ),
     # Wallbox meter — group on `meter_id`.
     UnivariateMetric(

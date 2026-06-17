@@ -30,7 +30,7 @@ from typing import Any
 
 import psycopg
 
-from . import nats_publisher
+from . import clear, nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
@@ -277,6 +277,7 @@ def _detect_fbh_cold(
     conn: psycopg.Connection[Any], settings: Settings
 ) -> tuple[int, int]:
     inserted = published = 0
+    fired: set[str | None] = set()
     with conn.cursor() as cur:
         cur.execute(_FBH_COLD_SQL)
         rows = cur.fetchall()
@@ -285,7 +286,10 @@ def _detect_fbh_cold(
         severity = _classify_fbh(gap)
         if severity is None:
             continue
+        entity = nats_publisher.slugify(str(row["room"]))
+        fired.add(entity)
         payload = {
+            "entity": entity,
             "room": row["room"],
             "stellwert_pct": float(row["stellwert_pct"]),
             "soll_c": float(row["soll_c"]),
@@ -303,14 +307,12 @@ def _detect_fbh_cold(
             score=gap,
             payload=payload,
         )
-        if not ok and not escalated(old_severity, severity):
-            continue
+        if ok or escalated(old_severity, severity):
+            _publish(settings, "fbh_cold", severity, payload, entity=entity)
+            published += 1
         if ok:
             inserted += 1
-        _publish(
-            settings, "fbh_cold", severity, payload, entity=nats_publisher.slugify(str(row["room"]))
-        )
-        published += 1
+    clear.publish_clears(conn, settings, uc="fbh_cold", fired_entities=fired)
     return inserted, published
 
 
@@ -360,6 +362,7 @@ def _detect_window_while_heating(
     conn: psycopg.Connection[Any], settings: Settings
 ) -> tuple[int, int]:
     inserted = published = 0
+    fired: set[str | None] = set()
     with conn.cursor() as cur:
         cur.execute(_WINDOW_HEATING_SQL)
         rows = cur.fetchall()
@@ -368,7 +371,10 @@ def _detect_window_while_heating(
         severity = _classify_window(stellwert)
         if severity is None:
             continue
+        entity = nats_publisher.slugify(str(row["room"]))
+        fired.add(entity)
         payload = {
+            "entity": entity,
             "room": row["room"],
             "window_open": bool(row["window_open"]),
             "stellwert_pct": stellwert,
@@ -384,18 +390,12 @@ def _detect_window_while_heating(
             score=stellwert,
             payload=payload,
         )
-        if not ok and not escalated(old_severity, severity):
-            continue
+        if ok or escalated(old_severity, severity):
+            _publish(settings, "window_while_heating", severity, payload, entity=entity)
+            published += 1
         if ok:
             inserted += 1
-        _publish(
-            settings,
-            "window_while_heating",
-            severity,
-            payload,
-            entity=nats_publisher.slugify(str(row["room"])),
-        )
-        published += 1
+    clear.publish_clears(conn, settings, uc="window_while_heating", fired_entities=fired)
     return inserted, published
 
 
@@ -463,6 +463,7 @@ def _detect_appliance_runtime(
         by_appliance.setdefault((row["ga"], row["knx_name"]), []).append(row)
 
     inserted = published = 0
+    fired: set[str | None] = set()
     for (ga, knx_name), rows in by_appliance.items():
         # Must be active in the current bucket to count as "left on".
         if rows[0]["bucket"] != last_bucket:
@@ -477,7 +478,10 @@ def _detect_appliance_runtime(
         severity = _classify_runtime(streak)
         if severity is None:
             continue
+        entity = nats_publisher.slugify(ga)
+        fired.add(entity)
         payload = {
+            "entity": entity,
             "ga": ga,
             "knx_name": knx_name,
             "streak_hours": streak,
@@ -494,14 +498,12 @@ def _detect_appliance_runtime(
             payload=payload,
             source="knx_appliance_1h",
         )
-        if not ok and not escalated(old_severity, severity):
-            continue
+        if ok or escalated(old_severity, severity):
+            _publish(settings, "appliance_runtime", severity, payload, entity=entity)
+            published += 1
         if ok:
             inserted += 1
-        _publish(
-            settings, "appliance_runtime", severity, payload, entity=nats_publisher.slugify(ga)
-        )
-        published += 1
+    clear.publish_clears(conn, settings, uc="appliance_runtime", fired_entities=fired)
     return inserted, published
 
 
@@ -576,46 +578,53 @@ _FREEZER_ICING_SQL = f"""
 def _detect_freezer_icing(
     conn: psycopg.Connection[Any], settings: Settings
 ) -> tuple[int, int]:
+    # 1:1 UC → entity is None (subject `anomaly.freezer_icing`).
+    fired: set[str | None] = set()
+    inserted = published = 0
     with conn.cursor() as cur:
         cur.execute(_FREEZER_ICING_SQL)
         row = cur.fetchone()
-    if row is None or row["median_run_min"] is None:
-        return 0, 0
-    warm_run_count = int(row["warm_run_count"])
+
+    severity: str | None = None
     # Too few warm runs (winter / unresolved channel) → not enough signal.
-    if warm_run_count < FREEZER_ICING_MIN_WARM_RUNS:
-        return 0, 0
-    median_run_min = float(row["median_run_min"])
-    severity = _classify_icing(median_run_min)
-    if severity is None:
-        return 0, 0
-    bucket = row["bucket"]
-    ga = row["ga"]
-    knx_name = row["knx_name"]
-    payload = {
-        "ga": ga,
-        "knx_name": knx_name,
-        "median_run_min": round(median_run_min, 1),
-        "baseline_run_min": FREEZER_ICING_BASELINE_MIN,
-        "warm_run_count": warm_run_count,
-        "warm_ambient_c": FREEZER_WARM_AMBIENT_C,
-        "lookback_days": FREEZER_ICING_LOOKBACK_DAYS,
-        "bucket": bucket.isoformat(),
-    }
-    ok, old_severity = _insert_anomaly(
-        conn,
-        bucket=bucket,
-        uc="freezer_icing",
-        room=f"{ga},{knx_name}",
-        severity=severity,
-        score=median_run_min,
-        payload=payload,
-        source="knx",
-    )
-    if not ok and not escalated(old_severity, severity):
-        return 0, 0
-    _publish(settings, "freezer_icing", severity, payload)
-    return (1 if ok else 0), 1
+    if (
+        row is not None
+        and row["median_run_min"] is not None
+        and int(row["warm_run_count"]) >= FREEZER_ICING_MIN_WARM_RUNS
+    ):
+        severity = _classify_icing(float(row["median_run_min"]))
+
+    if severity is not None and row is not None:
+        fired.add(None)
+        median_run_min = float(row["median_run_min"])
+        payload = {
+            "entity": None,
+            "ga": row["ga"],
+            "knx_name": row["knx_name"],
+            "median_run_min": round(median_run_min, 1),
+            "baseline_run_min": FREEZER_ICING_BASELINE_MIN,
+            "warm_run_count": int(row["warm_run_count"]),
+            "warm_ambient_c": FREEZER_WARM_AMBIENT_C,
+            "lookback_days": FREEZER_ICING_LOOKBACK_DAYS,
+            "bucket": row["bucket"].isoformat(),
+        }
+        ok, old_severity = _insert_anomaly(
+            conn,
+            bucket=row["bucket"],
+            uc="freezer_icing",
+            room=f"{row['ga']},{row['knx_name']}",
+            severity=severity,
+            score=median_run_min,
+            payload=payload,
+            source="knx",
+        )
+        if ok or escalated(old_severity, severity):
+            _publish(settings, "freezer_icing", severity, payload)
+            published = 1
+        inserted = 1 if ok else 0
+
+    clear.publish_clears(conn, settings, uc="freezer_icing", fired_entities=fired)
+    return inserted, published
 
 
 # --- dispatcher ------------------------------------------------------------

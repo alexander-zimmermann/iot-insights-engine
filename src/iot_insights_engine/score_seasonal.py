@@ -35,7 +35,7 @@ import psycopg
 from statsforecast import StatsForecast
 from statsforecast.models import MSTL, AutoARIMA
 
-from . import nats_publisher
+from . import clear, nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
@@ -272,6 +272,9 @@ def _score_uc(
     z = (actual - expected) / residual_stddev
     severity = _classify(z, uc.severity_floor)
     if severity is None:
+        # Scored, nothing fired → clear a previously-open anomaly (1:1 UC):
+        # empty fired set means the (entity=None) anomaly gets level 0.
+        clear.publish_clears(conn, settings, uc=uc.uc, fired_entities=set())
         return forecast_rows, 0, 0
 
     earliest = df["ds"].min()
@@ -280,6 +283,7 @@ def _score_uc(
         severity = "info"
 
     payload = {
+        "entity": None,
         "actual": actual,
         "expected": expected,
         "z": z,
@@ -305,6 +309,7 @@ def _score_uc(
             settings,
             uc=uc.uc,
             severity=severity,
+            entity=None,
             payload={"source": uc.source_cagg, "metric": uc.metric, **payload},
         )
         return forecast_rows, inserts, 1

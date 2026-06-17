@@ -22,7 +22,7 @@ from typing import Any
 
 import psycopg
 
-from . import nats_publisher
+from . import clear, nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
@@ -175,8 +175,10 @@ def _insert_anomaly(
     escalation. The CTE sees the pre-statement snapshot — safe because
     each detector is the only writer for its (time, source, metric,
     detector) keys."""
+    group = dict(zip(metric.group_cols, hit.group_values, strict=True))
     payload = {
-        "group": dict(zip(metric.group_cols, hit.group_values, strict=True)),
+        "entity": nats_publisher.entity_slug(group),
+        "group": group,
         "mean": hit.mean,
         "stddev": hit.stddev,
         "zscore": hit.zscore,
@@ -246,7 +248,12 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                 log.exception("metric_scan_failed", uc=metric.uc, source=metric.source_cagg)
                 # Keep going — one bad CAGG must not stop the whole sweep.
                 continue
+            fired: set[str | None] = set()
             for hit in hits:
+                entity = nats_publisher.entity_slug(
+                    dict(zip(metric.group_cols, hit.group_values, strict=True))
+                )
+                fired.add(entity)
                 inserted, old_severity = _insert_anomaly(conn, metric, hit)
                 total_hits += 1
                 if not inserted and not escalated(old_severity, hit.severity):
@@ -256,18 +263,14 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                         settings,
                         uc=metric.uc,
                         severity=hit.severity,
-                        entity=nats_publisher.entity_slug(
-                            dict(zip(metric.group_cols, hit.group_values, strict=True))
-                        ),
+                        entity=entity,
                         payload={
                             "source": metric.source_cagg,
                             "metric": metric.metric,
                             "actual": hit.actual,
                             "expected": hit.mean,
                             "zscore": hit.zscore,
-                            "group": dict(
-                                zip(metric.group_cols, hit.group_values, strict=True)
-                            ),
+                            "group": dict(zip(metric.group_cols, hit.group_values, strict=True)),
                             "bucket": hit.bucket.isoformat(),
                         },
                     )
@@ -276,6 +279,7 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                     # NATS-outage must not fail the job — the row is in TSDB
                     # and the next run retries.
                     log.exception("nats_publish_failed", uc=metric.uc)
+            clear.publish_clears(conn, settings, uc=metric.uc, fired_entities=fired)
     log.info(
         "detect_univariate_done",
         scanned_metrics=len(UNIVARIATE_METRICS),
