@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import psycopg
 
-from . import artifacts, iforest_common, nats_publisher
+from . import artifacts, clear, iforest_common, nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .iforest_common import DETECTOR_NAME, ModelEnvelope
@@ -83,8 +83,10 @@ def _insert_anomaly(
     metric_with_group = (
         f"{uc.uc}[{','.join(str(v) for v in group_values)}]" if group_values else uc.uc
     )
+    group = dict(zip(uc.group_cols, group_values, strict=True))
     payload = {
-        "group": dict(zip(uc.group_cols, group_values, strict=True)),
+        "entity": nats_publisher.entity_slug(group),
+        "group": group,
         "score_samples": score,
         "features": features,
     }
@@ -140,6 +142,7 @@ def _score_group(
     fnames = iforest_common.feature_names(uc)
     inserted_count = 0
     published_count = 0
+    fired: set[str | None] = set()
     by_group: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
         gvals = tuple(row[c] for c in uc.group_cols)
@@ -158,6 +161,8 @@ def _score_group(
             if severity is None:
                 continue
             severity = _warmup_demote(envelope, severity, uc.warmup_days)
+            entity = nats_publisher.entity_slug(dict(zip(uc.group_cols, gvals, strict=True)))
+            fired.add(entity)
             row_features = {c: float(row[c]) for c in fnames}
             inserted, old_severity = _insert_anomaly(
                 conn, uc, row["bucket"], gvals, float(score), severity, row_features
@@ -171,9 +176,7 @@ def _score_group(
                     settings,
                     uc=uc.uc,
                     severity=severity,
-                    entity=nats_publisher.entity_slug(
-                        dict(zip(uc.group_cols, gvals, strict=True))
-                    ),
+                    entity=entity,
                     payload={
                         "source": uc.source_cagg,
                         "score_samples": float(score),
@@ -185,6 +188,7 @@ def _score_group(
                 published_count += 1
             except Exception:
                 log.exception("nats_publish_failed", uc=uc.uc)
+    clear.publish_clears(conn, settings, uc=uc.uc, fired_entities=fired)
     return inserted_count, published_count
 
 
