@@ -215,9 +215,18 @@ def _insert_anomaly(
     return bool(result["inserted"]), result["old_severity"]
 
 
-def _publish(settings: Settings, uc: str, severity: str, payload: dict[str, Any]) -> None:
+def _publish(
+    settings: Settings,
+    uc: str,
+    severity: str,
+    payload: dict[str, Any],
+    *,
+    entity: str | None = None,
+) -> None:
     try:
-        nats_publisher.publish_anomaly(settings, uc=uc, severity=severity, payload=payload)
+        nats_publisher.publish_anomaly(
+            settings, uc=uc, severity=severity, payload=payload, entity=entity
+        )
     except Exception:
         log.exception("nats_publish_failed", uc=uc)
 
@@ -298,7 +307,9 @@ def _detect_fbh_cold(
             continue
         if ok:
             inserted += 1
-        _publish(settings, "fbh_cold", severity, payload)
+        _publish(
+            settings, "fbh_cold", severity, payload, entity=nats_publisher.slugify(str(row["room"]))
+        )
         published += 1
     return inserted, published
 
@@ -377,7 +388,13 @@ def _detect_window_while_heating(
             continue
         if ok:
             inserted += 1
-        _publish(settings, "window_while_heating", severity, payload)
+        _publish(
+            settings,
+            "window_while_heating",
+            severity,
+            payload,
+            entity=nats_publisher.slugify(str(row["room"])),
+        )
         published += 1
     return inserted, published
 
@@ -481,7 +498,9 @@ def _detect_appliance_runtime(
             continue
         if ok:
             inserted += 1
-        _publish(settings, "appliance_runtime", severity, payload)
+        _publish(
+            settings, "appliance_runtime", severity, payload, entity=nats_publisher.slugify(ga)
+        )
         published += 1
     return inserted, published
 

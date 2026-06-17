@@ -171,6 +171,9 @@ def _score_group(
                     settings,
                     uc=uc.uc,
                     severity=severity,
+                    entity=nats_publisher.entity_slug(
+                        dict(zip(uc.group_cols, gvals, strict=True))
+                    ),
                     payload={
                         "source": uc.source_cagg,
                         "score_samples": float(score),
