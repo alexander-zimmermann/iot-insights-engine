@@ -50,6 +50,13 @@ class UnivariateMetric:
     # (trusted registry input). Used to keep bursty channels out of a
     # stationary z-score that a dedicated detector handles instead.
     source_filter: str | None = None
+    # When False, the published anomaly carries `entity=None` (subject
+    # `anomaly.<uc>`) even though `group_cols` is set. Use for house-level
+    # metrics that the source CAGG happens to store per-group (e.g.
+    # consumer_total/grid_power duplicated under both inverter_ids): the
+    # grouping/baseline join stays correct while a `source_filter` dedups to
+    # one row, but the routing entity must be None so it maps to one KNX-GA.
+    emit_entity: bool = True
 
 
 @dataclass(frozen=True)
@@ -189,7 +196,8 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
     ),
     # consumer_total/grid_power are house-level but the powerflow CAGG stores
     # them under BOTH inverter_ids (duplicate values). Scope to inverter 1 so
-    # the anomaly fires once → one KNX-GA (entity slug `inv1`).
+    # the anomaly fires once; `emit_entity=False` keeps the routing entity None
+    # (subject `anomaly.<uc>`) so it maps to one house-level KNX-GA.
     UnivariateMetric(
         uc="consumer_total",
         source_cagg="solaredge_powerflow_1h",
@@ -198,6 +206,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         stats_field="consumer_total_stats",
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
+        emit_entity=False,
     ),
     UnivariateMetric(
         uc="grid_power",
@@ -207,6 +216,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         stats_field="grid_power_stats",
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
+        emit_entity=False,
     ),
     # Wallbox meter — group on `meter_id`.
     UnivariateMetric(
