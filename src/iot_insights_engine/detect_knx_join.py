@@ -243,7 +243,12 @@ _FBH_COLD_SQL = f"""
         WHERE bucket <= date_trunc('hour', now()) - interval '1 hour'
     ),
     per_room AS (
+        -- Room names repeat across floors (e.g. "Flur" exists in EG and OG),
+        -- so group on (floor, room). Floor = 2nd dotted segment of the GA
+        -- name (`<Gewerk>.<EG|OG>.<room>...`) — a stable name-based key, not
+        -- the GA address, so it survives GA renumbering.
         SELECT c.room,
+          split_part(c.name, '.', 2) AS floor,
           avg(k.avg_value) FILTER (
             WHERE c.name LIKE '%FBH.Stellwert-Status'
           ) AS stellwert_pct,
@@ -258,11 +263,11 @@ _FBH_COLD_SQL = f"""
         WHERE k.bucket > (SELECT bucket FROM last_bucket) - interval '{FBH_LOOKBACK_HOURS} hours'
           AND k.bucket <= (SELECT bucket FROM last_bucket)
           AND c.room IS NOT NULL
-        GROUP BY c.room
+        GROUP BY c.room, split_part(c.name, '.', 2)
     )
     SELECT
         (SELECT bucket FROM last_bucket) AS bucket,
-        room, stellwert_pct, soll_c, ist_c,
+        room, floor, stellwert_pct, soll_c, ist_c,
         (soll_c - ist_c) AS gap_c
     FROM per_room
     WHERE stellwert_pct IS NOT NULL
@@ -286,11 +291,13 @@ def _detect_fbh_cold(
         severity = _classify_fbh(gap)
         if severity is None:
             continue
-        entity = nats_publisher.slugify(str(row["room"]))
+        room_label = f"{row['floor']} {row['room']}"
+        entity = nats_publisher.slugify(room_label)
         fired.add(entity)
         payload = {
             "entity": entity,
             "room": row["room"],
+            "floor": row["floor"],
             "stellwert_pct": float(row["stellwert_pct"]),
             "soll_c": float(row["soll_c"]),
             "ist_c": float(row["ist_c"]),
@@ -302,7 +309,7 @@ def _detect_fbh_cold(
             conn,
             bucket=row["bucket"],
             uc="fbh_cold",
-            room=str(row["room"]),
+            room=room_label,
             severity=severity,
             score=gap,
             payload=payload,
@@ -331,7 +338,10 @@ _WINDOW_HEATING_SQL = f"""
         )
     ),
     per_room AS (
+        -- Group on (floor, room): room names repeat across floors. Floor =
+        -- 2nd dotted segment of the GA name (stable, GA-renumber-proof).
         SELECT c.room,
+          split_part(c.name, '.', 2) AS floor,
           max(k.avg_value) FILTER (
             WHERE c.name LIKE '%Fenster%Geöffnet-Status'
               AND c.name NOT LIKE '%Stellung-%'
@@ -344,11 +354,11 @@ _WINDOW_HEATING_SQL = f"""
         JOIN ga_catalog c ON c.ga = k.ga
         WHERE k.bucket = (SELECT bucket FROM last_bucket)
           AND c.room IS NOT NULL
-        GROUP BY c.room
+        GROUP BY c.room, split_part(c.name, '.', 2)
     )
     SELECT
         (SELECT bucket FROM last_bucket) AS bucket,
-        p.room, p.window_open, p.stellwert_pct,
+        p.room, p.floor, p.window_open, p.stellwert_pct,
         (SELECT outdoortemp_avg FROM outdoor) AS outdoortemp_c
     FROM per_room p
     WHERE p.window_open IS NOT NULL AND p.window_open > 0
@@ -371,11 +381,13 @@ def _detect_window_while_heating(
         severity = _classify_window(stellwert)
         if severity is None:
             continue
-        entity = nats_publisher.slugify(str(row["room"]))
+        room_label = f"{row['floor']} {row['room']}"
+        entity = nats_publisher.slugify(room_label)
         fired.add(entity)
         payload = {
             "entity": entity,
             "room": row["room"],
+            "floor": row["floor"],
             "window_open": bool(row["window_open"]),
             "stellwert_pct": stellwert,
             "outdoortemp_c": float(row["outdoortemp_c"]),
@@ -385,7 +397,7 @@ def _detect_window_while_heating(
             conn,
             bucket=row["bucket"],
             uc="window_while_heating",
-            room=str(row["room"]),
+            room=room_label,
             severity=severity,
             score=stellwert,
             payload=payload,

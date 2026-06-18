@@ -54,6 +54,24 @@ def test_registry_slugs_unique_across_families() -> None:
     assert not overlap, f"KNX-join slugs collide with other families: {overlap}"
 
 
+def test_fbh_and_window_group_by_floor() -> None:
+    """Room names repeat across floors (e.g. "Flur" in EG and OG). Both
+    per-room detectors must group on (room, floor) — floor taken from the
+    2nd dotted name segment — or the two Flure merge into one anomaly and
+    the entity slug can't route to a single KNX-GA."""
+    for sql in (detect_knx_join._FBH_COLD_SQL, detect_knx_join._WINDOW_HEATING_SQL):
+        assert "split_part(c.name, '.', 2)" in sql
+        assert "GROUP BY c.room, split_part(c.name, '.', 2)" in sql
+
+
+def test_floor_qualified_room_slugs_are_distinct() -> None:
+    from iot_insights_engine.nats_publisher import slugify
+
+    assert slugify("EG Flur") == "eg-flur"
+    assert slugify("OG Flur") == "og-flur"
+    assert slugify("EG Gäste WC") == "eg-gaeste-wc"
+
+
 def test_every_registered_uc_has_implementation() -> None:
     """A registry entry without a matching `_DETECTORS` key is dead — the
     dispatcher logs `uc_not_implemented` and silently skips it."""
