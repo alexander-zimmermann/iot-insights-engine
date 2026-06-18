@@ -164,6 +164,17 @@ def _scan_metric(
     return hits
 
 
+def _entity_for(metric: UnivariateMetric, group_values: tuple[Any, ...]) -> str | None:
+    """Routing entity for the anomaly subject/payload. None when the metric
+    opts out of per-group routing (`emit_entity=False`) — its `group_cols`
+    only exist to keep the baseline join correct, not to fan out to GAs."""
+    if not metric.emit_entity:
+        return None
+    return nats_publisher.entity_slug(
+        dict(zip(metric.group_cols, group_values, strict=True))
+    )
+
+
 def _insert_anomaly(
     conn: psycopg.Connection[Any],
     metric: UnivariateMetric,
@@ -177,7 +188,7 @@ def _insert_anomaly(
     detector) keys."""
     group = dict(zip(metric.group_cols, hit.group_values, strict=True))
     payload = {
-        "entity": nats_publisher.entity_slug(group),
+        "entity": _entity_for(metric, hit.group_values),
         "group": group,
         "mean": hit.mean,
         "stddev": hit.stddev,
@@ -250,9 +261,7 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
                 continue
             fired: set[str | None] = set()
             for hit in hits:
-                entity = nats_publisher.entity_slug(
-                    dict(zip(metric.group_cols, hit.group_values, strict=True))
-                )
+                entity = _entity_for(metric, hit.group_values)
                 fired.add(entity)
                 inserted, old_severity = _insert_anomaly(conn, metric, hit)
                 total_hits += 1

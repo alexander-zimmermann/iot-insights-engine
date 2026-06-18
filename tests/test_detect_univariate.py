@@ -32,6 +32,45 @@ def _metric(
     )
 
 
+def test_entity_for_grouped_metric_uses_slug() -> None:
+    metric = UnivariateMetric(
+        uc="pv_production",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="pv_production_avg",
+        stats_field="pv_production_stats",
+        group_cols=("inverter_id",),
+    )
+    assert detect_univariate._entity_for(metric, (1,)) == "inv1"
+    assert detect_univariate._entity_for(metric, (2,)) == "inv2"
+
+
+def test_entity_for_emit_entity_false_is_none() -> None:
+    # House-level metric that is grouped only to keep the baseline join
+    # correct — it must route to a single GA, so entity is None despite the
+    # group_cols/group_values being present.
+    metric = UnivariateMetric(
+        uc="grid_power",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="grid_power_avg",
+        stats_field="grid_power_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+    )
+    assert detect_univariate._entity_for(metric, (1,)) is None
+
+
+def test_registry_house_level_pv_metrics_opt_out_of_entity() -> None:
+    # Lock the intent: the two duplicated-under-both-inverters metrics route
+    # to one house-level KNX-GA each (anomaly.<uc>, no entity suffix).
+    by_uc = {m.uc: m for m in registry.UNIVARIATE_METRICS}
+    assert by_uc["grid_power"].emit_entity is False
+    assert by_uc["consumer_total"].emit_entity is False
+    assert by_uc["pv_production"].emit_entity is True
+
+
 def test_classify_thresholds() -> None:
     assert detect_univariate._classify(0.0) is None
     assert detect_univariate._classify(2.9) is None
