@@ -151,5 +151,5 @@ def test_run_isolates_per_uc_score_failure(monkeypatch: pytest.MonkeyPatch) -> N
 
     rc = score_iforest.run(_settings(), [])
     assert rc == 0
-    # All UCs attempted despite the first one raising.
-    assert len(calls) == len(registry.IFOREST_USECASES)
+    # All non-silenced UCs attempted despite the first one raising.
+    assert len(calls) == len([uc for uc in registry.IFOREST_USECASES if not uc.silenced])
