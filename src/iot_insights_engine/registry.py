@@ -218,6 +218,77 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         source_filter="inverter_id = 1",
         emit_entity=False,
     ),
+    # Grid import/export and PV self-consumption — same house-level pattern as
+    # grid_power/consumer_total (powerflow stores them under both inverter_ids).
+    UnivariateMetric(
+        uc="grid_consumption",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="grid_consumption_avg",
+        stats_field="grid_consumption_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+    ),
+    UnivariateMetric(
+        uc="grid_delivery",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="grid_delivery_avg",
+        stats_field="grid_delivery_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+    ),
+    UnivariateMetric(
+        uc="pv_self_consumption",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="consumer_used_pv_production_avg",
+        stats_field="consumer_used_pv_production_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+    ),
+    # Battery — silenced until the storage unit is connected and the
+    # solaredge_battery / powerflow battery columns accumulate ~30 d of
+    # history. Flip `silenced=False` once the baseline is mature. Charge +
+    # discharge come from the powerflow CAGG (house-level, inverter 1), SOC
+    # from the dedicated battery baseline.
+    UnivariateMetric(
+        uc="battery_charge",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="battery_charge_avg",
+        stats_field="battery_charge_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+        silenced=True,
+    ),
+    UnivariateMetric(
+        uc="battery_discharge",
+        source_cagg="solaredge_powerflow_1h",
+        baseline_cagg="solaredge_powerflow_baseline_30d",
+        metric="consumer_used_battery_production_avg",
+        stats_field="consumer_used_battery_production_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+        silenced=True,
+    ),
+    UnivariateMetric(
+        uc="battery_soc",
+        source_cagg="solaredge_battery_1h",
+        baseline_cagg="solaredge_battery_baseline_30d",
+        metric="soc_avg",
+        stats_field="soc_stats",
+        group_cols=("inverter_id",),
+        source_filter="inverter_id = 1",
+        emit_entity=False,
+        deadband_abs=5.0,  # %, ignore sub-5% SOC noise
+        silenced=True,
+    ),
     # Wallbox meter — group on `meter_id`.
     UnivariateMetric(
         uc="wallbox_power_total",
@@ -295,6 +366,20 @@ IFOREST_USECASES: tuple[IsolationForestUseCase, ...] = (
         ),
         group_cols=("inverter_id",),
         include_hour_of_day=True,
+    ),
+    # Battery — single storage unit (no group_cols → house-level subject
+    # `anomaly.battery_iforest`). SOC + power are diurnal (charge midday,
+    # discharge evening), so include hour-of-day. Silenced until the battery
+    # is connected and has cleared warmup; flip `silenced=False` then.
+    IsolationForestUseCase(
+        uc="battery_iforest",
+        source_cagg="solaredge_battery_1h",
+        feature_cols=(
+            "soc_avg",
+            "power_avg",
+        ),
+        include_hour_of_day=True,
+        silenced=True,
     ),
     # Wallbox meter — group on meter_id. Voltage + current per phase
     # catches phase imbalance and brownouts that power_total alone hides.
