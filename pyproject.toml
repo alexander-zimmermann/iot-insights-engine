@@ -18,14 +18,14 @@ classifiers = [
 dependencies = [
     "psycopg[binary,pool]>=3.3.4",
     "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.1",
+    "pydantic-settings>=2.14.2",
     "pyyaml>=6.0.3",
     "structlog>=26.1.0",
     "httpx>=0.28.1",
     "scikit-learn>=1.9.0",
     "statsforecast>=2.0.3",
     "joblib>=1.5.3",
-    "boto3>=1.43.32",
+    "boto3>=1.43.34",
     "pandas>=3.0.3",
     "numpy>=2.4.6",
     "nats-py[nkeys]>=2.15.0",
@@ -33,10 +33,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.1.0",
+    "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
-    "ruff>=0.15.17",
+    "ruff>=0.15.18",
     "mypy>=2.1.0",
     "pre-commit>=4.6.0",
 ]
