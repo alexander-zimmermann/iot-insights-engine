@@ -18,6 +18,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "detect-knx-join",
     "score-seasonal",
     "forecast-solar",
+    "forecast-weather",
     "weekly-report",
 )
 

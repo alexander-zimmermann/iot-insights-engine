@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     # (TIMESTAMPTZ).
     forecast_solar_timezone: str = "Europe/Berlin"
 
+    # Open-Meteo — keyless weather forecast API. We pin the DWD ICON model
+    # (`icon_seamless`) which covers the homelab at ~2 km. Requested with
+    # timezone=UTC, so no local-tz conversion is needed before insert.
+    forecast_weather_lat: float | None = None
+    forecast_weather_lon: float | None = None
+    forecast_weather_base_url: str = "https://api.open-meteo.com/v1/forecast"
+    forecast_weather_model: str = "icon_seamless"
+    forecast_weather_forecast_hours: int = 48
+
     @model_validator(mode="after")
     def _resolve_db_secret_files(self) -> Settings:
         if self.db_username_file:
