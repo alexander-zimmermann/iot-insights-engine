@@ -198,6 +198,10 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
     # them under BOTH inverter_ids (duplicate values). Scope to inverter 1 so
     # the anomaly fires once; `emit_entity=False` keeps the routing entity None
     # (subject `anomaly.<uc>`) so it maps to one house-level KNX-GA.
+    # SILENCED: like grid_consumption/-delivery/pv_self_consumption these read
+    # SolarEdge grid/consumer fields that are invalid until the SolarEdge meter
+    # is live (battery + 400 V) — real grid data is on the KNX Energiezähler
+    # 15/1. Flip `silenced=False` when the SolarEdge meter feeds the powerflow.
     UnivariateMetric(
         uc="consumer_total",
         source_cagg="solaredge_powerflow_1h",
@@ -207,6 +211,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
         emit_entity=False,
+        silenced=True,
     ),
     UnivariateMetric(
         uc="grid_power",
@@ -217,9 +222,14 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
         emit_entity=False,
+        silenced=True,
     ),
     # Grid import/export and PV self-consumption — same house-level pattern as
     # grid_power/consumer_total (powerflow stores them under both inverter_ids).
+    # SILENCED: these read SolarEdge grid/consumer fields, which stay invalid
+    # until the SolarEdge meter goes live (battery + 400 V). The real grid data
+    # lives on the KNX Energiezähler 15/1 meanwhile. Flip `silenced=False` once
+    # the SolarEdge meter feeds the powerflow.
     UnivariateMetric(
         uc="grid_consumption",
         source_cagg="solaredge_powerflow_1h",
@@ -229,6 +239,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
         emit_entity=False,
+        silenced=True,
     ),
     UnivariateMetric(
         uc="grid_delivery",
@@ -239,6 +250,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
         emit_entity=False,
+        silenced=True,
     ),
     UnivariateMetric(
         uc="pv_self_consumption",
@@ -249,6 +261,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         group_cols=("inverter_id",),
         source_filter="inverter_id = 1",
         emit_entity=False,
+        silenced=True,
     ),
     # Battery — silenced until the storage unit is connected and the
     # solaredge_battery / powerflow battery columns accumulate ~30 d of

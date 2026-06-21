@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     forecast_weather_model: str = "icon_seamless"
     forecast_weather_forecast_hours: int = 48
 
+    # Energy-balance job — timezone whose local midnight bounds the "today"
+    # window for the daily kWh counters (matches the meter/account locale).
+    energy_timezone: str = "Europe/Berlin"
+
     @model_validator(mode="after")
     def _resolve_db_secret_files(self) -> Settings:
         if self.db_username_file:
@@ -131,8 +135,7 @@ class Settings(BaseSettings):
     def db_write_dsn(self) -> str:
         if not self.db_write_username or not self.db_write_password:
             raise ValueError(
-                "MCP_DB_WRITE_USERNAME / MCP_DB_WRITE_PASSWORD "
-                "(or *_FILE variants) are required"
+                "MCP_DB_WRITE_USERNAME / MCP_DB_WRITE_PASSWORD (or *_FILE variants) are required"
             )
         user = quote(self.db_write_username, safe="")
         password = quote(self.db_write_password, safe="")

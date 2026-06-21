@@ -35,3 +35,27 @@ def write_connection(settings: Settings) -> Iterator[psycopg.Connection[DictRow]
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def read_connection(settings: Settings) -> Iterator[psycopg.Connection[DictRow]]:
+    """Open a short-lived read-only connection (the RO role).
+
+    For jobs that only SELECT (e.g. energy_balance) so the CronJob does not
+    need write credentials mounted. Same one-shot lifecycle as write_connection.
+    """
+    conn = psycopg.connect(
+        settings.db_dsn,
+        autocommit=True,
+        row_factory=dict_row,
+    )
+    try:
+        log.info(
+            "db_read_connect",
+            host=settings.db_host,
+            database=settings.db_name,
+            user=settings.db_username,
+        )
+        yield conn
+    finally:
+        conn.close()

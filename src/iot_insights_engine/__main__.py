@@ -19,6 +19,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "score-seasonal",
     "forecast-solar",
     "forecast-weather",
+    "energy-balance",
     "weekly-report",
 )
 
