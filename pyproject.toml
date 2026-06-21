@@ -27,7 +27,7 @@ dependencies = [
     "joblib>=1.5.3",
     "boto3>=1.43.34",
     "pandas>=3.0.3",
-    "numpy>=2.4.6",
+    "numpy>=2.5.0",
     "nats-py[nkeys]>=2.15.0",
 ]
 
