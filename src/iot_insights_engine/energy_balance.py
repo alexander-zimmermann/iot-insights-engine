@@ -49,7 +49,9 @@ def _today_deltas(conn: psycopg.Connection[Any], tz: str) -> tuple[float, float,
     of a cumulative counter over the day, floored at 0 (guards a meter reset).
     """
     with conn.cursor() as cur:
-        cur.execute("SET TIME ZONE %s", (tz,))
+        # SET TIME ZONE takes no bind params ("SET TIME ZONE $1" is a syntax
+        # error) — set_config() is the parameterised equivalent.
+        cur.execute("SELECT set_config('timezone', %s, false)", (tz,))
 
         # Generation: inverter energytotal is a lifetime Wh counter, per inverter_id.
         # Delta per inverter, then sum (can't nest sum(last(...))).
