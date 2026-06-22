@@ -16,6 +16,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "train-iforest",
     "score-iforest",
     "detect-knx-join",
+    "detect-pv-underperformance",
     "score-seasonal",
     "forecast-solar",
     "forecast-weather",
