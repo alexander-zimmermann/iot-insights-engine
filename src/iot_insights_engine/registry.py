@@ -330,7 +330,13 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         # Bursty appliance power is handled by the dedicated knx_appliance_*
         # path (standby-drift + left-on); a stationary z-score here would just
         # flag every normal use of the oven/coffee machine/etc.
-        source_filter="knx_name NOT LIKE '%Stromwert'",
+        # Brightness/lux channels (DPT 9.004) are daylight-driven with a huge
+        # dynamic range and sit near zero overnight; a stationary z-score
+        # flags every sunrise and light switch, so they are carved out here.
+        source_filter=(
+            "knx_name NOT LIKE '%Stromwert' "
+            "AND knx_name NOT LIKE '%Helligkeit%'"
+        ),
     ),
     # KNX appliances — standby-drift on the hourly idle floor (`min(value)`).
     # The source CAGG is pre-filtered to `%Stromwert` channels and carries a
