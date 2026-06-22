@@ -10,9 +10,10 @@ per-inverter iforest detectors (which watch electrical behaviour) with a
 yield/performance signal.
 
 Compares **cumulative energy over today's elapsed hours** (robust to single
-cloudy hours): actual = Σ inverter ``energytotal`` deltas; expected = Σ
-forecast watts for today's past hours. Only judges once enough is expected that
-a shortfall is meaningful.
+cloudy hours): actual = Σ inverter ``energytotal`` deltas; expected = the
+time-weighted integral of the forecast power curve over today's elapsed time
+(forecast.solar is 15-min resolution → integrate, don't sum the samples). Only
+judges once enough is expected that a shortfall is meaningful.
 """
 
 from __future__ import annotations
@@ -69,10 +70,16 @@ def _actual_and_expected(conn: psycopg.Connection[Any], tz: str) -> tuple[float,
         """)
         actual = float((cur.fetchone() or {}).get("actual_kwh") or 0.0)
 
-        # Hourly forecast watts for today's elapsed hours → kWh (W × 1h, summed).
+        # Expected energy so far = time-weighted integral of the forecast power
+        # curve over today's elapsed time. forecast.solar is 15-min resolution,
+        # so summing the watt samples would over-count ~4x — integrate instead.
+        # The forecast slice is tiny (tens of rows), so time_weight is cheap here.
         cur.execute(
             """
-            SELECT COALESCE(sum(forecast_value), 0) / 1000.0 AS expected_kwh
+            SELECT COALESCE(
+                       integral(time_weight('Linear', forecast_for, forecast_value), 'hours'),
+                       0
+                   ) / 1000.0 AS expected_kwh
             FROM mcp_forecasts
             WHERE source = %s AND metric = %s AND model = %s
               AND forecast_for >= date_trunc('day', now())
