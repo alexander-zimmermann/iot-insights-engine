@@ -36,6 +36,13 @@
       "enabled": false,
     },
     {
+      // statsforecast 2.0.3 pins scipy<1.16, which caps numpy<2.5. Hold numpy
+      // below 2.5.0 until a statsforecast release relaxes the scipy bound.
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["numpy"],
+      "allowedVersions": "<2.5.0",
+    },
+    {
       "matchManagers": ["pep621"],
       "matchUpdateTypes": ["patch", "minor"],
       "groupName": "python deps (non-major)",
