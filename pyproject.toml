@@ -25,8 +25,8 @@ dependencies = [
     "scikit-learn>=1.9.0",
     "statsforecast>=2.0.3",
     "joblib>=1.5.3",
-    "boto3>=1.43.34",
-    "pandas>=3.0.3",
+    "boto3>=1.43.36",
+    "pandas>=3.0.4",
     "numpy>=2.4.6",
     "nats-py[nkeys]>=2.15.0",
 ]
@@ -36,7 +36,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
-    "ruff>=0.15.18",
+    "ruff>=0.15.20",
     "mypy>=2.1.0",
     "pre-commit>=4.6.0",
 ]
