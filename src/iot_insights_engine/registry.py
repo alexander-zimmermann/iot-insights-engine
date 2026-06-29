@@ -131,6 +131,10 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         baseline_cagg="ems_esp_boiler_baseline_30d",
         metric="curburnpow_avg",
         stats_field="curburnpow_stats",
+        # Summer burner power is idle with sporadic DHW-reheat spikes, so the
+        # baseline is near-zero — floor stddev so a hot-water draw can't explode
+        # the z-score. Inert in the heating season where real variance dominates.
+        min_stddev_abs=6.0,
     ),
     UnivariateMetric(
         uc="boiler_curflowtemp",
