@@ -322,7 +322,7 @@ wheels = [
 
 [[package]]
 name = "iot-insights-engine"
-version = "1.9.2"
+version = "1.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
