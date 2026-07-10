@@ -1,6 +1,6 @@
 [project]
 name = "iot-insights-engine"
-version = "1.10.0"
+version = "1.10.1"
 description = "TSDB-backed background jobs: anomaly detection (z-score, IsolationForest, KNX-joins), seasonal forecasting (statsforecast), external forecast pulls (Forecast.Solar). Companion to iot-mcp-bridge — owns all writes to mcp_anomalies + mcp_forecasts."
 readme = "README.md"
 license = "GPL-2.0-or-later"
@@ -26,7 +26,7 @@ dependencies = [
     "statsforecast>=2.0.3",
     "joblib>=1.5.3",
     "boto3>=1.43.38",
-    "pandas>=3.0.4",
+    "pandas>=3.0.3",
     "numpy>=2.4.6",
     "nats-py[nkeys]>=2.15.0",
 ]
