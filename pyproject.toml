@@ -23,10 +23,10 @@ dependencies = [
     "structlog>=26.1.0",
     "httpx>=0.28.1",
     "scikit-learn>=1.9.0",
-    "statsforecast>=2.0.3",
+    "statsforecast>=2.1.1",
     "joblib>=1.5.3",
-    "boto3>=1.43.46",
-    "pandas>=3.0.3",
+    "boto3>=1.43.56",
+    "pandas>=3.0.5",
     "numpy>=2.4.6",
     "nats-py[nkeys]>=2.15.0",
 ]
@@ -36,9 +36,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
-    "ruff>=0.15.21",
-    "mypy>=2.2.0",
-    "pre-commit>=4.6.0",
+    "ruff>=0.16.0",
+    "mypy>=2.3.0",
+    "pre-commit>=4.6.1",
 ]
 
 [project.scripts]
