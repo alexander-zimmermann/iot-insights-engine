@@ -43,6 +43,12 @@
       "allowedVersions": "<2.5.0",
     },
     {
+      // statsforecast 2.1.x caps pandas<3.0.0; project needs pandas 3.x. Hold at 2.0.x.
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["statsforecast"],
+      "allowedVersions": "<2.1.0",
+    },
+    {
       "matchManagers": ["pep621"],
       "matchUpdateTypes": ["patch", "minor"],
       "groupName": "python deps (non-major)",
