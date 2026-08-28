@@ -142,6 +142,10 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         baseline_cagg="ems_esp_boiler_baseline_30d",
         metric="curflowtemp_avg",
         stats_field="curflowtemp_stats",
+        # Baseline stddev over the 168 hour x weekday slots: min 0.18, p10
+        # 1.42, median 2.54 K. The floor lifts only the degenerate tail —
+        # in a 0.18 K slot a 1 K deviation would otherwise score z=5.6.
+        min_stddev_abs=1.0,
     ),
     UnivariateMetric(
         uc="boiler_rettemp",
@@ -149,13 +153,9 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         baseline_cagg="ems_esp_boiler_baseline_30d",
         metric="rettemp_avg",
         stats_field="rettemp_stats",
-    ),
-    UnivariateMetric(
-        uc="boiler_heatingactive",
-        source_cagg="ems_esp_boiler_1h",
-        baseline_cagg="ems_esp_boiler_baseline_30d",
-        metric="heatingactive_samples",
-        stats_field="heatingactive_stats",
+        # Baseline stddev: min 0.04, p10 1.01, median 2.39 K. Same floor as
+        # the flow temperature — the 0.04 K slots are the noise source.
+        min_stddev_abs=1.0,
     ),
     # DHW — `ems_esp_dhw_1h` × `ems_esp_dhw_baseline_30d`.
     UnivariateMetric(
@@ -164,6 +164,8 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         baseline_cagg="ems_esp_dhw_baseline_30d",
         metric="curtemp_avg",
         stats_field="curtemp_stats",
+        # Baseline stddev: min 0.30, p10 1.16, median 2.61 K.
+        min_stddev_abs=1.0,
     ),
     UnivariateMetric(
         uc="dhw_curflow",
@@ -171,6 +173,15 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         baseline_cagg="ems_esp_dhw_baseline_30d",
         metric="curflow_avg",
         stats_field="curflow_stats",
+        # Unlike the temperatures this channel is bursty and mostly zero:
+        # baseline stddev min 0.000, median 0.063, and the hourly mean spans
+        # only 0.00-0.90. In a no-draw slot any tap gives an unbounded score.
+        # The floor plus a deadband bound that, but a draw at an unusual hour
+        # stays statistically extreme while being operationally normal — this
+        # channel likely wants a dedicated detector rather than a stationary
+        # z-score, the same carve-out the appliance power channels got.
+        min_stddev_abs=0.05,
+        deadband_abs=0.25,
     ),
     # SolarEdge inverter — group on `inverter_id`.
     UnivariateMetric(
@@ -455,10 +466,3 @@ SEASONAL_MODELS: tuple[SeasonalModel, ...] = (
 )
 
 
-def all_slugs() -> set[str]:
-    return (
-        {m.uc for m in UNIVARIATE_METRICS}
-        | {u.uc for u in IFOREST_USECASES}
-        | {k.uc for k in KNX_JOIN_USECASES}
-        | {s.uc for s in SEASONAL_MODELS}
-    )
