@@ -123,6 +123,21 @@ class SeasonalModel:
     silenced: bool = False
 
 
+def _knx_dpt_scope(dpts: tuple[str, ...], *, name_not_like: tuple[str, ...] = ()) -> str:
+    """`source_filter` scoping a KNX metric to the GAs the catalog types as one
+    of `dpts`, minus optional name carve-outs.
+
+    `knx_1h` carries no DPT, so `ga_catalog` is the only place that knows what a
+    channel *is* — without it `avg_value` is taken over enums and scenes where a
+    mean has no meaning. Trusted registry input: the literals are written in
+    this file, never user data.
+    """
+    quoted_dpts = ", ".join(f"'{d}'" for d in dpts)
+    clauses = [f"dpt IN ({quoted_dpts})"]
+    clauses += [f"name NOT LIKE '{pattern}'" for pattern in name_not_like]
+    return f"ga IN (SELECT ga FROM ga_catalog WHERE {' AND '.join(clauses)})"
+
+
 UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
     # Heating boiler — `ems_esp_boiler_1h` × `ems_esp_boiler_baseline_30d`.
     UnivariateMetric(
@@ -326,32 +341,91 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         stats_field="power_total_stats",
         group_cols=("meter_id",),
     ),
-    # KNX — group on `(ga, knx_name)`. One UC for all values; the anomaly
-    # row carries the GA so insights tools can join against ga_catalog
-    # for the human-readable name and the source room/function.
+    # KNX — group on `(ga, knx_name)`, one entry per unit family so the stddev
+    # floors below are expressed in the channel's own unit. The anomaly row
+    # carries the GA so insights tools can join ga_catalog for name/room.
+    # Everything the catalog types as something else (booleans, enums, scenes,
+    # strings, cumulative counters, setpoints) is out of scope by construction —
+    # `avg_value` over those is not a physical quantity.
     UnivariateMetric(
-        uc="knx_value",
+        uc="knx_temperature",
         source_cagg="knx_1h",
         baseline_cagg="knx_baseline_30d",
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # Heterogeneous units (lux, °C, azimuth, setpoints) → only *relative*
-        # knobs are safe here. The relative stddev floor caps the variance
-        # explosion on near-constant channels (lux ~0 overnight scoring 1e15);
-        # the relative deadband drops deviations below 25% of the baseline mean.
-        min_stddev_rel=0.15,
-        deadband_rel=0.25,
-        # Bursty appliance power is handled by the dedicated knx_appliance_*
-        # path (standby-drift + left-on); a stationary z-score here would just
-        # flag every normal use of the oven/coffee machine/etc.
-        # Brightness/lux channels (DPT 9.004) are daylight-driven with a huge
-        # dynamic range and sit near zero overnight; a stationary z-score
-        # flags every sunrise and light switch, so they are carved out here.
-        source_filter=(
-            "knx_name NOT LIKE '%Stromwert' "
-            "AND knx_name NOT LIKE '%Helligkeit%'"
+        # K — floor at the 10th percentile of the baseline slot stddev (0.97).
+        min_stddev_abs=1.0,
+        deadband_abs=1.0,
+        # Out: setpoints and alarm thresholds (user-driven), appliance temps
+        # (cook cycles), and the boiler/PV channels their own UCs already score.
+        source_filter=_knx_dpt_scope(
+            ("9.001",),
+            name_not_like=(
+                "%Soll%",
+                "%Alarm%",
+                "Haushaltstechnik.%",
+                "Versorgungstechnik.Gastherme.%",
+                "Versorgungstechnik.Photovoltaik.%",
+            ),
         ),
+    ),
+    UnivariateMetric(
+        uc="knx_humidity",
+        source_cagg="knx_1h",
+        baseline_cagg="knx_baseline_30d",
+        metric="avg_value",
+        stats_field="value_stats",
+        group_cols=("ga", "knx_name"),
+        # %rH — floor at the 10th percentile of the baseline slot stddev (2.4).
+        min_stddev_abs=2.5,
+        deadband_abs=5.0,
+        source_filter=_knx_dpt_scope(("9.007",)),
+    ),
+    UnivariateMetric(
+        uc="knx_air_quality",
+        source_cagg="knx_1h",
+        baseline_cagg="knx_baseline_30d",
+        metric="avg_value",
+        stats_field="value_stats",
+        group_cols=("ga", "knx_name"),
+        # ppm — CO2 and VOC. Floor at the 10th percentile of the slot stddev
+        # (20.9); the deadband sits above VOC's median slot stddev (27.5).
+        min_stddev_abs=20.0,
+        deadband_abs=40.0,
+        source_filter=_knx_dpt_scope(("9.008",)),
+    ),
+    UnivariateMetric(
+        uc="knx_power",
+        source_cagg="knx_1h",
+        baseline_cagg="knx_baseline_30d",
+        metric="avg_value",
+        stats_field="value_stats",
+        group_cols=("ga", "knx_name"),
+        # W — 161 of 168 slots on the grid-import phase sit below this floor;
+        # ordinary load tops out ~1.7 kW, so critical means ~3 kW off profile.
+        min_stddev_abs=500.0,
+        deadband_abs=200.0,
+        # Out: PV and wallbox power, scored from their own sources already.
+        source_filter=_knx_dpt_scope(
+            ("14.056",),
+            name_not_like=(
+                "Versorgungstechnik.Photovoltaik.%",
+                "Versorgungstechnik.Wallbox.%",
+            ),
+        ),
+    ),
+    UnivariateMetric(
+        uc="knx_voltage",
+        source_cagg="knx_1h",
+        baseline_cagg="knx_baseline_30d",
+        metric="avg_value",
+        stats_field="value_stats",
+        group_cols=("ga", "knx_name"),
+        # V — live phases measured 229.6-246.1, so ±6 V is normal drift.
+        min_stddev_abs=2.0,
+        deadband_abs=3.0,
+        source_filter=_knx_dpt_scope(("14.027",)),
     ),
     # KNX appliances — standby-drift on the hourly idle floor (`min(value)`).
     # The source CAGG is pre-filtered to `%Stromwert` channels and carries a

@@ -122,6 +122,16 @@ def test_zscore_absolute_floor_and_deadband_appliance_standby() -> None:
     assert detect_univariate._zscore(50.0, 43.0, 0.5, m) is None
 
 
+def test_zscore_knx_power_floor_survives_a_near_zero_baseline() -> None:
+    """`15/1/4` (grid import L1): 196.67 W against a 0.08 W baseline whose
+    effective stddev was 0.227 W scored 864.94 under relative-only knobs."""
+    m = {u.uc: u for u in registry.UNIVARIATE_METRICS}["knx_power"]
+    assert detect_univariate._zscore(196.67, 0.08, 0.227, m) is None
+    # A genuine 3 kW excess over a quiet hour still reaches critical.
+    z = detect_univariate._zscore(3000.08, 0.08, 0.227, m)
+    assert z is not None and detect_univariate._classify(z) == "critical"
+
+
 def test_registry_slugs_unique() -> None:
     """A duplicate slug would break NATS routing (same subject, ambiguous
     KNX-GA mapping). Catch the typo at import time."""
