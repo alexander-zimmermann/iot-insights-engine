@@ -354,7 +354,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # K — room/outdoor sensors, dew points, KWL. Sub-1 K is sensor noise.
+        # K — floor at the 10th percentile of the baseline slot stddev (0.97).
         min_stddev_abs=1.0,
         deadband_abs=1.0,
         # Out: setpoints and alarm thresholds (user-driven), appliance temps
@@ -377,8 +377,8 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # %rH — sensor resolution is ~1 %, and showering/cooking moves it by 5 %.
-        min_stddev_abs=3.0,
+        # %rH — floor at the 10th percentile of the baseline slot stddev (2.4).
+        min_stddev_abs=2.5,
         deadband_abs=5.0,
         source_filter=_knx_dpt_scope(("9.007",)),
     ),
@@ -389,9 +389,10 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # ppm — CO2 and VOC. Occupancy swings hundreds of ppm within the hour.
-        min_stddev_abs=50.0,
-        deadband_abs=100.0,
+        # ppm — CO2 and VOC. Floor at the 10th percentile of the slot stddev
+        # (20.9); the deadband sits above VOC's median slot stddev (27.5).
+        min_stddev_abs=20.0,
+        deadband_abs=40.0,
         source_filter=_knx_dpt_scope(("9.008",)),
     ),
     UnivariateMetric(
@@ -401,8 +402,8 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # W — the meter sits at zero for whole hours, so only an absolute floor
-        # bounds it: critical now means ~3 kW off the hour's profile.
+        # W — 161 of 168 slots on the grid-import phase sit below this floor;
+        # ordinary load tops out ~1.7 kW, so critical means ~3 kW off profile.
         min_stddev_abs=500.0,
         deadband_abs=200.0,
         # Out: PV and wallbox power, scored from their own sources already.
@@ -421,7 +422,7 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
         metric="avg_value",
         stats_field="value_stats",
         group_cols=("ga", "knx_name"),
-        # V — mains per phase; normal drift is a few volts around 230.
+        # V — live phases measured 229.6-246.1, so ±6 V is normal drift.
         min_stddev_abs=2.0,
         deadband_abs=3.0,
         source_filter=_knx_dpt_scope(("14.027",)),
