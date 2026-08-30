@@ -84,7 +84,6 @@ def test_temperature_scope_keeps_measurements_and_drops_setpoints() -> None:
 
 
 def test_unit_family_scopes() -> None:
-    assert _scoped_gas(_KNX_METRICS["knx_humidity"].source_filter or "") == {"8/1/124"}
     assert _scoped_gas(_KNX_METRICS["knx_air_quality"].source_filter or "") == {"8/1/131"}
     assert _scoped_gas(_KNX_METRICS["knx_voltage"].source_filter or "") == {"15/1/21"}
     # PV and wallbox power are scored from their own sources, not the KNX mirror.
@@ -100,6 +99,14 @@ def test_non_continuous_classes_are_scored_by_nobody() -> None:
     non_continuous = {"1", "3", "5", "7", "10", "11", "13", "16", "17", "19", "20", "232"}
     out_of_scope = {ga for ga, dpt, _ in _CATALOG if dpt.split(".")[0] in non_continuous}
     assert not scored & out_of_scope
+
+
+def test_humidity_is_not_z_scored() -> None:
+    """Humidity moves together across rooms (r=0.8-0.95 against the house-wide
+    component), so a per-entity z-score fires everywhere on one weather change.
+    It belongs in a residual detector, not this family."""
+    for metric in _KNX_METRICS.values():
+        assert "8/1/124" not in _scoped_gas(metric.source_filter or "")
 
 
 def test_reported_offender_is_out_of_scope() -> None:

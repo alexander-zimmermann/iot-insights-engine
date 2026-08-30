@@ -347,6 +347,9 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
     # Everything the catalog types as something else (booleans, enums, scenes,
     # strings, cumulative counters, setpoints) is out of scope by construction —
     # `avg_value` over those is not a physical quantity.
+    # Humidity (9.007) is out for a different reason: measured at r=0.8-0.95
+    # across rooms, it is a common-mode signal, so a per-room z-score fires
+    # house-wide on one weather change. It needs a residual detector.
     UnivariateMetric(
         uc="knx_temperature",
         source_cagg="knx_1h",
@@ -369,18 +372,6 @@ UNIVARIATE_METRICS: tuple[UnivariateMetric, ...] = (
                 "Versorgungstechnik.Photovoltaik.%",
             ),
         ),
-    ),
-    UnivariateMetric(
-        uc="knx_humidity",
-        source_cagg="knx_1h",
-        baseline_cagg="knx_baseline_30d",
-        metric="avg_value",
-        stats_field="value_stats",
-        group_cols=("ga", "knx_name"),
-        # %rH — floor at the 10th percentile of the baseline slot stddev (2.4).
-        min_stddev_abs=2.5,
-        deadband_abs=5.0,
-        source_filter=_knx_dpt_scope(("9.007",)),
     ),
     UnivariateMetric(
         uc="knx_air_quality",
