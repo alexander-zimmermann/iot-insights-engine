@@ -14,9 +14,10 @@ plus one array per metric. We request ``timezone=UTC`` so the timestamps
 are already UTC — no local-tz conversion needed before the TIMESTAMPTZ
 insert.
 
-The persisted weather (vs an in-process cache) is what later lets the
-MCP server's get_weather_forecast tool read back a stable 48 h horizon,
-and gives the seasonal heating model a weather exogenous variable.
+The persisted weather (vs an in-process cache) is what lets the MCP
+server's get_weather_forecast tool read back a stable 48 h horizon, and
+gives the deviation-from-expectation faults a reference to compare
+against.
 """
 
 from __future__ import annotations
