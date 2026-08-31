@@ -14,7 +14,7 @@ import httpx
 import pytest
 import respx
 
-from iot_insights_engine import forecast_solar
+from iot_insights_engine import forecast_solar, nats_publisher
 from iot_insights_engine.config import Settings
 
 
@@ -183,7 +183,7 @@ def test_compute_scalars_partial_response() -> None:
 
 def test_publish_scalars_skips_without_nats() -> None:
     s = _settings()  # nats_servers is None
-    with patch.object(forecast_solar.nats_publisher, "publish") as pub:
+    with patch.object(nats_publisher, "publish") as pub:
         forecast_solar._publish_scalars(s, {"today_kwh": 31.0})
     pub.assert_not_called()
 
@@ -191,7 +191,7 @@ def test_publish_scalars_skips_without_nats() -> None:
 def test_publish_scalars_publishes_each_subject() -> None:
     s = _settings()
     s.nats_servers = "nats://localhost:4222"
-    with patch.object(forecast_solar.nats_publisher, "publish") as pub:
+    with patch.object(nats_publisher, "publish") as pub:
         forecast_solar._publish_scalars(s, {"today_kwh": 31.0, "now_watts": 5400.0})
     assert pub.call_count == 2
     subjects = {call.args[1] for call in pub.call_args_list}
