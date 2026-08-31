@@ -9,6 +9,9 @@ from __future__ import annotations
 
 SEVERITY_ORDER: tuple[str, ...] = ("info", "warning", "critical")
 
+# The 1-byte tiers written to the anomaly GAs; 0 clears.
+CLEAR, INFO, WARNING, CRITICAL = 0, 1, 2, 3
+
 
 def severity_level(severity: str | None) -> int:
     """Numeric tier for the KNX payload: clear/None=0, info=1, warning=2,
