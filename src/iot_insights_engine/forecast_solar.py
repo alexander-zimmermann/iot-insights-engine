@@ -10,11 +10,10 @@ instead of creating a duplicate.
 The API returns naive local timestamps (account timezone, see
 ``MCP_FORECAST_SOLAR_TIMEZONE``); they are converted to UTC-aware
 datetimes before insert so ``forecast_for`` (TIMESTAMPTZ) lines up
-with the UTC-based seasonal forecasts in the same table.
+with the other forecasts in the same table.
 
-The companion comparison job — does actual production match what was
-forecast? — lives in ``score_solar_actual`` (TBD) and reads back from
-this same table.
+Comparing actual production against this forecast is a fault of kind
+deviation-from-expectation, declared in the fault list — not a job here.
 """
 
 from __future__ import annotations

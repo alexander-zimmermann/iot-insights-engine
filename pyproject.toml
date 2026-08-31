@@ -1,7 +1,7 @@
 [project]
 name = "iot-insights-engine"
 version = "1.14.0"
-description = "TSDB-backed background jobs: anomaly detection (z-score, IsolationForest, KNX-joins), seasonal forecasting (statsforecast), external forecast pulls (Forecast.Solar). Companion to iot-mcp-bridge — owns all writes to mcp_anomalies + mcp_forecasts."
+description = "TSDB-backed background jobs: external forecast pulls (Forecast.Solar, Open-Meteo) and the daily energy balance. Companion to iot-mcp-bridge — owns all writes to mcp_forecasts."
 readme = "README.md"
 license = "GPL-2.0-or-later"
 requires-python = ">=3.13"
@@ -22,12 +22,6 @@ dependencies = [
     "pyyaml>=6.0.3",
     "structlog>=26.1.0",
     "httpx>=0.28.1",
-    "scikit-learn>=1.9.0",
-    "statsforecast>=2.0.3",
-    "joblib>=1.5.3",
-    "boto3>=1.43.83",
-    "pandas>=3.0.5",
-    "numpy>=2.4.6",
     "nats-py[nkeys]>=2.15.0",
 ]
 
@@ -73,22 +67,12 @@ warn_unused_ignores = true
 # don't express that. Same disable-set as iot-mcp-bridge had.
 module = [
     "iot_insights_engine.db_write",
-    "iot_insights_engine.detect_univariate",
 ]
 disable_error_code = ["call-overload", "attr-defined", "index", "dict-item", "assignment", "arg-type"]
 
 [[tool.mypy.overrides]]
-# ML / NATS / S3 deps don't publish PEP 561 stubs.
-module = [
-    "nats",
-    "joblib",
-    "boto3",
-    "botocore.client",
-    "sklearn.*",
-    "statsforecast",
-    "statsforecast.*",
-    "pandas",
-]
+# nats-py doesn't publish PEP 561 stubs.
+module = ["nats"]
 ignore_missing_imports = true
 
 [tool.pyright]
@@ -104,9 +88,6 @@ reportUnnecessaryComparison = "none"
 reportArgumentType = "none"
 reportCallIssue = "none"
 reportReturnType = "none"
-# statsforecast returns either polars or pandas DataFrames depending
-# on installed deps; the union confuses Pylance's __getitem__ check.
-reportIndexIssue = "none"
 
 [[tool.pyright.executionEnvironments]]
 root = "tests"

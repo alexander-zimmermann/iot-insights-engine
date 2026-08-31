@@ -1,7 +1,7 @@
 # iot-insights-engine
 
-TSDB-backed background jobs for the homelab — anomaly detection +
-forecast pulls that write to `mcp_anomalies` and `mcp_forecasts`.
+TSDB-backed background jobs for the homelab — external forecast pulls
+and the daily energy balance, writing to `mcp_forecasts`.
 Companion to [iot-mcp-bridge](https://github.com/alexander-zimmermann/iot-mcp-bridge)
 (the MCP server, read-only) and [knx-nats-bridge](https://github.com/alexander-zimmermann/knx-nats-bridge)
 (KNX ↔ NATS, owns the GA catalog).
@@ -9,16 +9,20 @@ Companion to [iot-mcp-bridge](https://github.com/alexander-zimmermann/iot-mcp-br
 ## Architecture
 
 ```
-TSDB (knx_1h, ems_esp_*, solaredge_*, warp_meter_1h) ─┐
-api.forecast.solar (Personal Plus)                    ├─► iot-insights-engine
-api.open-meteo.com (future)                           │     │
-api.awattar.de / tibber (future)                      ┘     ▼
-                                                    TSDB (mcp_anomalies, mcp_forecasts)
-                                                    NATS (anomaly.<uc>.<severity>)
-                                                            │
-                                                            ▼
-                                                       knx-nats-bridge ─► KNX-GA ─► Basalte push
+TSDB (solaredge_*, warp_meter_1h) ─┐
+api.forecast.solar (Personal Plus) ├─► iot-insights-engine
+api.open-meteo.com                 ┘     │
+                                         ▼
+                                 TSDB (mcp_forecasts)
+                                 NATS (forecast.pv.*, energy.pv.*)
+                                         │
+                                         ▼
+                                  knx-nats-bridge ─► KNX-GA ─► Basalte
 ```
+
+The detection chain is being rebuilt: the old detectors, their
+baselines and the weekly report are switched off, and the new fault
+definitions land here as declared entries, not as subcommands.
 
 ## Subcommands
 
@@ -30,13 +34,9 @@ iot-insights-engine <subcommand>
 
 | Subcommand              | Schedule (Kubernetes CronJob) | What it does |
 |-------------------------|-------------------------------|--------------|
-| `detect-univariate`     | `*/15 * * * *`                | Per-metric z-score vs `<source>_baseline_30d` |
-| `detect-knx-join`       | `*/15 * * * *`                | Rule-based per-room joins (FBH-kalt, window+heating) |
-| `train-iforest`         | `30 2 * * *`                  | Daily fit of IsolationForest per (uc, group) — pickled to rustfs |
-| `score-iforest`         | `5,20,35,50 * * * *`          | Score last hour against the persisted IF model |
-| `score-seasonal`        | `25 * * * *`                  | Fit MSTL+AutoARIMA inline, forecast 24h, anomaly-check last bucket |
-| `forecast-solar`        | `15 * * * *`                  | Pull PV forecast → `mcp_forecasts` |
-| `weekly-report`         | `0 8 * * 1`                   | Weekly Markdown digest via SMTP |
+| `forecast-solar`        | `15 * * * *`                  | Pull PV forecast → `mcp_forecasts`, publish `forecast.pv.*` |
+| `forecast-weather`      | `20 * * * *`                  | Pull Open-Meteo (ICON) forecast → `mcp_forecasts` |
+| `energy-balance`        | `*/15 * * * *`                | Today's kWh counters → `energy.pv.*` |
 
 ## Configuration
 

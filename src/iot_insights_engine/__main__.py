@@ -12,16 +12,9 @@ from .logging_setup import configure_logging, get_logger
 # that exposes `def run(settings, argv) -> int`. The dispatcher fails
 # with a clear message if a subcommand listed here has no module yet.
 SUBCOMMANDS: tuple[str, ...] = (
-    "detect-univariate",
-    "train-iforest",
-    "score-iforest",
-    "detect-knx-join",
-    "detect-pv-underperformance",
-    "score-seasonal",
     "forecast-solar",
     "forecast-weather",
     "energy-balance",
-    "weekly-report",
 )
 
 
