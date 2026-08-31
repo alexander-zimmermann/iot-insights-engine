@@ -16,6 +16,7 @@ classifiers = [
     "Topic :: Home Automation",
 ]
 dependencies = [
+    "jsonschema>=4.25.1",
     "psycopg[binary,pool]>=3.3.4",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
@@ -32,6 +33,8 @@ dev = [
     "respx>=0.23.1",
     "ruff>=0.16.5",
     "mypy>=2.3.1",
+    "types-jsonschema",
+    "types-PyYAML",
     "pre-commit>=4.6.2",
 ]
 

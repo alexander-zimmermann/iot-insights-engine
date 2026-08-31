@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alexander-zimmermann/iot-insights-engine/schemas/faults.schema.json",
+  "title": "Fault list",
+  "description": "Declares the faults the engine detects. Per fault: the sentence with its unit, a measurement kind with parameters in the channel's own unit, the target group address, and the channel scope as a catalog query.",
+  "type": "object",
+  "properties": {
+    "faults": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/fault" }
+    }
+  },
+  "required": ["faults"],
+  "additionalProperties": false,
+  "$defs": {
+    "fault": {
+      "type": "object",
+      "properties": {
+        "name":       { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "sentence":   { "type": "string", "minLength": 1 },
+        "unit":       { "type": "string", "minLength": 1 },
+        "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy"] },
+        "parameters": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number" }
+        },
+        "scope":      { "$ref": "#/$defs/scope" },
+        "target":     { "$ref": "#/$defs/target" },
+        "dormant":    { "$ref": "#/$defs/dormant" }
+      },
+      "required": ["name", "sentence", "unit", "kind", "parameters", "scope", "target"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if":   { "properties": { "kind": { "const": "silence" } }, "required": ["kind"] },
+          "then": { "properties": { "parameters": { "required": ["gap_factor"] } } }
+        }
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "dpt":               { "$ref": "#/$defs/stringOrList" },
+        "name_like":         { "$ref": "#/$defs/stringOrList" },
+        "exclude_name_like": { "$ref": "#/$defs/stringOrList" }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+    "target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "ga": { "type": "string", "pattern": "^[0-9]+/[0-9]+/[0-9]+$" } },
+          "required": ["ga"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "per_main_group": { "const": true } },
+          "required": ["per_main_group"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "dormant": {
+      "type": "object",
+      "properties": {
+        "reason":      { "type": "string", "minLength": 1 },
+        "active_when": { "type": "string", "minLength": 1 }
+      },
+      "required": ["reason", "active_when"],
+      "additionalProperties": false
+    },
+    "stringOrList": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      ]
+    }
+  }
+}
