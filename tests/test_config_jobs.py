@@ -1,4 +1,4 @@
-"""Tests for the jobs-extension settings fields (db_write, NATS, S3, SMTP)."""
+"""Tests for the jobs-extension settings fields (db_write, NATS)."""
 
 from __future__ import annotations
 
@@ -62,27 +62,13 @@ def test_db_dsns_url_encode_password(base_env: pytest.MonkeyPatch) -> None:
 
 def test_optional_fields_have_sane_defaults(base_env: pytest.MonkeyPatch) -> None:
     s = Settings()  # type: ignore[call-arg]
-    assert s.s3_bucket == "iot-mcp-bridge-models"
-    assert s.smtp_host == "smtprelay.smtprelay.svc.cluster.local"
-    assert s.smtp_port == 25
     assert s.nats_servers is None
-    assert s.s3_endpoint is None
     assert s.forecast_solar_timezone == "Europe/Berlin"
 
 
-def test_nats_and_s3_secret_files_resolve(
-    base_env: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_nats_secret_file_resolves(base_env: pytest.MonkeyPatch, tmp_path: Path) -> None:
     pw = tmp_path / "nats-pw"
     pw.write_text("super-secret\n")
-    ak = tmp_path / "s3-ak"
-    sk = tmp_path / "s3-sk"
-    ak.write_text("AKIA\n")
-    sk.write_text("secretkey\n")
     base_env.setenv("MCP_NATS_PASSWORD_FILE", str(pw))
-    base_env.setenv("MCP_S3_ACCESS_KEY_FILE", str(ak))
-    base_env.setenv("MCP_S3_SECRET_KEY_FILE", str(sk))
     s = Settings()  # type: ignore[call-arg]
     assert s.nats_password == "super-secret"
-    assert s.s3_access_key == "AKIA"
-    assert s.s3_secret_key == "secretkey"

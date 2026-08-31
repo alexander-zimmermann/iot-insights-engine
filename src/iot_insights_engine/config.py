@@ -1,5 +1,5 @@
-"""Settings for the iot-insights-engine jobs (anomaly detection +
-forecast pulls). MCP_-prefixed env vars kept as the de-facto homelab
+"""Settings for the iot-insights-engine jobs (forecast pulls +
+energy balance). MCP_-prefixed env vars kept as the de-facto homelab
 convention — same SealedSecrets and Kyverno-clone topology the MCP
 server uses already inject these into the namespace.
 """
@@ -37,29 +37,13 @@ class Settings(BaseSettings):
     db_write_username_file: str | None = None
     db_write_password_file: str | None = None
 
-    # NATS — jobs publish anomaly events on `anomaly.<uc>.<severity>`.
+    # NATS — jobs publish their results on `forecast.pv.*` / `energy.pv.*`.
     nats_servers: str | None = None
     nats_user: str | None = None
     nats_password: str = Field(default="", repr=False)
     nats_password_file: str | None = None
     nats_creds_file: str | None = None
     nats_nkey_seed_file: str | None = None
-
-    # S3 (rustfs) — jobs persist trained models as joblib pickles.
-    s3_endpoint: str | None = None
-    s3_access_key: str = ""
-    s3_secret_key: str = Field(default="", repr=False)
-    s3_access_key_file: str | None = None
-    s3_secret_key_file: str | None = None
-    s3_bucket: str = "iot-mcp-bridge-models"
-    s3_region: str = "us-east-1"
-
-    # SMTP — weekly-report job sends Markdown via the cluster-internal
-    # relay (no auth, BGP-advertised LoadBalancer).
-    smtp_host: str = "smtprelay.smtprelay.svc.cluster.local"
-    smtp_port: int = 25
-    smtp_from: str = "admin@zimmermann.sh"
-    smtp_to: str = "admin@zimmermann.sh"
 
     # Forecast.Solar — PV-production forecast HTTPS API. Personal-Plus
     # tier supports up to 2 planes in a single request, so the
@@ -115,10 +99,6 @@ class Settings(BaseSettings):
             )
         if self.nats_password_file:
             self.nats_password = Path(self.nats_password_file).read_text(encoding="utf-8").strip()
-        if self.s3_access_key_file:
-            self.s3_access_key = Path(self.s3_access_key_file).read_text(encoding="utf-8").strip()
-        if self.s3_secret_key_file:
-            self.s3_secret_key = Path(self.s3_secret_key_file).read_text(encoding="utf-8").strip()
         if self.forecast_solar_api_key_file:
             self.forecast_solar_api_key = (
                 Path(self.forecast_solar_api_key_file).read_text(encoding="utf-8").strip()

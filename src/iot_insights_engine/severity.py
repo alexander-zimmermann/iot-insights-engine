@@ -1,18 +1,13 @@
-"""Shared severity ordering for all detector families.
+"""Severity ordering shared by everything that publishes to the bus.
 
-`severity_floor` on a registry entry suppresses findings below the
-floor at classification time — warmup demotion (where a family has
-one) runs *after* the floor check, matching the original
-score_seasonal semantics.
+The numeric tier is the delivery contract: the knx-nats-bridge writer
+rules carry it onto a group address, where Basalte turns it into a
+notification.
 """
 
 from __future__ import annotations
 
 SEVERITY_ORDER: tuple[str, ...] = ("info", "warning", "critical")
-
-
-def meets_floor(severity: str, floor: str) -> bool:
-    return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(floor)
 
 
 def severity_level(severity: str | None) -> int:
@@ -22,16 +17,3 @@ def severity_level(severity: str | None) -> int:
     if severity is None:
         return 0
     return SEVERITY_ORDER.index(severity) + 1
-
-
-def escalated(old_severity: str | None, new_severity: str) -> bool:
-    """True when an existing anomaly row was bumped to a higher tier.
-
-    Detectors re-score the same (still maturing) bucket multiple times;
-    a finding that first fired as info must still reach the bus when a
-    CAGG refresh turns it critical. Downgrades and unchanged severity
-    return False — no re-publish, no notification spam.
-    """
-    if old_severity is None:
-        return False
-    return SEVERITY_ORDER.index(new_severity) > SEVERITY_ORDER.index(old_severity)
