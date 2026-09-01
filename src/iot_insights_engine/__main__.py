@@ -15,6 +15,7 @@ SUBCOMMANDS: tuple[str, ...] = (
     "forecast-solar",
     "forecast-weather",
     "energy-balance",
+    "detect-faults",
 )
 
 

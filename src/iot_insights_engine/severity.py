@@ -13,6 +13,13 @@ SEVERITY_ORDER: tuple[str, ...] = ("info", "warning", "critical")
 CLEAR, INFO, WARNING, CRITICAL = 0, 1, 2, 3
 
 
+def severity_name(level: int) -> str:
+    """Inverse of severity_level for the firing tiers 1..3."""
+    if not 1 <= level <= len(SEVERITY_ORDER):
+        raise ValueError(f"no severity name for tier {level}")
+    return SEVERITY_ORDER[level - 1]
+
+
 def severity_level(severity: str | None) -> int:
     """Numeric tier for the KNX payload: clear/None=0, info=1, warning=2,
     critical=3. The writer-rules write this 1-byte value (DPT 5.010) onto the
