@@ -70,6 +70,7 @@ warn_unused_ignores = true
 # don't express that. Same disable-set as iot-mcp-bridge had.
 module = [
     "iot_insights_engine.db_write",
+    "iot_insights_engine.detect_faults",
 ]
 disable_error_code = ["call-overload", "attr-defined", "index", "dict-item", "assignment", "arg-type"]
 
