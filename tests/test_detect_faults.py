@@ -67,11 +67,13 @@ def _plan(
     episodes: list[Episode],
     open_rows: list[OpenEpisodeRow],
     states: dict[str, SilenceState] | None = None,
+    dataless: frozenset[str] = frozenset(),
 ) -> detect_faults.RunPlan:
     return plan_run(
         episodes=episodes,
         open_rows=open_rows,
         states_by_ga=states if states is not None else _states(_FREEZER, _BOILER),
+        dataless=dataless,
         frontier=_FRONTIER,
     )
 
@@ -146,7 +148,29 @@ def test_group_severity_is_the_maximum_over_its_channels() -> None:
 
 def test_historical_ended_episode_without_open_row_is_ignored() -> None:
     plan = _plan([_episode("2/2/227", severity=1, ended=True)], open_rows=[])
-    assert plan == detect_faults.RunPlan((), (), (), ())
+    assert plan == detect_faults.RunPlan((), (), (), (), ())
+
+
+def test_second_channel_at_the_same_tier_is_still_published() -> None:
+    # The group severity does not move, but the set of silent channels does
+    # — the publish names the newcomer instead of going stale.
+    freezer = _episode("2/2/227", severity=1)
+    boiler = _episode("2/2/224", severity=1)
+    row = OpenEpisodeRow(id=7, subject="2/2/224", severity=1)
+    plan = _plan([boiler, freezer], open_rows=[row])
+    (publish,) = plan.publishes
+    assert publish.severity == 1
+    assert {c.ga for c in publish.channels} == {"2/2/224", "2/2/227"}
+
+
+def test_silence_outliving_the_window_stays_open() -> None:
+    # In scope but without a single bucket in the window: there is no data
+    # to decide a recovery with, so the episode must not self-clear.
+    row = OpenEpisodeRow(id=9, subject="2/2/227", severity=2)
+    plan = _plan([], open_rows=[row], dataless=frozenset({"2/2/227"}))
+    assert plan.orphan_closes == ()
+    assert plan.stale_opens == ("2/2/227",)
+    assert plan.publishes == ()
 
 
 def test_publish_group_carries_severity_level_and_channels() -> None:
@@ -186,4 +210,5 @@ def test_publish_clear_forces_level_zero() -> None:
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.15"
     assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False

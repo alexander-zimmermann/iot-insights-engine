@@ -21,18 +21,31 @@ out where the scope resolves; both drops are logged by the caller.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from statistics import median
+from typing import Any
+
+import psycopg
+from psycopg.rows import DictRow
 
 from .episodes import Observation
+from .faults import Scope
 
 BUCKET = timedelta(hours=1)
 
 # Constant-zero evidence shorter than a day is thin — an idle binary
 # channel, not a dead register.
 DEAD_MIN_BUCKETS = 24
+
+
+def main_group(ga: str) -> int:
+    """The KNX main group of a group address — the granularity silence
+    reports at (one Zentral diagnosis address per main group).
+    """
+    return int(ga.split("/", 1)[0])
 
 
 class ChannelState(StrEnum):
@@ -52,7 +65,7 @@ class Channel:
 
     @property
     def main_group(self) -> int:
-        return int(self.ga.split("/", 1)[0])
+        return main_group(self.ga)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +151,81 @@ def silence_observations(
                 )
             t += BUCKET
     return observations
+
+
+def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
+    """The aggregate's newest bucket anywhere — the 'now' all gaps are
+    measured against."""
+    row = conn.execute("SELECT max(bucket) AS frontier FROM knx_1h").fetchone()
+    return row["frontier"] if row else None
+
+
+def resolve_scope(conn: psycopg.Connection[DictRow], scope: Scope) -> list[Channel]:
+    """The fault's channels, resolved where the catalog lives — never a
+    hand-written address list."""
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    if scope.dpt:
+        clauses.append("dpt = ANY(%(dpt)s)")
+        params["dpt"] = list(scope.dpt)
+    if scope.name_like:
+        clauses.append("name LIKE ANY(%(name_like)s)")
+        params["name_like"] = list(scope.name_like)
+    if scope.exclude_name_like:
+        clauses.append("NOT (name LIKE ANY(%(exclude_name_like)s))")
+        params["exclude_name_like"] = list(scope.exclude_name_like)
+    sql = "SELECT ga, name, dpt FROM ga_catalog"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(sql + " ORDER BY ga", params).fetchall()
+    return [Channel(ga=r["ga"], name=r["name"], dpt=r["dpt"]) for r in rows]
+
+
+def channel_stats(
+    conn: psycopg.Connection[DictRow], window_start: datetime
+) -> dict[str, ChannelStats]:
+    rows = conn.execute(
+        """
+        SELECT ga, count(*) AS buckets, max(bucket) AS last_bucket,
+               min(min_value) AS floor_value, max(max_value) AS ceil_value
+        FROM knx_1h WHERE bucket >= %(start)s GROUP BY ga
+        """,
+        {"start": window_start},
+    ).fetchall()
+    return {
+        r["ga"]: ChannelStats(
+            ga=r["ga"],
+            buckets=r["buckets"],
+            last_bucket=r["last_bucket"],
+            floor_value=r["floor_value"],
+            ceil_value=r["ceil_value"],
+        )
+        for r in rows
+    }
+
+
+def bucket_series(
+    conn: psycopg.Connection[DictRow], gas: list[str], window_start: datetime
+) -> dict[str, list[datetime]]:
+    """Bucket series for the channels that need one, fetched in main-group
+    chunks so a single result set stays bounded on the small database.
+    """
+    by_group: dict[int, list[str]] = defaultdict(list)
+    for ga in gas:
+        by_group[main_group(ga)].append(ga)
+    series: dict[str, list[datetime]] = defaultdict(list)
+    for group_gas in by_group.values():
+        rows = conn.execute(
+            """
+            SELECT ga, bucket FROM knx_1h
+            WHERE ga = ANY(%(gas)s) AND bucket >= %(start)s
+            ORDER BY ga, bucket
+            """,
+            {"gas": group_gas, "start": window_start},
+        ).fetchall()
+        for r in rows:
+            series[r["ga"]].append(r["bucket"])
+    return dict(series)
 
 
 def drop_unmeasurable(

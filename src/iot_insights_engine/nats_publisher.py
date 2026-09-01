@@ -91,7 +91,7 @@ def publish(settings: Settings, subject: str, payload: dict[str, Any]) -> None:
 def publish_anomaly(
     settings: Settings,
     uc: str,
-    severity: str,
+    severity: str | None,
     payload: dict[str, Any],
     *,
     entity: str | None = None,
@@ -103,7 +103,8 @@ def publish_anomaly(
 
     The severity travels as a numeric `severity_level` in the payload (the
     writer-rule reads `$.severity_level`); `firing=False` forces level 0
-    (auto-clear → GA falls back to 0).
+    (auto-clear → GA falls back to 0), with `severity=None` as the matching
+    name-side value.
     """
     subject = f"anomaly.{uc}.{entity}" if entity else f"anomaly.{uc}"
     body = {
