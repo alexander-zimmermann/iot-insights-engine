@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from iot_insights_engine import energy_balance
+from iot_insights_engine import energy_balance, nats_publisher
 from iot_insights_engine.config import Settings
 
 
@@ -50,7 +50,7 @@ def test_compute_clamps_direct_use_nonnegative() -> None:
 
 def test_publish_skips_without_nats() -> None:
     s = _settings()  # nats_servers is None
-    with patch.object(energy_balance.nats_publisher, "publish") as pub:
+    with patch.object(nats_publisher, "publish") as pub:
         energy_balance._publish(s, {"generation_kwh": 21.9})
     pub.assert_not_called()
 
@@ -58,7 +58,7 @@ def test_publish_skips_without_nats() -> None:
 def test_publish_emits_each_subject() -> None:
     s = _settings()
     s.nats_servers = "nats://localhost:4222"
-    with patch.object(energy_balance.nats_publisher, "publish") as pub:
+    with patch.object(nats_publisher, "publish") as pub:
         energy_balance._publish(s, {"generation_kwh": 21.9, "self_consumption_rate": 31.5})
     subjects = {call.args[1] for call in pub.call_args_list}
     assert subjects == {"energy.pv.generation_kwh", "energy.pv.self_consumption_rate"}
