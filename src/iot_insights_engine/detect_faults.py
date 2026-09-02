@@ -8,6 +8,13 @@ leaves the engine is a severity 0–3 per main group on
 `anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
+External faults run the same loop the other way round: Basalte detects,
+writes the severity to the fault address and delivers itself; the engine
+reads those writes back from the bus archive, records episodes marked
+externally delivered, and publishes nothing. The frontier rule above is
+the measured faults': the bus archive has no materialization lag, so
+external runs take wall-clock time where an orphaned row needs closing.
+
 Time is the aggregate's frontier throughout — episodes also *end* in
 frontier time, so a stalled refresh (or a dead bridge) freezes the picture
 instead of clearing every open episode with a severity 0 nobody earned.
@@ -27,10 +34,10 @@ import argparse
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import episode_store, nats_publisher, silence
+from . import episode_store, external, nats_publisher, silence
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -261,7 +268,7 @@ def _log_drops(drops: Mapping[ChannelState, list[Channel]]) -> None:
 
 
 def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    if not fault.target.per_main_group:
+    if fault.target is None or not fault.target.per_main_group:
         raise ValueError(f"fault {fault.name}: silence delivery needs a per_main_group target")
     gap_factor = float(fault.parameters["gap_factor"])
 
@@ -344,6 +351,65 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
+def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    """Basalte-written severities become episodes: read the fault's severity
+    writes back off the bus archive, fold, reconcile — and publish nothing.
+    Basalte already delivered; the engine only records.
+    """
+    now = datetime.now(tz=UTC)
+    with read_connection(settings) as conn:
+        channels = silence.resolve_scope(conn, fault.scope)
+        if not channels:
+            # Address not in the catalog yet (ETS work pending) — or a typo.
+            log.warning("external_no_subjects", fault=fault.name)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        processed = episode_store.processed_through(conn, fault.name)
+        writes = external.read_writes(conn, [c.ga for c in channels], now - LOOKBACK)
+
+    prior = {row.subject: row.severity for row in open_rows}
+    fresh = external.drop_processed(writes, processed)
+    episodes = external.fold_severity_writes(fault.name, fresh, prior)
+    plan = external.plan_run(
+        episodes=episodes,
+        open_rows=open_rows,
+        in_scope=frozenset(c.ga for c in channels),
+        now=now,
+    )
+
+    log.info(
+        "external_severities_run",
+        fault=fault.name,
+        subjects=len(channels),
+        writes=len(writes),
+        fresh_writes=len(fresh),
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        still_open=list(plan.still_open),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+        )
+        return
+
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(
+            conn,
+            fault.name,
+            plan.inserts,
+            plan.updates,
+            plan.orphan_closes,
+            externally_delivered=True,
+        )
+
+
 def run(settings: Settings, argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="iot-insights-engine detect-faults")
     parser.add_argument("--dry-run", action="store_true")
@@ -356,6 +422,8 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     for fault in fault_list.schedulable():
         if fault.kind is MeasurementKind.SILENCE:
             _run_silence(settings, fault, dry_run=args.dry_run)
+        elif fault.kind is MeasurementKind.EXTERNAL:
+            _run_external(settings, fault, dry_run=args.dry_run)
         else:
             # Arrives with its own ticket; a declared fault must not fail
             # the ones already running.

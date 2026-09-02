@@ -67,6 +67,7 @@ def test_loads_valid_file(tmp_path: Path) -> None:
     assert silence.kind is MeasurementKind.SILENCE
     assert silence.parameters == {"gap_factor": 5}
     assert silence.unit == "× der üblichen Sendepause"
+    assert silence.target is not None
     assert silence.target.per_main_group is True
     assert silence.target.ga is None
     assert silence.dormant is None
@@ -74,6 +75,7 @@ def test_loads_valid_file(tmp_path: Path) -> None:
     standby = faults.get("appliance_standby")
     assert standby.kind is MeasurementKind.DRIFT
     assert standby.parameters == {"healthy": 43, "slack": 5, "budget": 840}
+    assert standby.target is not None
     assert standby.target.ga == "2/2/229"
     assert standby.target.per_main_group is False
 
@@ -470,6 +472,73 @@ def test_target_union_holds_for_python_construction() -> None:
         Target()
     with pytest.raises(ValueError, match="never both or neither"):
         Target(ga="1/2/3", per_main_group=True)
+
+
+_EXTERNAL = """
+faults:
+  - name: system_pressure_low
+    sentence: "Der Systemdruck der Gastherme liegt unter 1,0 bar."
+    unit: "bar"
+    kind: external
+    scope:
+      name_like: "%.Gastherme.System-Druck-Anomalie"
+"""
+
+
+def test_external_fault_loads_without_target_and_parameters(tmp_path: Path) -> None:
+    # Basalte owns threshold and delivery; the entry only declares the
+    # sentence and where the severity writes appear.
+    [fault] = FaultList.load(_write(tmp_path, _EXTERNAL))
+    assert fault.kind is MeasurementKind.EXTERNAL
+    assert fault.sentence == "Der Systemdruck der Gastherme liegt unter 1,0 bar."
+    assert fault.parameters == {}
+    assert fault.target is None
+    assert fault.scope.name_like == ("%.Gastherme.System-Druck-Anomalie",)
+
+
+def test_external_fault_rejects_a_target(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        _EXTERNAL
+        + """    target:
+      ga: "15/2/2"
+""",
+    )
+    with pytest.raises(ValueError, match=r"'system_pressure_low'.*target"):
+        FaultList.load(path)
+
+
+def test_external_fault_rejects_parameters(tmp_path: Path) -> None:
+    # A threshold on an external fault would be a second source of truth
+    # beside the Basalte logic.
+    path = _write(
+        tmp_path,
+        _EXTERNAL
+        + """    parameters:
+      threshold: 1
+""",
+    )
+    with pytest.raises(ValueError, match=r"'system_pressure_low'.*parameters"):
+        FaultList.load(path)
+
+
+def test_engine_kind_still_requires_target(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: x
+            sentence: "Ein Satz mit Einheit in mA."
+            unit: "mA"
+            kind: drift
+            parameters:
+              healthy: 43
+            scope:
+              name_like: "%.Stromwert"
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'x'.*target"):
+        FaultList.load(path)
 
 
 def test_bundled_schema_is_valid() -> None:
