@@ -33,6 +33,9 @@ class MeasurementKind(StrEnum):
     DEVIATION = "deviation"
     SILENCE = "silence"
     CONSTANCY = "constancy"
+    # Not measured here: Basalte detects and delivers, the engine reads the
+    # severity writes back off the fault address and records episodes.
+    EXTERNAL = "external"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +81,9 @@ class Dormant:
 @dataclass(frozen=True, slots=True)
 class Fault:
     """One declared fault: a sentence with a unit, measured one way, with
-    parameters expressed in the channel's own unit.
+    parameters expressed in the channel's own unit. External faults carry
+    neither parameters nor a target — threshold and delivery live in
+    Basalte, the scope names the address whose writes come back.
     """
 
     name: str
@@ -87,7 +92,7 @@ class Fault:
     kind: MeasurementKind
     parameters: Mapping[str, float]
     scope: Scope
-    target: Target
+    target: Target | None = None
     dormant: Dormant | None = None
 
 
@@ -131,6 +136,9 @@ class FaultList:
             if name in seen:
                 raise ValueError(f"{path}: duplicate fault name {name!r}")
             seen.add(name)
+            problem = _check_external(raw)
+            if problem is not None:
+                raise ValueError(f"{path}: {problem}")
             faults.append(_parse_fault(raw))
         return cls(faults)
 
@@ -159,24 +167,45 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _check_external(raw: dict[str, Any]) -> str | None:
+    """External faults declare neither parameters nor a target: threshold
+    and delivery live in Basalte, and a value here would be a second source
+    of truth beside the Studio logic. Checked in the loader because the
+    schema's false-subschema error loses the field name.
+    """
+    if raw["kind"] != MeasurementKind.EXTERNAL:
+        return None
+    for forbidden in ("parameters", "target"):
+        if forbidden in raw:
+            return (
+                f"fault {raw['name']!r}: {forbidden}: "
+                f"an external fault declares none — Basalte owns it"
+            )
+    return None
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
     scope = raw["scope"]
-    target = raw["target"]
+    target = raw.get("target")
     dormant = raw.get("dormant")
     return Fault(
         name=raw["name"],
         sentence=raw["sentence"],
         unit=raw["unit"],
         kind=MeasurementKind(raw["kind"]),
-        parameters=MappingProxyType(dict(raw["parameters"])),
+        parameters=MappingProxyType(dict(raw.get("parameters", {}))),
         scope=Scope(
             dpt=_as_tuple(scope.get("dpt")),
             name_like=_as_tuple(scope.get("name_like")),
             exclude_name_like=_as_tuple(scope.get("exclude_name_like")),
         ),
-        target=Target(
-            ga=target.get("ga"),
-            per_main_group=target.get("per_main_group", False),
+        target=(
+            Target(
+                ga=target.get("ga"),
+                per_main_group=target.get("per_main_group", False),
+            )
+            if target is not None
+            else None
         ),
         dormant=(
             Dormant(reason=dormant["reason"], active_when=dormant["active_when"])

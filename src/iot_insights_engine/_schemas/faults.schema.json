@@ -20,7 +20,7 @@
         "name":       { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
         "sentence":   { "type": "string", "minLength": 1 },
         "unit":       { "type": "string", "minLength": 1 },
-        "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy"] },
+        "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy", "external"] },
         "parameters": {
           "type": "object",
           "minProperties": 1,
@@ -30,12 +30,16 @@
         "target":     { "$ref": "#/$defs/target" },
         "dormant":    { "$ref": "#/$defs/dormant" }
       },
-      "required": ["name", "sentence", "unit", "kind", "parameters", "scope", "target"],
+      "required": ["name", "sentence", "unit", "kind", "scope"],
       "additionalProperties": false,
       "allOf": [
         {
           "if":   { "properties": { "kind": { "const": "silence" } }, "required": ["kind"] },
           "then": { "properties": { "parameters": { "required": ["gap_factor"] } } }
+        },
+        {
+          "if":   { "properties": { "kind": { "const": "external" } }, "required": ["kind"] },
+          "else": { "required": ["parameters", "target"] }
         }
       ]
     },

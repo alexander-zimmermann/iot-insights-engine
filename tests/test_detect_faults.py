@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from iot_insights_engine import detect_faults, nats_publisher
 from iot_insights_engine.config import Settings
-from iot_insights_engine.detect_faults import GroupPublish, OpenEpisodeRow, plan_run
+from iot_insights_engine.detect_faults import GroupPublish, plan_run
+from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import (
     Episode,
     EventKind,

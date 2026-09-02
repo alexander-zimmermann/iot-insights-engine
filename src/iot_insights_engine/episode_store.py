@@ -40,6 +40,24 @@ def open_rows(conn: psycopg.Connection[DictRow], fault_name: str) -> list[OpenEp
     return [OpenEpisodeRow(id=r["id"], subject=r["subject"], severity=r["severity"]) for r in rows]
 
 
+def processed_through(
+    conn: psycopg.Connection[DictRow], fault_name: str
+) -> dict[str, datetime]:
+    """Per subject, how far this fault's recorded story reaches: the end of
+    a closed episode, the last seen write of an open one. Bus-archive writes
+    up to that point are already folded — the replay guard for the sliding
+    read window.
+    """
+    rows = conn.execute(
+        """
+        SELECT subject, max(COALESCE(ended_at, last_seen_at)) AS through
+        FROM episodes WHERE fault = %(fault)s GROUP BY subject
+        """,
+        {"fault": fault_name},
+    ).fetchall()
+    return {r["subject"]: r["through"] for r in rows}
+
+
 def history_scores(conn: psycopg.Connection[DictRow], fault_name: str) -> list[float]:
     # Folded episodes are the imported detector era — a different score
     # scale, never this fault's own distribution.
@@ -60,14 +78,22 @@ def apply(
     inserts: Sequence[Episode],
     updates: Sequence[tuple[int, Episode]],
     orphan_closes: Sequence[tuple[int, datetime]],
+    *,
+    externally_delivered: bool = False,
 ) -> None:
+    """`externally_delivered` marks episodes whose fault Basalte already
+    delivered itself — the engine only records them, and nothing downstream
+    may notify a second time.
+    """
     for episode in inserts:
         inserted = conn.execute(
             """
             INSERT INTO episodes (fault, subject, started_at, last_seen_at,
-                                  ended_at, severity, peak_score)
+                                  ended_at, severity, peak_score,
+                                  externally_delivered)
             VALUES (%(fault)s, %(subject)s, %(started_at)s, %(last_seen_at)s,
-                    %(ended_at)s, %(severity)s, %(peak_score)s)
+                    %(ended_at)s, %(severity)s, %(peak_score)s,
+                    %(externally_delivered)s)
             RETURNING id
             """,
             {
@@ -78,6 +104,7 @@ def apply(
                 "ended_at": episode.ended_at,
                 "severity": episode.severity,
                 "peak_score": episode.peak_score,
+                "externally_delivered": externally_delivered,
             },
         ).fetchone()
         if inserted is None:  # INSERT … RETURNING always yields the row
