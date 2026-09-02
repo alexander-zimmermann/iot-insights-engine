@@ -53,18 +53,32 @@ class Scope:
 
 @dataclass(frozen=True, slots=True)
 class Target:
-    """Either one group address, or one address per matched main group in
-    that group's Zentral block (channel silence) — resolved via the catalog.
+    """One group address, one address per matched main group in that
+    group's Zentral block (channel silence), or one address per declared
+    device (appliance runtime) — resolved via the catalog and the writer
+    rules, never listed here.
     """
 
     ga: str | None = None
     per_main_group: bool = False
+    per_device: bool = False
 
     def __post_init__(self) -> None:
         # Mirrors the schema's oneOf so the union holds for Python-side
         # construction too, not only for loaded files.
-        if (self.ga is not None) == self.per_main_group:
-            raise ValueError("target is either one ga or per_main_group, never both or neither")
+        if sum((self.ga is not None, self.per_main_group, self.per_device)) != 1:
+            raise ValueError("target is exactly one of ga, per_main_group or per_device")
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceLimit:
+    """One device's declared limit: a unique fragment of its catalog name,
+    and the runtime it may not exceed — written here after someone looked
+    at the data once, never derived from history.
+    """
+
+    match: str
+    max_run_hours: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +108,7 @@ class Fault:
     scope: Scope
     target: Target | None = None
     dormant: Dormant | None = None
+    devices: tuple[DeviceLimit, ...] = ()
 
 
 class FaultList:
@@ -136,7 +151,7 @@ class FaultList:
             if name in seen:
                 raise ValueError(f"{path}: duplicate fault name {name!r}")
             seen.add(name)
-            problem = _check_external(raw)
+            problem = _check_external(raw) or _check_devices(raw)
             if problem is not None:
                 raise ValueError(f"{path}: {problem}")
             faults.append(_parse_fault(raw))
@@ -184,6 +199,16 @@ def _check_external(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_devices(raw: dict[str, Any]) -> str | None:
+    """Per-device limits belong to the duration kind alone; anywhere else
+    they would be dead configuration nothing reads. Checked in the loader
+    because the schema's false-subschema error loses the field name.
+    """
+    if raw["kind"] != MeasurementKind.DURATION and "devices" in raw:
+        return f"fault {raw['name']!r}: devices: only a duration fault declares per-device limits"
+    return None
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
     scope = raw["scope"]
     target = raw.get("target")
@@ -203,9 +228,14 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
             Target(
                 ga=target.get("ga"),
                 per_main_group=target.get("per_main_group", False),
+                per_device=target.get("per_device", False),
             )
             if target is not None
             else None
+        ),
+        devices=tuple(
+            DeviceLimit(match=match, max_run_hours=limit["max_run_hours"])
+            for match, limit in raw.get("devices", {}).items()
         ),
         dormant=(
             Dormant(reason=dormant["reason"], active_when=dormant["active_when"])

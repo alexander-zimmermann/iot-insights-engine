@@ -15,6 +15,7 @@ import pytest
 
 from iot_insights_engine.faults import (
     _SCHEMA_PATH,
+    DeviceLimit,
     Dormant,
     FaultList,
     MeasurementKind,
@@ -468,10 +469,115 @@ def test_fault_objects_are_frozen(tmp_path: Path) -> None:
 
 def test_target_union_holds_for_python_construction() -> None:
     # The schema's oneOf, mirrored for Python-side construction
-    with pytest.raises(ValueError, match="never both or neither"):
+    with pytest.raises(ValueError, match="exactly one"):
         Target()
-    with pytest.raises(ValueError, match="never both or neither"):
+    with pytest.raises(ValueError, match="exactly one"):
         Target(ga="1/2/3", per_main_group=True)
+    with pytest.raises(ValueError, match="exactly one"):
+        Target(per_main_group=True, per_device=True)
+
+
+_DURATION = """
+faults:
+  - name: appliance_runtime
+    sentence: "Ein Gerät zieht länger ununterbrochen Strom, als seine erlaubte
+      Laufzeit zulässt."
+    unit: "× der erlaubten Laufzeit"
+    kind: duration
+    parameters:
+      active_hour_fraction: 0.5
+    devices:
+      Hauswirtschaftsraum.K4-L1.Waschmaschine:
+        max_run_hours: 4
+      Küche.K15-L1.Gefrierschrank:
+        max_run_hours: 6
+    scope:
+      name_like: "%.Stromwert"
+    target:
+      per_device: true
+"""
+
+
+def test_duration_fault_loads_device_limits(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _DURATION))
+    assert fault.kind is MeasurementKind.DURATION
+    assert fault.parameters == {"active_hour_fraction": 0.5}
+    assert fault.target is not None
+    assert fault.target.per_device is True
+    assert fault.target.ga is None
+    assert fault.devices == (
+        DeviceLimit(match="Hauswirtschaftsraum.K4-L1.Waschmaschine", max_run_hours=4),
+        DeviceLimit(match="Küche.K15-L1.Gefrierschrank", max_run_hours=6),
+    )
+
+
+def test_duration_without_devices_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: appliance_runtime
+            sentence: "Ein Gerät zieht zu lange Strom."
+            unit: "× der erlaubten Laufzeit"
+            kind: duration
+            parameters:
+              active_hour_fraction: 0.5
+            scope:
+              name_like: "%.Stromwert"
+            target:
+              per_device: true
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*devices"):
+        FaultList.load(path)
+
+
+def test_duration_requires_active_hour_fraction(tmp_path: Path) -> None:
+    body = _DURATION.replace("active_hour_fraction: 0.5", "other: 1")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*active_hour_fraction"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_devices_on_other_kind_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: x
+            sentence: "Ein Satz mit Einheit in mA."
+            unit: "mA"
+            kind: drift
+            parameters:
+              healthy: 43
+            devices:
+              Waschmaschine:
+                max_run_hours: 4
+            scope:
+              name_like: "%.Stromwert"
+            target:
+              ga: "2/2/229"
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'x'.*devices"):
+        FaultList.load(path)
+
+
+def test_non_positive_device_limit_rejected(tmp_path: Path) -> None:
+    body = _DURATION.replace("max_run_hours: 4", "max_run_hours: 0")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*max_run_hours"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_device_entry_without_limit_rejected(tmp_path: Path) -> None:
+    body = _DURATION.replace("max_run_hours: 4", "note: 4")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*Waschmaschine"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_per_device_target_excludes_other_forms(tmp_path: Path) -> None:
+    body = _DURATION.replace("per_device: true", 'per_device: true\n      ga: "2/2/229"')
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*target"):
+        FaultList.load(_write(tmp_path, body))
 
 
 _EXTERNAL = """

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-from iot_insights_engine import detect_faults, nats_publisher
+from iot_insights_engine import detect_faults, duration, nats_publisher
 from iot_insights_engine.config import Settings
 from iot_insights_engine.detect_faults import GroupPublish, plan_run
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -174,14 +174,18 @@ def test_silence_outliving_the_window_stays_open() -> None:
     assert plan.publishes == ()
 
 
-def test_publish_group_carries_severity_level_and_channels() -> None:
-    settings = Settings(
+def _settings() -> Settings:
+    return Settings(
         db_host="localhost",
         db_name="x",
         db_username="x",
         db_password="x",  # noqa: S106 — test stub
         nats_servers="nats://localhost:4222",
     )
+
+
+def test_publish_group_carries_severity_level_and_channels() -> None:
+    settings = _settings()
     episode = _episode("2/2/227", severity=2)
     plan = _plan([episode], open_rows=[])
     with patch.object(nats_publisher, "publish") as pub:
@@ -195,13 +199,7 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
 
 
 def test_publish_clear_forces_level_zero() -> None:
-    settings = Settings(
-        db_host="localhost",
-        db_name="x",
-        db_username="x",
-        db_password="x",  # noqa: S106 — test stub
-        nats_servers="nats://localhost:4222",
-    )
+    settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
         detect_faults._publish_groups(
             settings,
@@ -210,6 +208,49 @@ def test_publish_clear_forces_level_zero() -> None:
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.15"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
+    assert call.args[2]["firing"] is False
+
+
+def test_publish_device_carries_run_details_on_the_slug_subject() -> None:
+    settings = _settings()
+    publish = duration.DevicePublish(
+        ga="2/1/197",
+        severity=2,
+        device="Hauswirtschaftsraum.K4-L1.Waschmaschine",
+        name="Schalten.KG.Hauswirtschaftsraum.K4-L1.Waschmaschine.Stromwert",
+        running_since=_T0,
+        run_hours=6.0,
+        limit_hours=4.0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_devices(settings, "appliance_runtime", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["device"] == "Hauswirtschaftsraum.K4-L1.Waschmaschine"
+    assert payload["run_hours"] == 6.0
+    assert payload["limit_hours"] == 4.0
+
+
+def test_publish_device_clear_forces_level_zero() -> None:
+    settings = _settings()
+    publish = duration.DevicePublish(
+        ga="2/1/197",
+        severity=0,
+        device="Hauswirtschaftsraum.K4-L1.Waschmaschine",
+        name="Schalten.KG.Hauswirtschaftsraum.K4-L1.Waschmaschine.Stromwert",
+        running_since=None,
+        run_hours=None,
+        limit_hours=4.0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_devices(settings, "appliance_runtime", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False

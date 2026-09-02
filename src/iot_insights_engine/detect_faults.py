@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import episode_store, external, nats_publisher, silence
+from . import duration, episode_store, external, nats_publisher, silence
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -351,6 +351,106 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
+def _publish_devices(
+    settings: Settings, fault_name: str, publishes: Iterable[duration.DevicePublish]
+) -> None:
+    for publish in publishes:
+        firing = publish.severity > 0
+        nats_publisher.publish_anomaly(
+            settings,
+            fault_name,
+            severity_name(publish.severity) if firing else None,
+            {
+                "device": publish.device,
+                "ga": publish.ga,
+                "name": publish.name,
+                "running_since": publish.running_since,
+                "run_hours": publish.run_hours,
+                "limit_hours": publish.limit_hours,
+            },
+            entity=publish.ga.replace("/", "-"),
+            firing=firing,
+        )
+
+
+def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    if fault.target is None or not fault.target.per_device:
+        raise ValueError(f"fault {fault.name}: duration delivery needs a per_device target")
+    active_fraction = float(fault.parameters["active_hour_fraction"])
+
+    with read_connection(settings) as conn:
+        frontier = duration.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window_start = frontier - LOOKBACK
+        channels = silence.resolve_scope(conn, fault.scope)
+        # A limit without a channel or a channel without a limit fails the
+        # run loudly — never a silently unmeasured device.
+        devices = duration.resolve_devices(channels, fault.devices)
+        activity = duration.activity(conn, [d.ga for d in devices], window_start, active_fraction)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    states: dict[str, duration.DeviceState] = {}
+    observations: list[Observation] = []
+    for device in devices:
+        active = activity.active.get(device.ga, [])
+        states[device.ga] = duration.classify(device, active, frontier)
+        observations.extend(duration.duration_observations(device.ga, active, device.max_run))
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(
+        fault.name, observations, history_scores, EpisodePolicy(), frontier
+    )
+    dataless = frozenset(d.ga for d in devices) - activity.present
+    plan = duration.plan_run(
+        episodes=episodes,
+        open_rows=open_rows,
+        states_by_ga=states,
+        dataless=dataless,
+        frontier=frontier,
+    )
+
+    log.info(
+        "appliance_runtime_run",
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        devices=len(devices),
+        running=sum(1 for s in states.values() if s.running_since is not None),
+        over_limit=sum(
+            1
+            for s in states.values()
+            if s.run_hours is not None and s.run_hours * BUCKET > s.device.max_run
+        ),
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        stale_opens=list(plan.stale_opens),
+        publishes=len(plan.publishes),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        label_by_ga = {d.ga: d.label for d in devices}
+        per_device = Counter(e.subject for e in episodes)
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            per_device={label_by_ga.get(ga, ga): count for ga, count in sorted(per_device.items())},
+            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+            would_publish=[{"ga": p.ga, "severity": p.severity} for p in plan.publishes],
+        )
+        return
+
+    _publish_devices(settings, fault.name, plan.publishes)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
 def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     """Basalte-written severities become episodes: read the fault's severity
     writes back off the bus archive, fold, reconcile — and publish nothing.
@@ -422,6 +522,8 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     for fault in fault_list.schedulable():
         if fault.kind is MeasurementKind.SILENCE:
             _run_silence(settings, fault, dry_run=args.dry_run)
+        elif fault.kind is MeasurementKind.DURATION:
+            _run_duration(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.EXTERNAL:
             _run_external(settings, fault, dry_run=args.dry_run)
         else:

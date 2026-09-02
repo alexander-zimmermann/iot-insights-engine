@@ -26,6 +26,7 @@
           "minProperties": 1,
           "additionalProperties": { "type": "number" }
         },
+        "devices":    { "$ref": "#/$defs/devices" },
         "scope":      { "$ref": "#/$defs/scope" },
         "target":     { "$ref": "#/$defs/target" },
         "dormant":    { "$ref": "#/$defs/dormant" }
@@ -40,8 +41,27 @@
         {
           "if":   { "properties": { "kind": { "const": "external" } }, "required": ["kind"] },
           "else": { "required": ["parameters", "target"] }
+        },
+        {
+          "if":   { "properties": { "kind": { "const": "duration" } }, "required": ["kind"] },
+          "then": {
+            "required": ["devices"],
+            "properties": { "parameters": { "required": ["active_hour_fraction"] } }
+          }
         }
       ]
+    },
+    "devices": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "max_run_hours": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "required": ["max_run_hours"],
+        "additionalProperties": false
+      }
     },
     "scope": {
       "type": "object",
@@ -65,6 +85,12 @@
           "type": "object",
           "properties": { "per_main_group": { "const": true } },
           "required": ["per_main_group"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "per_device": { "const": true } },
+          "required": ["per_device"],
           "additionalProperties": false
         }
       ]
