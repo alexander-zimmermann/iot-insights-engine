@@ -54,20 +54,24 @@ class Scope:
 @dataclass(frozen=True, slots=True)
 class Target:
     """One group address, one address per matched main group in that
-    group's Zentral block (channel silence), or one address per declared
-    device (appliance runtime) — resolved via the catalog and the writer
-    rules, never listed here.
+    group's Zentral block (channel silence), one address per declared
+    device (appliance runtime), or one per declared room (room deviation)
+    — resolved via the catalog and the writer rules, never listed here.
     """
 
     ga: str | None = None
     per_main_group: bool = False
     per_device: bool = False
+    per_room: bool = False
 
     def __post_init__(self) -> None:
         # Mirrors the schema's oneOf so the union holds for Python-side
         # construction too, not only for loaded files.
-        if sum((self.ga is not None, self.per_main_group, self.per_device)) != 1:
-            raise ValueError("target is exactly one of ga, per_main_group or per_device")
+        forms = (self.ga is not None, self.per_main_group, self.per_device, self.per_room)
+        if sum(forms) != 1:
+            raise ValueError(
+                "target is exactly one of ga, per_main_group, per_device or per_room"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +83,32 @@ class DeviceLimit:
 
     match: str
     max_run_hours: float
+
+
+@dataclass(frozen=True, slots=True)
+class Roles:
+    """The deviation kind's channel roles, each a catalog-name LIKE pattern
+    matched inside every room's channels: the measured value, the reference
+    it deviates from, and an optional gate that must stand for the fault to
+    count at all.
+    """
+
+    value: str
+    reference: str
+    gate: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RoomRule:
+    """One room's declared rule: a unique fragment of its catalog names,
+    the gap under the reference it may not exceed — written here after
+    someone looked at the data once — and, where the default value role
+    does not fit (the sensor-less halls), the room's own value pattern.
+    """
+
+    match: str
+    min_gap_k: float
+    value: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +139,8 @@ class Fault:
     target: Target | None = None
     dormant: Dormant | None = None
     devices: tuple[DeviceLimit, ...] = ()
+    roles: Roles | None = None
+    rooms: tuple[RoomRule, ...] = ()
 
 
 class FaultList:
@@ -151,7 +183,7 @@ class FaultList:
             if name in seen:
                 raise ValueError(f"{path}: duplicate fault name {name!r}")
             seen.add(name)
-            problem = _check_external(raw) or _check_devices(raw)
+            problem = _check_external(raw) or _check_devices(raw) or _check_rooms(raw)
             if problem is not None:
                 raise ValueError(f"{path}: {problem}")
             faults.append(_parse_fault(raw))
@@ -209,10 +241,35 @@ def _check_devices(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_rooms(raw: dict[str, Any]) -> str | None:
+    """Roles and per-room rules belong to the deviation kind alone, and a
+    gate role needs its threshold (and the other way round) — half a gate
+    would silently measure ungated. Checked in the loader because the
+    schema's false-subschema error loses the field name.
+    """
+    if raw["kind"] != MeasurementKind.DEVIATION:
+        for field in ("roles", "rooms"):
+            if field in raw:
+                return (
+                    f"fault {raw['name']!r}: {field}: "
+                    f"only a deviation fault declares channel roles and rooms"
+                )
+        return None
+    has_gate = "gate" in raw["roles"]
+    has_gate_min = "gate_min_pct" in raw.get("parameters", {})
+    if has_gate != has_gate_min:
+        return (
+            f"fault {raw['name']!r}: a gate role and the gate_min_pct parameter "
+            f"come together — one without the other measures ungated"
+        )
+    return None
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
     scope = raw["scope"]
     target = raw.get("target")
     dormant = raw.get("dormant")
+    roles = raw.get("roles")
     return Fault(
         name=raw["name"],
         sentence=raw["sentence"],
@@ -229,6 +286,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
                 ga=target.get("ga"),
                 per_main_group=target.get("per_main_group", False),
                 per_device=target.get("per_device", False),
+                per_room=target.get("per_room", False),
             )
             if target is not None
             else None
@@ -236,6 +294,15 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         devices=tuple(
             DeviceLimit(match=match, max_run_hours=limit["max_run_hours"])
             for match, limit in raw.get("devices", {}).items()
+        ),
+        roles=(
+            Roles(value=roles["value"], reference=roles["reference"], gate=roles.get("gate"))
+            if roles is not None
+            else None
+        ),
+        rooms=tuple(
+            RoomRule(match=match, min_gap_k=rule["min_gap_k"], value=rule.get("value"))
+            for match, rule in raw.get("rooms", {}).items()
         ),
         dormant=(
             Dormant(reason=dormant["reason"], active_when=dormant["active_when"])

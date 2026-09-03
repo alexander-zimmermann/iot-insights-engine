@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-from iot_insights_engine import detect_faults, duration, nats_publisher
+from iot_insights_engine import detect_faults, deviation, duration, nats_publisher
 from iot_insights_engine.config import Settings
 from iot_insights_engine.detect_faults import GroupPublish, plan_run
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -251,6 +251,53 @@ def test_publish_device_clear_forces_level_zero() -> None:
         detect_faults._publish_devices(settings, "appliance_runtime", (publish,))
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
+    assert call.args[2]["firing"] is False
+
+
+def test_publish_room_carries_cold_details_on_the_slug_subject() -> None:
+    settings = _settings()
+    publish = deviation.RoomPublish(
+        slug="eg-buero",
+        severity=2,
+        room="EG.Büro",
+        cold_since=_T0,
+        gap=1.5,
+        value=20.5,
+        reference=22.0,
+        gate=80.0,
+        min_gap=1.0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.fbh_cold.eg-buero"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["room"] == "EG.Büro"
+    assert payload["gap"] == 1.5
+    assert payload["reference"] == 22.0
+
+
+def test_publish_room_clear_forces_level_zero() -> None:
+    settings = _settings()
+    publish = deviation.RoomPublish(
+        slug="eg-buero",
+        severity=0,
+        room="EG.Büro",
+        cold_since=None,
+        gap=None,
+        value=None,
+        reference=None,
+        gate=None,
+        min_gap=1.0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.fbh_cold.eg-buero"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
