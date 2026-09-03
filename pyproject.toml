@@ -1,6 +1,6 @@
 [project]
 name = "iot-insights-engine"
-version = "1.17.0"
+version = "1.18.0"
 description = "TSDB-backed background jobs: external forecast pulls (Forecast.Solar, Open-Meteo) and the daily energy balance. Companion to iot-mcp-bridge — owns all writes to mcp_forecasts."
 readme = "README.md"
 license = "GPL-2.0-or-later"
