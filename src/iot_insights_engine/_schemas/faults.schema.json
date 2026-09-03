@@ -27,6 +27,8 @@
           "additionalProperties": { "type": "number" }
         },
         "devices":    { "$ref": "#/$defs/devices" },
+        "roles":      { "$ref": "#/$defs/roles" },
+        "rooms":      { "$ref": "#/$defs/rooms" },
         "scope":      { "$ref": "#/$defs/scope" },
         "target":     { "$ref": "#/$defs/target" },
         "dormant":    { "$ref": "#/$defs/dormant" }
@@ -48,6 +50,13 @@
             "required": ["devices"],
             "properties": { "parameters": { "required": ["active_hour_fraction"] } }
           }
+        },
+        {
+          "if":   { "properties": { "kind": { "const": "deviation" } }, "required": ["kind"] },
+          "then": {
+            "required": ["roles", "rooms"],
+            "properties": { "parameters": { "required": ["min_hours"] } }
+          }
         }
       ]
     },
@@ -60,6 +69,29 @@
           "max_run_hours": { "type": "number", "exclusiveMinimum": 0 }
         },
         "required": ["max_run_hours"],
+        "additionalProperties": false
+      }
+    },
+    "roles": {
+      "type": "object",
+      "properties": {
+        "value":     { "type": "string", "minLength": 1 },
+        "reference": { "type": "string", "minLength": 1 },
+        "gate":      { "type": "string", "minLength": 1 }
+      },
+      "required": ["value", "reference"],
+      "additionalProperties": false
+    },
+    "rooms": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "min_gap_k": { "type": "number", "exclusiveMinimum": 0 },
+          "value":     { "type": "string", "minLength": 1 }
+        },
+        "required": ["min_gap_k"],
         "additionalProperties": false
       }
     },
@@ -91,6 +123,12 @@
           "type": "object",
           "properties": { "per_device": { "const": true } },
           "required": ["per_device"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "per_room": { "const": true } },
+          "required": ["per_room"],
           "additionalProperties": false
         }
       ]

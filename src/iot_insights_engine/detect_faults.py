@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import duration, episode_store, external, nats_publisher, silence
+from . import deviation, duration, episode_store, external, nats_publisher, silence
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -451,6 +451,120 @@ def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
+def _publish_rooms(
+    settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
+) -> None:
+    for publish in publishes:
+        firing = publish.severity > 0
+        nats_publisher.publish_anomaly(
+            settings,
+            fault_name,
+            severity_name(publish.severity) if firing else None,
+            {
+                "room": publish.room,
+                "cold_since": publish.cold_since,
+                "gap": publish.gap,
+                "value": publish.value,
+                "reference": publish.reference,
+                "gate": publish.gate,
+                "min_gap": publish.min_gap,
+            },
+            entity=publish.slug,
+            firing=firing,
+        )
+
+
+def _run_deviation(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    if fault.target is None or not fault.target.per_room:
+        raise ValueError(f"fault {fault.name}: deviation delivery needs a per_room target")
+    if fault.roles is None:
+        raise ValueError(f"fault {fault.name}: the deviation kind needs declared roles")
+    min_hours = float(fault.parameters["min_hours"])
+    gate_min = fault.parameters.get("gate_min_pct")
+
+    with read_connection(settings) as conn:
+        frontier = silence.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window_start = frontier - LOOKBACK
+        channels = silence.resolve_scope(conn, fault.scope)
+        # A room without its channels or a channel without its room fails
+        # the run loudly — never a silently unmeasured room.
+        rooms = deviation.resolve_rooms(channels, fault.rooms, fault.roles)
+        gas = [ga for room in rooms for ga in room.gas]
+        series = deviation.values(conn, gas, window_start)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    dead_values = deviation.dead_value_gas(rooms, series)
+    if dead_values:
+        # A dead register reading 0.0 would score as a huge gap; the
+        # silence fault owns reporting the channel itself.
+        log.info("scope_drops", dead=len(dead_values), dead_channels=dead_values)
+        for ga in dead_values:
+            del series[ga]
+
+    states: dict[str, deviation.RoomState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for room in rooms:
+        buckets = deviation.room_series(room, series, window_start, frontier)
+        if not buckets:
+            dataless.add(room.slug)
+        cold = deviation.cold_buckets(room, buckets, gate_min)
+        states[room.slug] = deviation.classify(room, cold, frontier)
+        observations.extend(deviation.deviation_observations(room, cold, min_hours))
+    if dataless:
+        # A role silent for the whole window leaves the room unmeasurable —
+        # not a scope error, but never to pass in silence either.
+        log.warning("rooms_dataless", fault=fault.name, rooms=sorted(dataless))
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(
+        fault.name, observations, history_scores, EpisodePolicy(), frontier
+    )
+    plan = deviation.plan_run(
+        episodes=episodes,
+        open_rows=open_rows,
+        states_by_slug=states,
+        dataless=frozenset(dataless),
+        frontier=frontier,
+    )
+
+    log.info(
+        "room_deviation_run",
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        rooms=len(rooms),
+        cold=sum(1 for s in states.values() if s.cold_since is not None),
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        stale_opens=list(plan.stale_opens),
+        publishes=len(plan.publishes),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        per_room = Counter(e.subject for e in episodes)
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            per_room=dict(sorted(per_room.items())),
+            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+            would_publish=[{"slug": p.slug, "severity": p.severity} for p in plan.publishes],
+        )
+        return
+
+    _publish_rooms(settings, fault.name, plan.publishes)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
 def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     """Basalte-written severities become episodes: read the fault's severity
     writes back off the bus archive, fold, reconcile — and publish nothing.
@@ -524,6 +638,8 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
             _run_silence(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.DURATION:
             _run_duration(settings, fault, dry_run=args.dry_run)
+        elif fault.kind is MeasurementKind.DEVIATION:
+            _run_deviation(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.EXTERNAL:
             _run_external(settings, fault, dry_run=args.dry_run)
         else:

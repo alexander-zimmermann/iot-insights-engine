@@ -19,6 +19,8 @@ from iot_insights_engine.faults import (
     Dormant,
     FaultList,
     MeasurementKind,
+    Roles,
+    RoomRule,
     Target,
 )
 
@@ -577,6 +579,123 @@ def test_device_entry_without_limit_rejected(tmp_path: Path) -> None:
 def test_per_device_target_excludes_other_forms(tmp_path: Path) -> None:
     body = _DURATION.replace("per_device: true", 'per_device: true\n      ga: "2/2/229"')
     with pytest.raises(ValueError, match=r"'appliance_runtime'.*target"):
+        FaultList.load(_write(tmp_path, body))
+
+
+_DEVIATION = """
+faults:
+  - name: fbh_cold
+    sentence: "Ein Raum liegt bei offenem Stellventil zu lange unter seiner
+      Soll-Temperatur."
+    unit: "× der erlaubten Abweichung"
+    kind: deviation
+    parameters:
+      min_hours: 2
+      gate_min_pct: 50
+    roles:
+      value: "%.Sensor.Temperatur"
+      reference: "%.FBH.Soll-Temperatur-Status"
+      gate: "%.FBH.Stellwert-Status"
+    rooms:
+      EG.Büro:
+        min_gap_k: 1.0
+      EG.Flur:
+        min_gap_k: 1.0
+        value: "Sensorik.EG.Flur.BWM.%.Temperatur"
+    scope:
+      name_like:
+        - "Sensorik.%.Sensor.Temperatur"
+        - "Sensorik.EG.Flur.BWM.%.Temperatur"
+        - "Raumklima.%.FBH.Soll-Temperatur-Status"
+        - "Raumklima.%.FBH.Stellwert-Status"
+    target:
+      per_room: true
+"""
+
+
+def test_deviation_fault_loads_roles_and_rooms(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _DEVIATION))
+    assert fault.kind is MeasurementKind.DEVIATION
+    assert fault.parameters == {"min_hours": 2, "gate_min_pct": 50}
+    assert fault.target is not None
+    assert fault.target.per_room is True
+    assert fault.target.ga is None
+    assert fault.roles == Roles(
+        value="%.Sensor.Temperatur",
+        reference="%.FBH.Soll-Temperatur-Status",
+        gate="%.FBH.Stellwert-Status",
+    )
+    assert fault.rooms == (
+        RoomRule(match="EG.Büro", min_gap_k=1.0),
+        RoomRule(match="EG.Flur", min_gap_k=1.0, value="Sensorik.EG.Flur.BWM.%.Temperatur"),
+    )
+
+
+def test_deviation_without_rooms_rejected(tmp_path: Path) -> None:
+    body = "\n".join(
+        line
+        for line in _DEVIATION.splitlines()
+        if line.strip() not in {"rooms:", "EG.Büro:", "EG.Flur:"}
+        and "min_gap_k" not in line
+        and "Sensorik.EG.Flur.BWM" not in line
+    )
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*rooms"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_deviation_requires_min_hours(tmp_path: Path) -> None:
+    body = _DEVIATION.replace("min_hours: 2", "other: 1").replace(
+        "gate_min_pct: 50", "gate_min_pct: 50.0"
+    )
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*min_hours"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_gate_role_without_gate_min_rejected(tmp_path: Path) -> None:
+    body = _DEVIATION.replace("      gate_min_pct: 50\n", "")
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*gate"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_gate_min_without_gate_role_rejected(tmp_path: Path) -> None:
+    body = _DEVIATION.replace('      gate: "%.FBH.Stellwert-Status"\n', "")
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*gate"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_rooms_on_other_kind_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: x
+            sentence: "Ein Satz mit Einheit in mA."
+            unit: "mA"
+            kind: drift
+            parameters:
+              healthy: 43
+            rooms:
+              EG.Büro:
+                min_gap_k: 1.0
+            scope:
+              name_like: "%.Stromwert"
+            target:
+              ga: "2/2/229"
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'x'.*rooms"):
+        FaultList.load(path)
+
+
+def test_non_positive_room_gap_rejected(tmp_path: Path) -> None:
+    body = _DEVIATION.replace("min_gap_k: 1.0\n        value:", "min_gap_k: 0\n        value:")
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*min_gap_k"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_room_entry_without_gap_rejected(tmp_path: Path) -> None:
+    body = _DEVIATION.replace("        min_gap_k: 1.0\n      EG.Flur:", "      EG.Flur:")
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*Büro"):
         FaultList.load(_write(tmp_path, body))
 
 
