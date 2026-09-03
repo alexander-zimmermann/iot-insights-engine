@@ -56,12 +56,11 @@ _FLUR_SOLL = Channel(ga="6/1/2", name="Raumklima.EG.Flur.FBH.Soll-Temperatur-Sta
 _FLUR_VALVE = Channel(ga="6/1/1", name="Raumklima.EG.Flur.FBH.Stellwert-Status", dpt="5.001")
 
 _ROLES = Roles(
-    value="%.Sensor.Temperatur",
     reference="%.FBH.Soll-Temperatur-Status",
     gate="%.FBH.Stellwert-Status",
 )
 _RULES = (
-    RoomRule(match="EG.Büro", min_gap_k=1.0),
+    RoomRule(match="EG.Büro", min_gap_k=1.0, value="Sensorik.EG.Büro.Sensor.Temperatur"),
     RoomRule(match="EG.Flur", min_gap_k=1.0, value="Sensorik.EG.Flur.BWM.%.Temperatur"),
 )
 _ALL_CHANNELS = [
@@ -134,7 +133,10 @@ class TestResolveRooms:
                 ga="6/2/20", name="Raumklima.EG.Gäste-WC.FBH.Stellwert-Status", dpt="5.001"
             ),
         ]
-        [room] = resolve_rooms(wc_channels, (RoomRule(match="EG.Gäste-WC", min_gap_k=1.0),), _ROLES)
+        rule = RoomRule(
+            match="EG.Gäste-WC", min_gap_k=1.0, value="Sensorik.EG.Gäste-WC.Sensor.Temperatur"
+        )
+        [room] = resolve_rooms(wc_channels, (rule,), _ROLES)
         assert room.slug == "eg-gaeste-wc"
 
     def test_room_without_reference_channel_is_an_error(self) -> None:
@@ -159,25 +161,25 @@ class TestResolveRooms:
             resolve_rooms([*_ALL_CHANNELS, twin], _RULES, _ROLES)
 
     def test_missing_gate_role_leaves_gate_unset(self) -> None:
-        roles = Roles(value="%.Sensor.Temperatur", reference="%.FBH.Soll-Temperatur-Status")
-        rooms = resolve_rooms(
-            [_BUERO_SENSOR, _BUERO_SOLL], (RoomRule(match="EG.Büro", min_gap_k=1.0),), roles
-        )
+        roles = Roles(reference="%.FBH.Soll-Temperatur-Status")
+        rooms = resolve_rooms([_BUERO_SENSOR, _BUERO_SOLL], _RULES[:1], roles)
         assert rooms[0].gate_ga is None
 
     def test_channel_claimed_by_two_rooms_is_an_error(self) -> None:
         # "EG.Flur" and a leftover "Flur" rule both contain the hall's
         # channels — a merge artifact that must fail, not double-measure.
-        rules = (*_RULES, RoomRule(match="Flur", min_gap_k=2.0))
+        stray = RoomRule(match="Flur", min_gap_k=2.0, value="Sensorik.EG.Flur.BWM.%.Temperatur")
         with pytest.raises(ValueError, match=r"8/1/11.*'EG\.Flur'.*'Flur'"):
-            resolve_rooms(_ALL_CHANNELS, rules, _ROLES)
+            resolve_rooms(_ALL_CHANNELS, (*_RULES, stray), _ROLES)
 
     def test_colliding_slugs_are_an_error(self) -> None:
         # The slug is episode subject and NATS entity: two labels that
         # transliterate to one slug would silently merge two rooms.
         rules = (
-            RoomRule(match="EG.Büro", min_gap_k=1.0),
-            RoomRule(match="EG.Buero", min_gap_k=1.0),
+            _RULES[0],
+            RoomRule(
+                match="EG.Buero", min_gap_k=1.0, value="Sensorik.EG.Büro.Sensor.Temperatur"
+            ),
         )
         with pytest.raises(ValueError, match=r"'EG\.Büro'.*'EG\.Buero'.*eg-buero"):
             resolve_rooms([_BUERO_SENSOR, _BUERO_SOLL, _BUERO_VALVE], rules, _ROLES)

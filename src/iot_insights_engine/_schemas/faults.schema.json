@@ -75,11 +75,10 @@
     "roles": {
       "type": "object",
       "properties": {
-        "value":     { "type": "string", "minLength": 1 },
         "reference": { "type": "string", "minLength": 1 },
         "gate":      { "type": "string", "minLength": 1 }
       },
-      "required": ["value", "reference"],
+      "required": ["reference"],
       "additionalProperties": false
     },
     "rooms": {
@@ -91,7 +90,7 @@
           "min_gap_k": { "type": "number", "exclusiveMinimum": 0 },
           "value":     { "type": "string", "minLength": 1 }
         },
-        "required": ["min_gap_k"],
+        "required": ["min_gap_k", "value"],
         "additionalProperties": false
       }
     },
