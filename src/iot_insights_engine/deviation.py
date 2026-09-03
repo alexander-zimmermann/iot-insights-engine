@@ -4,8 +4,9 @@ A value sits too far under its declared reference while a gate condition
 holds — for the FBH fault: a room at least its declared gap under the
 setpoint while the valve is open past the gate threshold, for at least the
 declared hours. The reference is swappable by declaration: the fault file
-names a channel pattern per role (value, reference, optional gate), and
-per-room rules marry the scoped channels into triples — strictly both
+names a channel pattern for the reference and the optional gate, which
+follow a uniform naming rule across rooms, while each room names the
+channel it is measured on. The two marry into triples — strictly both
 ways, like the duration kind's device limits.
 
 Values come from the hourly aggregate as a dense series: KNX channels are
@@ -126,7 +127,6 @@ def resolve_rooms(
             continue
         slugs[slug] = rule.match
         mine = [c for c in channels if f".{rule.match}." in c.name]
-        value_pattern = rule.value if rule.value is not None else roles.value
         by_role: dict[str, list[Channel]] = {"value": [], "reference": [], "gate": []}
         for channel in mine:
             if channel.ga in claimed:
@@ -139,7 +139,7 @@ def resolve_rooms(
             hits = [
                 role
                 for role, pattern in (
-                    ("value", value_pattern),
+                    ("value", rule.value),
                     ("reference", roles.reference),
                     ("gate", roles.gate),
                 )

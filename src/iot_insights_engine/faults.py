@@ -87,28 +87,31 @@ class DeviceLimit:
 
 @dataclass(frozen=True, slots=True)
 class Roles:
-    """The deviation kind's channel roles, each a catalog-name LIKE pattern
-    matched inside every room's channels: the measured value, the reference
-    it deviates from, and an optional gate that must stand for the fault to
-    count at all.
+    """The deviation kind's shared channel roles, each a catalog-name LIKE
+    pattern matched inside every room's channels: the reference the value
+    deviates from, and an optional gate that must stand for the fault to
+    count at all. Both follow a uniform naming rule across rooms, which is
+    what makes a pattern the honest way to write them; the measured value
+    does not, so it is declared per room.
     """
 
-    value: str
     reference: str
     gate: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RoomRule:
-    """One room's declared rule: a unique fragment of its catalog names,
-    the gap under the reference it may not exceed — written here after
-    someone looked at the data once — and, where the default value role
-    does not fit (the sensor-less halls), the room's own value pattern.
+    """One room's declared rule: a unique fragment of its catalog names, the
+    channel it is measured on, and the gap under the reference it may not
+    exceed — written here after someone looked at the data once. The value
+    channel is named per room rather than matched by a shared pattern: rooms
+    disagree about which channel is theirs, and naming it makes the file
+    readable without resolving anything.
     """
 
     match: str
     min_gap_k: float
-    value: str | None = None
+    value: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,12 +299,12 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
             for match, limit in raw.get("devices", {}).items()
         ),
         roles=(
-            Roles(value=roles["value"], reference=roles["reference"], gate=roles.get("gate"))
+            Roles(reference=roles["reference"], gate=roles.get("gate"))
             if roles is not None
             else None
         ),
         rooms=tuple(
-            RoomRule(match=match, min_gap_k=rule["min_gap_k"], value=rule.get("value"))
+            RoomRule(match=match, min_gap_k=rule["min_gap_k"], value=rule["value"])
             for match, rule in raw.get("rooms", {}).items()
         ),
         dormant=(

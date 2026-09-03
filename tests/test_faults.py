@@ -593,12 +593,12 @@ faults:
       min_hours: 2
       gate_min_pct: 50
     roles:
-      value: "%.Sensor.Temperatur"
       reference: "%.FBH.Soll-Temperatur-Status"
       gate: "%.FBH.Stellwert-Status"
     rooms:
       EG.Büro:
         min_gap_k: 1.0
+        value: "Sensorik.EG.Büro.Sensor.Temperatur"
       EG.Flur:
         min_gap_k: 1.0
         value: "Sensorik.EG.Flur.BWM.%.Temperatur"
@@ -621,24 +621,38 @@ def test_deviation_fault_loads_roles_and_rooms(tmp_path: Path) -> None:
     assert fault.target.per_room is True
     assert fault.target.ga is None
     assert fault.roles == Roles(
-        value="%.Sensor.Temperatur",
         reference="%.FBH.Soll-Temperatur-Status",
         gate="%.FBH.Stellwert-Status",
     )
     assert fault.rooms == (
-        RoomRule(match="EG.Büro", min_gap_k=1.0),
+        RoomRule(
+            match="EG.Büro", min_gap_k=1.0, value="Sensorik.EG.Büro.Sensor.Temperatur"
+        ),
         RoomRule(match="EG.Flur", min_gap_k=1.0, value="Sensorik.EG.Flur.BWM.%.Temperatur"),
     )
 
 
-def test_deviation_without_rooms_rejected(tmp_path: Path) -> None:
-    body = "\n".join(
-        line
-        for line in _DEVIATION.splitlines()
-        if line.strip() not in {"rooms:", "EG.Büro:", "EG.Flur:"}
-        and "min_gap_k" not in line
-        and "Sensorik.EG.Flur.BWM" not in line
+def test_room_without_a_value_channel_rejected(tmp_path: Path) -> None:
+    # There is no shared fallback: a room that names no channel cannot be
+    # measured, and the file must say so at load.
+    body = _DEVIATION.replace('        value: "Sensorik.EG.Büro.Sensor.Temperatur"\n', "")
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*Büro"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_value_on_the_roles_block_rejected(tmp_path: Path) -> None:
+    # The value belongs to the room, never to the shared roles.
+    body = _DEVIATION.replace(
+        '      reference: "%.FBH.Soll-Temperatur-Status"',
+        '      value: "%.Sensor.Temperatur"\n      reference: "%.FBH.Soll-Temperatur-Status"',
     )
+    with pytest.raises(ValueError, match=r"'fbh_cold'.*value"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_deviation_without_rooms_rejected(tmp_path: Path) -> None:
+    head, _rooms = _DEVIATION.split("    rooms:\n", 1)
+    body = head + "    scope:" + _DEVIATION.split("    scope:", 1)[1]
     with pytest.raises(ValueError, match=r"'fbh_cold'.*rooms"):
         FaultList.load(_write(tmp_path, body))
 
@@ -694,7 +708,10 @@ def test_non_positive_room_gap_rejected(tmp_path: Path) -> None:
 
 
 def test_room_entry_without_gap_rejected(tmp_path: Path) -> None:
-    body = _DEVIATION.replace("        min_gap_k: 1.0\n      EG.Flur:", "      EG.Flur:")
+    body = _DEVIATION.replace(
+        '        min_gap_k: 1.0\n        value: "Sensorik.EG.Büro.Sensor.Temperatur"',
+        '        value: "Sensorik.EG.Büro.Sensor.Temperatur"',
+    )
     with pytest.raises(ValueError, match=r"'fbh_cold'.*Büro"):
         FaultList.load(_write(tmp_path, body))
 
