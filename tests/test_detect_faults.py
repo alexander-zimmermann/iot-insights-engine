@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-from iot_insights_engine import detect_faults, deviation, duration, nats_publisher
+from iot_insights_engine import detect_faults, deviation, duration, nats_publisher, volume
 from iot_insights_engine.config import Settings
 from iot_insights_engine.detect_faults import GroupPublish, plan_run
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -298,6 +298,49 @@ def test_publish_room_clear_forces_level_zero() -> None:
         detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
+    assert call.args[2]["firing"] is False
+
+
+def _volume_publish(severity: int) -> volume.VolumePublish:
+    """Over the limit while firing, back under it on the clear."""
+    return volume.VolumePublish(
+        severity=severity,
+        state=volume.VolumeState(
+            episodes=11 if severity else 3,
+            limit=5.0,
+            over_since=_T0 if severity else None,
+            by_fault=(
+                volume.FaultCount(fault="channel_silence", episodes=8),
+                volume.FaultCount(fault="fbh_cold", episodes=3),
+            ),
+        ),
+    )
+
+
+def test_publish_volume_carries_the_week_on_the_house_wide_subject() -> None:
+    settings = _settings()
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_volume(settings, "notification_volume", _volume_publish(2))
+    (call,) = pub.call_args_list
+    # One house-wide address, so a 1:1 subject with no entity token.
+    assert call.args[1] == "anomaly.notification_volume"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["episodes"] == 11
+    assert payload["limit"] == 5.0
+    assert payload["window_days"] == 7
+    assert payload["by_fault"][0] == {"fault": "channel_silence", "episodes": 8}
+
+
+def test_publish_volume_clear_forces_level_zero() -> None:
+    settings = _settings()
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_volume(settings, "notification_volume", _volume_publish(0))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.notification_volume"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
