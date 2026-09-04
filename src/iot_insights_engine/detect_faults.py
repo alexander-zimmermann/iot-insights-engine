@@ -8,6 +8,11 @@ leaves the engine is a severity 0–3 per main group on
 `anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
+The volume watchdog runs the loop over the engine's own output: it counts
+the incidents of the last seven days out of the episode stream and puts a
+severity on one house-wide address, so drift back into noise arrives on the
+same bus as everything else.
+
 External faults run the same loop the other way round: Basalte detects,
 writes the severity to the fault address and delivers itself; the engine
 reads those writes back from the bus archive, records episodes marked
@@ -37,7 +42,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import deviation, duration, episode_store, external, nats_publisher, silence
+from . import deviation, duration, episode_store, external, nats_publisher, silence, volume
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -278,7 +283,7 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
             log.warning("no_aggregate_data", fault=fault.name)
             return
         window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.scope)
+        channels = silence.resolve_scope(conn, fault.channel_scope())
         stats_by_ga = silence.channel_stats(conn, window_start)
         kept, drops = silence.drop_unmeasurable(channels, stats_by_ga)
         _log_drops(drops)
@@ -384,7 +389,7 @@ def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
             log.warning("no_aggregate_data", fault=fault.name)
             return
         window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.scope)
+        channels = silence.resolve_scope(conn, fault.channel_scope())
         # A limit without a channel or a channel without a limit fails the
         # run loudly — never a silently unmeasured device.
         devices = duration.resolve_devices(channels, fault.devices)
@@ -488,7 +493,7 @@ def _run_deviation(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
             log.warning("no_aggregate_data", fault=fault.name)
             return
         window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.scope)
+        channels = silence.resolve_scope(conn, fault.channel_scope())
         # A room without its channels or a channel without its room fails
         # the run loudly — never a silently unmeasured room.
         rooms = deviation.resolve_rooms(channels, fault.rooms, fault.roles)
@@ -565,6 +570,101 @@ def _run_deviation(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
+def _publish_volume(
+    settings: Settings, fault_name: str, publish: volume.VolumePublish
+) -> None:
+    firing = publish.severity > 0
+    nats_publisher.publish_anomaly(
+        settings,
+        fault_name,
+        severity_name(publish.severity) if firing else None,
+        {
+            "episodes": publish.state.episodes,
+            "limit": publish.state.limit,
+            "window_days": volume.WINDOW.days,
+            "over_since": publish.state.over_since,
+            # Which fault is making the noise — the thing a human acts on.
+            "by_fault": [
+                {"fault": count.fault, "episodes": count.episodes}
+                for count in publish.state.by_fault
+            ],
+        },
+        firing=firing,
+    )
+
+
+def _run_volume(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    """The volume watchdog: the incident count of the last seven days is
+    itself a fault, measured over the episode stream and delivered on one
+    house-wide address. Declared last in the fault list, so the count
+    already includes what this run's other faults just wrote.
+    """
+    if fault.target is None or fault.target.ga is None:
+        raise ValueError(f"fault {fault.name}: volume delivery needs a house-wide ga target")
+    limit = float(fault.parameters["max_episodes_per_week"])
+
+    with read_connection(settings) as conn:
+        frontier = silence.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window_start = frontier - LOOKBACK
+        # A week of history before the first bucket, so the oldest count in
+        # the window is as complete as the newest.
+        starts = volume.episode_starts(conn, window_start - volume.WINDOW)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    buckets = volume.count_series(starts, window_start, frontier)
+    observations = volume.volume_observations(buckets, limit)
+    state = volume.classify(starts, buckets, limit, frontier)
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(
+        fault.name, observations, history_scores, EpisodePolicy(), frontier
+    )
+    plan = volume.plan_run(
+        episodes=episodes, open_rows=open_rows, state=state, frontier=frontier
+    )
+
+    log.info(
+        "notification_volume_run",
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        incidents=state.episodes,
+        limit=limit,
+        over_since=state.over_since.isoformat() if state.over_since else None,
+        by_fault={count.fault: count.episodes for count in state.by_fault},
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        publishes=1 if plan.publish is not None else 0,
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            buckets_over_limit=len(observations),
+            peak_incidents=max(b.episodes for b in buckets),
+            would_publish=(
+                {"severity": plan.publish.severity, "episodes": plan.publish.state.episodes}
+                if plan.publish is not None
+                else None
+            ),
+        )
+        return
+
+    if plan.publish is not None:
+        _publish_volume(settings, fault.name, plan.publish)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
 def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     """Basalte-written severities become episodes: read the fault's severity
     writes back off the bus archive, fold, reconcile — and publish nothing.
@@ -572,7 +672,7 @@ def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     """
     now = datetime.now(tz=UTC)
     with read_connection(settings) as conn:
-        channels = silence.resolve_scope(conn, fault.scope)
+        channels = silence.resolve_scope(conn, fault.channel_scope())
         if not channels:
             # Address not in the catalog yet (ETS work pending) — or a typo.
             log.warning("external_no_subjects", fault=fault.name)
@@ -640,6 +740,8 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
             _run_duration(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.DEVIATION:
             _run_deviation(settings, fault, dry_run=args.dry_run)
+        elif fault.kind is MeasurementKind.VOLUME:
+            _run_volume(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.EXTERNAL:
             _run_external(settings, fault, dry_run=args.dry_run)
         else:

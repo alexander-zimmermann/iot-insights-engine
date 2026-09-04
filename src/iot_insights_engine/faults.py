@@ -36,6 +36,9 @@ class MeasurementKind(StrEnum):
     # Not measured here: Basalte detects and delivers, the engine reads the
     # severity writes back off the fault address and records episodes.
     EXTERNAL = "external"
+    # Not measured on channels at all: the count of incidents per week, over
+    # the episode stream every other fault writes.
+    VOLUME = "volume"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +133,8 @@ class Fault:
     """One declared fault: a sentence with a unit, measured one way, with
     parameters expressed in the channel's own unit. External faults carry
     neither parameters nor a target — threshold and delivery live in
-    Basalte, the scope names the address whose writes come back.
+    Basalte, the scope names the address whose writes come back. A volume
+    fault carries no scope: it measures the episode stream, not channels.
     """
 
     name: str
@@ -138,12 +142,22 @@ class Fault:
     unit: str
     kind: MeasurementKind
     parameters: Mapping[str, float]
-    scope: Scope
+    scope: Scope | None = None
     target: Target | None = None
     dormant: Dormant | None = None
     devices: tuple[DeviceLimit, ...] = ()
     roles: Roles | None = None
     rooms: tuple[RoomRule, ...] = ()
+
+    def channel_scope(self) -> Scope:
+        """The catalog query this fault measures over. Every kind but volume
+        declares one and the loader enforces it, so a missing scope here is a
+        new kind that arrived without saying what it measures — never an
+        empty query, which would resolve to the whole catalog.
+        """
+        if self.scope is None:
+            raise ValueError(f"fault {self.name}: this kind measures channels and needs a scope")
+        return self.scope
 
 
 class FaultList:
@@ -186,7 +200,12 @@ class FaultList:
             if name in seen:
                 raise ValueError(f"{path}: duplicate fault name {name!r}")
             seen.add(name)
-            problem = _check_external(raw) or _check_devices(raw) or _check_rooms(raw)
+            problem = (
+                _check_external(raw)
+                or _check_volume(raw)
+                or _check_devices(raw)
+                or _check_rooms(raw)
+            )
             if problem is not None:
                 raise ValueError(f"{path}: {problem}")
             faults.append(_parse_fault(raw))
@@ -234,6 +253,19 @@ def _check_external(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_volume(raw: dict[str, Any]) -> str | None:
+    """A volume fault measures the episode stream, so a channel scope on it
+    would be configuration nothing reads. Checked in the loader because the
+    schema's if/else error names the branch rather than the field.
+    """
+    if raw["kind"] == MeasurementKind.VOLUME and "scope" in raw:
+        return (
+            f"fault {raw['name']!r}: scope: a volume fault counts episodes, "
+            f"not channels — it declares none"
+        )
+    return None
+
+
 def _check_devices(raw: dict[str, Any]) -> str | None:
     """Per-device limits belong to the duration kind alone; anywhere else
     they would be dead configuration nothing reads. Checked in the loader
@@ -269,7 +301,7 @@ def _check_rooms(raw: dict[str, Any]) -> str | None:
 
 
 def _parse_fault(raw: dict[str, Any]) -> Fault:
-    scope = raw["scope"]
+    scope = raw.get("scope")
     target = raw.get("target")
     dormant = raw.get("dormant")
     roles = raw.get("roles")
@@ -279,10 +311,14 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         unit=raw["unit"],
         kind=MeasurementKind(raw["kind"]),
         parameters=MappingProxyType(dict(raw.get("parameters", {}))),
-        scope=Scope(
-            dpt=_as_tuple(scope.get("dpt")),
-            name_like=_as_tuple(scope.get("name_like")),
-            exclude_name_like=_as_tuple(scope.get("exclude_name_like")),
+        scope=(
+            Scope(
+                dpt=_as_tuple(scope.get("dpt")),
+                name_like=_as_tuple(scope.get("name_like")),
+                exclude_name_like=_as_tuple(scope.get("exclude_name_like")),
+            )
+            if scope is not None
+            else None
         ),
         target=(
             Target(

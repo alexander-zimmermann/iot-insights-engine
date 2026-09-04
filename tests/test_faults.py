@@ -783,6 +783,68 @@ def test_engine_kind_still_requires_target(tmp_path: Path) -> None:
         FaultList.load(path)
 
 
+_VOLUME = """
+faults:
+  - name: notification_volume
+    sentence: "Mehr als 5 Vorfälle in sieben Tagen."
+    unit: "× der erlaubten Wochenmenge"
+    kind: volume
+    parameters:
+      max_episodes_per_week: 5
+    target:
+      ga: "0/0/251"
+"""
+
+
+def test_volume_fault_loads_without_a_channel_scope(tmp_path: Path) -> None:
+    # The watchdog measures the episode stream, not channels — so it has no
+    # catalog query to carry, and the limit is the whole configuration.
+    [fault] = FaultList.load(_write(tmp_path, _VOLUME))
+    assert fault.kind is MeasurementKind.VOLUME
+    assert fault.scope is None
+    assert fault.parameters == {"max_episodes_per_week": 5}
+    assert fault.target == Target(ga="0/0/251")
+
+
+def test_volume_fault_needs_its_limit(tmp_path: Path) -> None:
+    # N lives in the fault file: without it there is nothing to be over.
+    path = _write(tmp_path, _VOLUME.replace("max_episodes_per_week: 5", "window_days: 7"))
+    with pytest.raises(ValueError, match=r"'notification_volume'.*max_episodes_per_week"):
+        FaultList.load(path)
+
+
+def test_volume_fault_rejects_a_channel_scope(tmp_path: Path) -> None:
+    # A scope here would be configuration nothing reads.
+    path = _write(
+        tmp_path,
+        _VOLUME
+        + """    scope:
+      name_like: "%"
+""",
+    )
+    with pytest.raises(ValueError, match=r"'notification_volume'.*scope"):
+        FaultList.load(path)
+
+
+def test_measuring_kinds_still_require_a_scope(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: x
+            sentence: "Ein Satz mit Einheit in mA."
+            unit: "mA"
+            kind: drift
+            parameters:
+              healthy: 43
+            target:
+              ga: "2/2/229"
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'x'.*scope"):
+        FaultList.load(path)
+
+
 def test_bundled_schema_is_valid() -> None:
     schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
