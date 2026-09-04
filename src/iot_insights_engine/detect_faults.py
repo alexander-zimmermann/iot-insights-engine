@@ -271,6 +271,7 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     if fault.target is None or not fault.target.per_main_group:
         raise ValueError(f"fault {fault.name}: silence delivery needs a per_main_group target")
     gap_factor = float(fault.parameters["gap_factor"])
+    gap_quantile = float(fault.parameters["gap_quantile"])
 
     with read_connection(settings) as conn:
         frontier = silence.frontier(conn)
@@ -293,7 +294,13 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     observations: list[Observation] = []
     for channel in candidates:
         buckets = series.get(channel.ga, [])
-        state = silence.classify(channel, buckets, frontier, gap_factor)
+        state = silence.classify(
+            channel,
+            buckets,
+            frontier=frontier,
+            gap_factor=gap_factor,
+            gap_quantile=gap_quantile,
+        )
         states[channel.ga] = state
         if state.pause is not None:
             observations.extend(

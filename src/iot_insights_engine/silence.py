@@ -2,9 +2,12 @@
 
 A channel that used to send has gone silent — longer than `gap_factor`
 times its own normal pause, measured from the latest bucket per channel
-over the hourly aggregate. Channel state (alive / silent / never sent) is
-computed on demand from `knx_1h`, never stored: a staleness detector
-working off stale data is the joke that tells itself.
+over the hourly aggregate. That pause is the `gap_quantile` of the
+channel's own gaps rather than their median — see `normal_pause` for why
+the median misreads every channel a human switches. Channel state
+(alive / silent / never sent) is computed on demand from `knx_1h`, never
+stored: a staleness detector working off stale data is the joke that
+tells itself.
 
 Gaps are measured against the aggregate's *frontier* (its newest bucket
 anywhere), not the wall clock: the continuous aggregate materializes with
@@ -25,7 +28,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from statistics import median
+from math import ceil
 from typing import Any
 
 import psycopg
@@ -92,19 +95,37 @@ class SilenceState:
     pause: timedelta | None = None
 
 
-def median_pause(buckets: list[datetime]) -> timedelta | None:
-    """The channel's own normal pause: the median gap between its hourly
-    buckets, floored at one bucket (hourly resolution sees nothing
-    shorter). None below two buckets — a single send has no pause.
+def normal_pause(buckets: list[datetime], quantile: float) -> timedelta | None:
+    """The channel's own normal pause: the `quantile` of the gaps between
+    its hourly buckets, floored at one bucket (hourly resolution sees
+    nothing shorter). None below two buckets — a single send has no pause.
+
+    The quantile is the estimator, not the median, because gaps are bimodal
+    wherever a human drives the channel: an hour inside an evening's
+    switching, a day until the next one. The median lands inside the
+    cluster and calls every ordinary night a fault; a high quantile lands
+    on the gap that actually ends the quiet phase. For the cyclic channels
+    the fault exists for — power, temperature, status — every gap is the
+    cycle, so the quantile reads the same value the median did and costs
+    no sensitivity.
+
+    Read by nearest rank: the pause is a gap the channel really showed, not
+    an interpolation between two unlike ones.
     """
     if len(buckets) < 2:
         return None
-    gaps = [(b - a).total_seconds() for a, b in zip(buckets, buckets[1:], strict=False)]
-    return max(timedelta(seconds=median(gaps)), BUCKET)
+    gaps = sorted(b - a for a, b in zip(buckets, buckets[1:], strict=False))
+    rank = max(1, ceil(quantile * len(gaps)))
+    return max(gaps[rank - 1], BUCKET)
 
 
 def classify(
-    channel: Channel, buckets: list[datetime], frontier: datetime, gap_factor: float
+    channel: Channel,
+    buckets: list[datetime],
+    *,
+    frontier: datetime,
+    gap_factor: float,
+    gap_quantile: float,
 ) -> SilenceState:
     """State of one channel from its time-ordered bucket series. Silent
     means the frontier sits strictly more than `gap_factor` of the
@@ -113,7 +134,7 @@ def classify(
     """
     if not buckets:
         return SilenceState(channel, ChannelState.NEVER_SENT)
-    pause = median_pause(buckets)
+    pause = normal_pause(buckets, gap_quantile)
     if pause is None:
         return SilenceState(channel, ChannelState.ALIVE)
     if frontier - buckets[-1] > gap_factor * pause:

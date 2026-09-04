@@ -38,7 +38,16 @@
       "allOf": [
         {
           "if":   { "properties": { "kind": { "const": "silence" } }, "required": ["kind"] },
-          "then": { "properties": { "parameters": { "required": ["gap_factor"] } } }
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["gap_factor", "gap_quantile"],
+                "properties": {
+                  "gap_quantile": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+                }
+              }
+            }
+          }
         },
         {
           "if":   { "properties": { "kind": { "const": "external" } }, "required": ["kind"] },
