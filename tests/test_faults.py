@@ -30,11 +30,12 @@ _VALID = """
 faults:
   - name: channel_silence
     sentence: "Ein Kanal, der sonst regelmäßig sendet, schweigt länger als das
-      Fünffache seiner üblichen Sendepause."
+      Fünffache der Sendepause, die er in neun von zehn Fällen einhält."
     unit: "× der üblichen Sendepause"
     kind: silence
     parameters:
       gap_factor: 5
+      gap_quantile: 0.9
     scope:
       name_like: "%"
     target:
@@ -68,7 +69,7 @@ def test_loads_valid_file(tmp_path: Path) -> None:
 
     silence = faults.get("channel_silence")
     assert silence.kind is MeasurementKind.SILENCE
-    assert silence.parameters == {"gap_factor": 5}
+    assert silence.parameters == {"gap_factor": 5, "gap_quantile": 0.9}
     assert silence.unit == "× der üblichen Sendepause"
     assert silence.target is not None
     assert silence.target.per_main_group is True
@@ -126,6 +127,7 @@ def test_missing_sentence_names_fault_and_field(tmp_path: Path) -> None:
             kind: silence
             parameters:
               gap_factor: 5
+              gap_quantile: 0.9
             scope:
               name_like: "%"
             target:
@@ -146,6 +148,7 @@ def test_missing_unit_names_fault_and_field(tmp_path: Path) -> None:
             kind: silence
             parameters:
               gap_factor: 5
+              gap_quantile: 0.9
             scope:
               name_like: "%"
             target:
@@ -175,6 +178,30 @@ def test_missing_parameter_names_fault_and_field(tmp_path: Path) -> None:
         """,
     )
     with pytest.raises(ValueError, match=r"channel_silence.*gap_factor"):
+        FaultList.load(path)
+
+
+def test_quantile_outside_its_range_names_fault_and_field(tmp_path: Path) -> None:
+    # A quantile is a fraction of the channel's own gaps; 90 is the typo for
+    # 0.9 that would otherwise silently read the longest gap ever seen.
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: channel_silence
+            sentence: "Ein Kanal schweigt."
+            unit: "h"
+            kind: silence
+            parameters:
+              gap_factor: 5
+              gap_quantile: 90
+            scope:
+              name_like: "%"
+            target:
+              per_main_group: true
+        """,
+    )
+    with pytest.raises(ValueError, match=r"channel_silence.*gap_quantile"):
         FaultList.load(path)
 
 
