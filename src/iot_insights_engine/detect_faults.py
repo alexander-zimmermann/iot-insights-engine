@@ -542,13 +542,15 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         for ga, stats in stats_by_ga.items()
         if stats.buckets >= MIN_PAUSE_BUCKETS
     }
+    # Deliberately without the per-subject kinds' dataless warning: here the
+    # set is every never-sent symmetry address in the catalog — a thousand of
+    # them, normal, and already counted by `_log_drops`. The ones it actually
+    # holds open are `stale_opens` in the run record below.
     dataless = frozenset(
         channel.ga
         for channel in channels
         if not window.reaches(measured_through.get(channel.ga))
     )
-    if dataless:
-        log.warning("subjects_dataless", fault=fault.name, subjects=sorted(dataless))
 
     # `now` is the frontier: episode ends are decided by aggregate progress,
     # never by wall time racing ahead of a stalled materialization.
