@@ -40,10 +40,12 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import ceil
 from typing import TYPE_CHECKING
 
 from .episodes import Observation
 from .reconcile import reconcile
+from .silence import BUCKET, pair_by_match
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -96,43 +98,25 @@ class DeviceState:
 def resolve_devices(
     channels: Sequence[Channel], references: Sequence[DeviceReference]
 ) -> list[Device]:
-    """Marry the declared references to the scoped channels, strictly both
-    ways. Every problem is reported at once — a config error should name
-    the whole repair, not one field per run.
-    """
-    problems: list[str] = []
-    matched: dict[str, Device] = {}
-    for reference in references:
-        hits = [c for c in channels if reference.match in c.name]
-        if len(hits) != 1:
-            gas = ", ".join(c.ga for c in hits)
-            problems.append(
-                f"device {reference.match!r} matches no channel in scope"
-                if not hits
-                else f"device {reference.match!r} matches {len(hits)} channels: {gas}"
-            )
-            continue
-        channel = hits[0]
-        if channel.ga in matched:
-            problems.append(
-                f"channel {channel.ga} matched by "
-                f"{matched[channel.ga].label!r} and {reference.match!r}"
-            )
-            continue
-        matched[channel.ga] = Device(
+    """The declared references married to the scoped channels — never a
+    silently unmeasured device."""
+    return [
+        Device(
             ga=channel.ga,
             name=channel.name,
             label=reference.match,
             healthy=reference.healthy_ma,
         )
-    problems.extend(
-        f"channel {c.ga} ({c.name}) has no declared reference"
-        for c in channels
-        if c.ga not in matched
-    )
-    if problems:
-        raise ValueError("device references do not fit the scope: " + "; ".join(problems))
-    return sorted(matched.values(), key=lambda d: d.ga)
+        for channel, reference in pair_by_match(channels, references, noun="reference")
+    ]
+
+
+def min_window_samples(window: timedelta, fraction: float) -> int:
+    """How many hourly buckets a trailing `window` must carry before its
+    valley counts: the fault declares the fraction, the aggregate's hourly
+    grid turns it into a count.
+    """
+    return ceil(fraction * (window / BUCKET))
 
 
 def standby_floors(
@@ -160,6 +144,22 @@ def standby_floors(
     return floors
 
 
+def reaches_frontier(
+    floors: Sequence[tuple[datetime, float]], *, frontier: datetime, max_gap: timedelta
+) -> bool:
+    """Whether the device's valleys reach the present — the difference
+    between "recovered" and "unmeasured".
+
+    A device that ran through the last day, or sent too thinly to hold a
+    valley, produces no observations for exactly the same reason a repaired
+    one does. Without this test the episode would end on missing data and
+    clear an address whose relay is still stuck, so anything short of the
+    frontier by more than the episode pipeline's own gap counts as
+    unmeasurable rather than well.
+    """
+    return bool(floors) and frontier - floors[-1][0] <= max_gap
+
+
 def accumulate(
     floors: Sequence[tuple[datetime, float]], *, healthy: float, rise: float
 ) -> list[Sample]:
@@ -173,6 +173,13 @@ def accumulate(
     that a fault flickering in and out of the band never fills its budget —
     which is the reading the sentence asks for, since such a device is not
     *persistently* high.
+
+    Because the valley is a trailing minimum, one in-band sample means the
+    device really did return to its healthy level at some point in the last
+    day, and the count is right to start over: the budget only ever runs
+    while the device did not reach healthy once in a whole day. The flip
+    side is that a single low reading shadows the next 24 h, so a stuck
+    relay that briefly drops out is reported a day later, not never.
 
     An hour without a valley contributes nothing: the budget counts hours
     the device was measurably high, never hours nobody looked.
@@ -218,6 +225,10 @@ def drift_observations(
 def classify(device: Device, trace: Sequence[Sample], *, frontier: datetime) -> DeviceState:
     """What the device idles at now — the payload's side of the severity.
     A trace that does not reach the frontier says nothing about now.
+
+    `rising_since` is bounded by the replay window: a drift older than the
+    lookback reports the window's own start, which advances with it. The
+    episode's `started_at` in the database is the stable onset.
     """
     if not trace or trace[-1].time != frontier:
         return DeviceState(device)
@@ -314,13 +325,6 @@ def _publish_for(subject: str, severity: int, state: DeviceState | None) -> Devi
     )
 
 
-def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
-    """The appliance aggregate's newest bucket anywhere — the 'now' every
-    run is measured against."""
-    row = conn.execute("SELECT max(bucket) AS frontier FROM knx_appliance_1h").fetchone()
-    return row["frontier"] if row else None
-
-
 def hourly_floors(
     conn: psycopg.Connection[DictRow], gas: Sequence[str], window_start: datetime
 ) -> dict[str, list[tuple[datetime, float]]]:
@@ -328,8 +332,11 @@ def hourly_floors(
     whole scope — 21 appliances, not 2500 channels."""
     rows = conn.execute(
         """
-        SELECT ga, bucket, idle_floor FROM knx_appliance_1h
+        SELECT ga, bucket, min(idle_floor) AS idle_floor FROM knx_appliance_1h
         WHERE ga = ANY(%(gas)s) AND bucket >= %(start)s AND idle_floor IS NOT NULL
+        -- One row per hour: the aggregate also groups by knx_name, so a
+        -- channel renamed mid-hour would otherwise be counted twice.
+        GROUP BY ga, bucket
         ORDER BY ga, bucket
         """,
         {"gas": list(gas), "start": window_start},

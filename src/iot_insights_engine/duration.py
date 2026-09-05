@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 from .episodes import Episode, Observation
 from .reconcile import reconcile
 from .runs import split_runs
-from .silence import BUCKET
+from .silence import BUCKET, pair_by_match
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -72,40 +72,17 @@ class Activity:
 
 
 def resolve_devices(channels: Sequence[Channel], limits: Sequence[DeviceLimit]) -> list[Device]:
-    """Marry the declared limits to the scoped channels, strictly both ways.
-    Every problem is reported at once — a config error should name the whole
-    repair, not one field per run.
-    """
-    problems: list[str] = []
-    matched: dict[str, Device] = {}
-    for limit in limits:
-        hits = [c for c in channels if limit.match in c.name]
-        if len(hits) != 1:
-            gas = ", ".join(c.ga for c in hits)
-            problems.append(
-                f"device {limit.match!r} matches no channel in scope"
-                if not hits
-                else f"device {limit.match!r} matches {len(hits)} channels: {gas}"
-            )
-            continue
-        channel = hits[0]
-        if channel.ga in matched:
-            problems.append(
-                f"channel {channel.ga} matched by {matched[channel.ga].label!r} and {limit.match!r}"
-            )
-            continue
-        matched[channel.ga] = Device(
+    """The declared limits married to the scoped channels — never a silently
+    unmeasured device."""
+    return [
+        Device(
             ga=channel.ga,
             name=channel.name,
             label=limit.match,
             max_run=timedelta(hours=limit.max_run_hours),
         )
-    problems.extend(
-        f"channel {c.ga} ({c.name}) has no declared limit" for c in channels if c.ga not in matched
-    )
-    if problems:
-        raise ValueError("device limits do not fit the scope: " + "; ".join(problems))
-    return sorted(matched.values(), key=lambda d: d.ga)
+        for channel, limit in pair_by_match(channels, limits, noun="limit")
+    ]
 
 
 def duration_observations(

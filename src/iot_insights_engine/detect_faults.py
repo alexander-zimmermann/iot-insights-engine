@@ -40,7 +40,6 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from math import ceil
 from pathlib import Path
 
 from . import (
@@ -390,7 +389,7 @@ def _publish_devices(
                 "run_hours": publish.run_hours,
                 "limit_hours": publish.limit_hours,
             },
-            entity=publish.ga.replace("/", "-"),
+            entity=nats_publisher.slugify(publish.ga),
             firing=firing,
         )
 
@@ -491,7 +490,7 @@ def _publish_drift(
                 "excess_ma": publish.excess,
                 "rising_since": publish.rising_since,
             },
-            entity=publish.ga.replace("/", "-"),
+            entity=nats_publisher.slugify(publish.ga),
             firing=firing,
         )
 
@@ -505,10 +504,19 @@ def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     rise = float(fault.parameters["rise_ma"])
     budget = float(fault.parameters["budget_ma_h"])
     window = timedelta(hours=float(fault.parameters["window_hours"]))
-    min_samples = ceil(float(fault.parameters["min_window_fraction"]) * (window / BUCKET))
+    if window > LOOKBACK:
+        # A window the lookback cannot cover measures nothing, forever, and
+        # would pin every open episode open. Fail the way a bad reference does.
+        raise ValueError(
+            f"fault {fault.name}: window_hours exceeds the {LOOKBACK.days}-day lookback"
+        )
+    min_samples = drift.min_window_samples(
+        window, float(fault.parameters["min_window_fraction"])
+    )
+    policy = EpisodePolicy()
 
     with read_connection(settings) as conn:
-        frontier = drift.frontier(conn)
+        frontier = duration.frontier(conn)
         if frontier is None:
             log.warning("no_aggregate_data", fault=fault.name)
             return
@@ -528,9 +536,7 @@ def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         floors = drift.standby_floors(
             series.get(device.ga, []), window=window, min_samples=min_samples
         )
-        if not floors:
-            # A device that ran through the whole window, or sent too
-            # thinly to hold a valley, has no standby to judge.
+        if not drift.reaches_frontier(floors, frontier=frontier, max_gap=policy.max_gap):
             dataless.add(device.ga)
         trace = drift.accumulate(floors, healthy=device.healthy, rise=rise)
         states[device.ga] = drift.classify(device, trace, frontier=frontier)
@@ -538,11 +544,14 @@ def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
             drift.drift_observations(device.ga, trace, rise=rise, budget=budget)
         )
 
+    if dataless:
+        # Easier to trip than the other kinds' version — five missing hours
+        # in a day are enough — so it never passes at info level.
+        log.warning("devices_dataless", fault=fault.name, devices=sorted(dataless))
+
     # `now` is the frontier: episode ends are decided by aggregate progress,
     # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, observations, history_scores, EpisodePolicy(), frontier
-    )
+    episodes = fold_observations(fault.name, observations, history_scores, policy, frontier)
     plan = drift.plan_run(
         episodes=episodes,
         open_rows=open_rows,
@@ -556,7 +565,6 @@ def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         fault=fault.name,
         frontier=frontier.isoformat(),
         devices=len(devices),
-        dataless=sorted(dataless),
         high=sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
         episodes=len(episodes),
         open_episodes=sum(1 for e in episodes if e.ended_at is None),
@@ -862,21 +870,37 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     for fault in fault_list:
         if fault.dormant is not None:
             log.info("fault_dormant", fault=fault.name, active_when=fault.dormant.active_when)
+    failed: list[str] = []
     for fault in fault_list.schedulable():
-        if fault.kind is MeasurementKind.SILENCE:
-            _run_silence(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.DURATION:
-            _run_duration(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.DRIFT:
-            _run_drift(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.DEVIATION:
-            _run_deviation(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.VOLUME:
-            _run_volume(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.EXTERNAL:
-            _run_external(settings, fault, dry_run=args.dry_run)
-        else:
-            # Arrives with its own ticket; a declared fault must not fail
-            # the ones already running.
-            log.warning("fault_kind_not_implemented", fault=fault.name, kind=str(fault.kind))
+        # One fault must not take the others down with it: a catalog change
+        # that leaves a device undeclared fails its own fault loudly, while
+        # the rest of the list — the volume watchdog last of all — still
+        # runs. The job still exits non-zero, so the CronJob shows it.
+        try:
+            _run_fault(settings, fault, dry_run=args.dry_run)
+        except Exception:
+            log.exception("fault_run_failed", fault=fault.name, kind=str(fault.kind))
+            failed.append(fault.name)
+    if failed:
+        log.error("detect_faults_incomplete", failed=failed)
+        return 1
     return 0
+
+
+def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    if fault.kind is MeasurementKind.SILENCE:
+        _run_silence(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DURATION:
+        _run_duration(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DRIFT:
+        _run_drift(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DEVIATION:
+        _run_deviation(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.VOLUME:
+        _run_volume(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.EXTERNAL:
+        _run_external(settings, fault, dry_run=dry_run)
+    else:
+        # Arrives with its own ticket; a declared fault must not fail
+        # the ones already running.
+        log.warning("fault_kind_not_implemented", fault=fault.name, kind=str(fault.kind))

@@ -25,7 +25,9 @@ from iot_insights_engine.drift import (
     accumulate,
     classify,
     drift_observations,
+    min_window_samples,
     plan_run,
+    reaches_frontier,
     resolve_devices,
     standby_floors,
 )
@@ -99,6 +101,45 @@ class TestStandbyFloors:
         assert floors[_T0 + 23 * _HOUR] == 48.0
         assert floors[_T0 + 40 * _HOUR] == 48.0
         assert floors[_T0 + 47 * _HOUR] == 100.0
+
+
+class TestMinWindowSamples:
+    def test_the_declared_fraction_becomes_a_bucket_count(self) -> None:
+        # The number that decides measurability at all: 0.8 of a day is
+        # 19.2 hourly buckets, and a fifth of a day may not go missing.
+        assert min_window_samples(_DAY, 0.8) == 20
+
+    def test_a_full_window_demands_every_bucket(self) -> None:
+        assert min_window_samples(_DAY, 1.0) == 24
+
+    def test_it_rounds_up_so_a_thin_window_cannot_pass(self) -> None:
+        assert min_window_samples(timedelta(hours=6), 0.5) == 3
+        assert min_window_samples(timedelta(hours=7), 0.5) == 4
+
+
+class TestReachesFrontier:
+    """The difference between "recovered" and "unmeasured" — without it an
+    episode ends on missing data and clears a still-stuck relay."""
+
+    _MAX_GAP = EpisodePolicy().max_gap
+
+    def test_valleys_up_to_the_frontier_are_measurable(self) -> None:
+        floors = _floors([48] * 6)
+        assert reaches_frontier(floors, frontier=_T0 + 5 * _HOUR, max_gap=self._MAX_GAP)
+
+    def test_a_short_lag_still_counts(self) -> None:
+        # One late bucket is materialization lag, not a blind device.
+        floors = _floors([48] * 6)
+        assert reaches_frontier(floors, frontier=_T0 + 7 * _HOUR, max_gap=self._MAX_GAP)
+
+    def test_a_gap_past_the_episode_gap_is_unmeasurable(self) -> None:
+        # Five missing hours stop the valley for ~29 h; the episode would
+        # otherwise end and publish a clear the device never earned.
+        floors = _floors([48] * 6)
+        assert not reaches_frontier(floors, frontier=_T0 + 30 * _HOUR, max_gap=self._MAX_GAP)
+
+    def test_no_valley_at_all_is_unmeasurable(self) -> None:
+        assert not reaches_frontier([], frontier=_T0, max_gap=self._MAX_GAP)
 
 
 class TestAccumulate:
