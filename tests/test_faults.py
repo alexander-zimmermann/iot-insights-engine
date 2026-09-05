@@ -18,6 +18,7 @@ from iot_insights_engine.faults import (
     DeviceLimit,
     DeviceReference,
     Dormant,
+    DriftSignal,
     FaultList,
     MeasurementKind,
     Roles,
@@ -45,6 +46,7 @@ faults:
     sentence: "Der Ruhestrom eines Geräts steigt dauerhaft um mehr als 40 mA."
     unit: "× der erlaubten Erhöhung"
     kind: drift
+    signal: standby
     parameters:
       rise_ma: 40
       budget_ma_h: 480
@@ -89,8 +91,9 @@ def test_loads_valid_file(tmp_path: Path) -> None:
         "window_hours": 24,
         "min_window_fraction": 0.8,
     }
+    assert standby.signal is DriftSignal.STANDBY
     assert standby.references == (
-        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy_ma=48),
+        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy=48),
     )
     assert standby.target is not None
     assert standby.target.per_device is True
@@ -629,6 +632,7 @@ faults:
       40 mA über ihrem gesunden Wert."
     unit: "× der erlaubten Erhöhung"
     kind: drift
+    signal: standby
     parameters:
       rise_ma: 40
       budget_ma_h: 480
@@ -650,9 +654,10 @@ faults:
 def test_drift_fault_loads_its_references(tmp_path: Path) -> None:
     [fault] = FaultList.load(_write(tmp_path, _DRIFT))
     assert fault.kind is MeasurementKind.DRIFT
+    assert fault.signal is DriftSignal.STANDBY
     assert fault.references == (
-        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy_ma=48),
-        DeviceReference(match="Hauswirtschaftsraum.K4-L1.Waschmaschine", healthy_ma=0),
+        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy=48),
+        DeviceReference(match="Hauswirtschaftsraum.K4-L1.Waschmaschine", healthy=0),
     )
 
 
@@ -705,6 +710,94 @@ def test_references_on_other_kind_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match=r"'x'.*references"):
         FaultList.load(path)
+
+
+def test_drift_without_a_signal_rejected(tmp_path: Path) -> None:
+    # Which series the CUSUM walks decides what the pinned reference means;
+    # a drift fault that does not say it is not loadable.
+    body = _DRIFT.replace("    signal: standby\n", "")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*signal"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_signal_on_another_kind_rejected(tmp_path: Path) -> None:
+    body = _DURATION.replace("    kind: duration\n", "    kind: duration\n    signal: standby\n")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*signal"):
+        FaultList.load(_write(tmp_path, body))
+
+
+_ICING = """
+faults:
+  - name: freezer_icing
+    sentence: "Der Gefrierschrank verdichtet über den Tag anhaltend mehr als
+      15 Prozentpunkte länger als im gesunden Zustand."
+    unit: "× der erlaubten Erhöhung"
+    kind: drift
+    signal: duty_cycle
+    parameters:
+      rise_pct: 15
+      budget_pct_h: 600
+      window_hours: 24
+      min_window_fraction: 0.6
+      door_run_hours: 3
+      on_ma: 120
+    scope:
+      dpt: "7.012"
+      name_like: "%.Gefrierschrank.Stromwert"
+    references:
+      Küche.K15-L1.Gefrierschrank:
+        healthy_duty_pct: 50
+    target:
+      per_device: true
+"""
+
+
+def test_duty_cycle_drift_loads_its_reference_in_percent(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _ICING))
+    assert fault.kind is MeasurementKind.DRIFT
+    assert fault.signal is DriftSignal.DUTY_CYCLE
+    assert fault.references == (
+        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy=50),
+    )
+    assert fault.parameters["door_run_hours"] == 3
+
+
+def test_duty_cycle_drift_requires_its_parameters(tmp_path: Path) -> None:
+    body = _ICING.replace("rise_pct: 15", "rise_ma: 15")
+    with pytest.raises(ValueError, match=r"'freezer_icing'.*rise_pct"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_duty_cycle_drift_needs_its_door_run(tmp_path: Path) -> None:
+    # Without the door threshold the fault would count a door left open as
+    # icing — the one confusion this fault is built to avoid.
+    body = _ICING.replace("      door_run_hours: 3\n", "")
+    with pytest.raises(ValueError, match=r"'freezer_icing'.*door_run_hours"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_a_parameter_in_the_other_signal_unit_rejected(tmp_path: Path) -> None:
+    # A fault switched to the other signal leaves its old numbers behind:
+    # they would sit there looking authoritative while nothing reads them.
+    body = _ICING.replace("      rise_pct: 15\n", "      rise_pct: 15\n      rise_ma: 40\n")
+    with pytest.raises(ValueError, match=r"'freezer_icing'.*rise_ma"):
+        FaultList.load(_write(tmp_path, body))
+
+    standby = _DRIFT.replace("      rise_ma: 40\n", "      rise_ma: 40\n      rise_pct: 15\n")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*rise_pct"):
+        FaultList.load(_write(tmp_path, standby))
+
+
+def test_a_reference_in_the_other_signal_unit_rejected(tmp_path: Path) -> None:
+    # mA on a duty-cycle fault reads as 50 % where 50 mA was meant: the
+    # signal decides the unit, and the file has to say the same thing.
+    body = _ICING.replace("healthy_duty_pct: 50", "healthy_ma: 50")
+    with pytest.raises(ValueError, match=r"'freezer_icing'.*Gefrierschrank"):
+        FaultList.load(_write(tmp_path, body))
+
+    standby = _DRIFT.replace("healthy_ma: 48", "healthy_duty_pct: 48")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*Gefrierschrank"):
+        FaultList.load(_write(tmp_path, standby))
 
 
 _DEVIATION = """

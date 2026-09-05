@@ -41,6 +41,37 @@ class MeasurementKind(StrEnum):
     VOLUME = "volume"
 
 
+class DriftSignal(StrEnum):
+    """Which series a drift fault walks its CUSUM over. The method is the
+    same either way — accumulate what sits above a pinned healthy level —
+    but the series decides what the reference and the rise mean, which is
+    why the file declares it instead of the code guessing from the scope.
+    """
+
+    # The device's idle draw, in mA: a relay that no longer opens.
+    STANDBY = "standby"
+    # The share of the day a compressor runs, in percent: an evaporator
+    # icing up makes the same cold cost more running.
+    DUTY_CYCLE = "duty_cycle"
+
+
+# What each signal calls its declared healthy level. The unit is in the
+# name because that is the whole point of the reference; the loader keeps
+# it out of the dataclass, where the signal already says what it is.
+_HEALTHY_FIELD = {
+    DriftSignal.STANDBY: "healthy_ma",
+    DriftSignal.DUTY_CYCLE: "healthy_duty_pct",
+}
+
+# And what each signal calls the numbers it walks by. The schema requires
+# its own; this is what makes the other signal's an error rather than a
+# line that sits there looking authoritative while nothing reads it.
+_SIGNAL_PARAMETERS = {
+    DriftSignal.STANDBY: ("rise_ma", "budget_ma_h"),
+    DriftSignal.DUTY_CYCLE: ("rise_pct", "budget_pct_h", "door_run_hours", "on_ma"),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Scope:
     """Catalog query text. Each field is a conjunctive criterion; list-valued
@@ -104,14 +135,18 @@ class DeviceLimit:
 @dataclass(frozen=True, slots=True)
 class DeviceReference:
     """One device's declared healthy level: a unique fragment of its catalog
-    name, and the standby draw it sits at when nothing is wrong — written
-    here after someone read it off the data once, never derived from
-    history. A reference the detector computed for itself would adopt a
-    months-old fault as healthy, which is the whole reason it is declared.
+    name, and the level it sits at when nothing is wrong — written here
+    after someone read it off the data once, never derived from history. A
+    reference the detector computed for itself would adopt a months-old
+    fault as healthy, which is the whole reason it is declared.
+
+    The unit is the signal's: milliamps of idle draw for `standby`, percent
+    of the day for `duty_cycle`. The file names it either way; here the
+    fault's signal already says which one this is.
     """
 
     match: str
-    healthy_ma: float
+    healthy: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +203,7 @@ class Fault:
     unit: str
     kind: MeasurementKind
     parameters: Mapping[str, float]
+    signal: DriftSignal | None = None
     scope: Scope | None = None
     target: Target | None = None
     dormant: Dormant | None = None
@@ -232,6 +268,7 @@ class FaultList:
                 or _check_volume(raw)
                 or _check_devices(raw)
                 or _check_references(raw)
+                or _check_signal(raw)
                 or _check_rooms(raw)
             )
             if problem is not None:
@@ -317,6 +354,33 @@ def _check_references(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_signal(raw: dict[str, Any]) -> str | None:
+    """The signal belongs to the drift kind alone, and it owns the unit of
+    every number the fault walks by: a fault switched from one signal to the
+    other must lose the parameters of the one it left. Checked in the loader
+    because the schema's false-subschema error loses the field name.
+    """
+    if raw["kind"] != MeasurementKind.DRIFT:
+        if "signal" in raw:
+            return (
+                f"fault {raw['name']!r}: signal: "
+                f"only a drift fault declares which series it walks"
+            )
+        return None
+    signal = DriftSignal(raw["signal"])
+    foreign = {
+        name: other
+        for other, names in _SIGNAL_PARAMETERS.items()
+        if other is not signal
+        for name in names
+        if name in raw["parameters"]
+    }
+    if foreign:
+        named = ", ".join(f"{name} belongs to {other}" for name, other in sorted(foreign.items()))
+        return f"fault {raw['name']!r}: parameters: {named}, not to {signal}"
+    return None
+
+
 def _check_rooms(raw: dict[str, Any]) -> str | None:
     """Roles and per-room rules belong to the deviation kind alone, and a
     gate role needs its threshold (and the other way round) — half a gate
@@ -341,17 +405,36 @@ def _check_rooms(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _parse_references(
+    raw: dict[str, Any], signal: DriftSignal | None
+) -> tuple[DeviceReference, ...]:
+    """The declared healthy levels, read under the field name the signal
+    gives them. Only a drift fault carries references and a drift fault
+    always declares its signal — both enforced above — so a reference
+    without a signal cannot reach here.
+    """
+    if signal is None:
+        return ()
+    field = _HEALTHY_FIELD[signal]
+    return tuple(
+        DeviceReference(match=match, healthy=reference[field])
+        for match, reference in raw.get("references", {}).items()
+    )
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
     scope = raw.get("scope")
     target = raw.get("target")
     dormant = raw.get("dormant")
     roles = raw.get("roles")
+    signal = DriftSignal(raw["signal"]) if "signal" in raw else None
     return Fault(
         name=raw["name"],
         sentence=raw["sentence"],
         unit=raw["unit"],
         kind=MeasurementKind(raw["kind"]),
         parameters=MappingProxyType(dict(raw.get("parameters", {}))),
+        signal=signal,
         scope=(
             Scope(
                 dpt=_as_tuple(scope.get("dpt")),
@@ -375,10 +458,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
             DeviceLimit(match=match, max_run_hours=limit["max_run_hours"])
             for match, limit in raw.get("devices", {}).items()
         ),
-        references=tuple(
-            DeviceReference(match=match, healthy_ma=reference["healthy_ma"])
-            for match, reference in raw.get("references", {}).items()
-        ),
+        references=_parse_references(raw, signal),
         roles=(
             Roles(reference=roles["reference"], gate=roles.get("gate"))
             if roles is not None

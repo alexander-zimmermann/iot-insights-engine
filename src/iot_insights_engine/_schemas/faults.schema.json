@@ -21,6 +21,7 @@
         "sentence":   { "type": "string", "minLength": 1 },
         "unit":       { "type": "string", "minLength": 1 },
         "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy", "external", "volume"] },
+        "signal":     { "enum": ["standby", "duty_cycle"] },
         "parameters": {
           "type": "object",
           "minProperties": 1,
@@ -69,17 +70,53 @@
         {
           "if":   { "properties": { "kind": { "const": "drift" } }, "required": ["kind"] },
           "then": {
-            "required": ["references"],
+            "required": ["signal", "references"],
             "properties": {
               "parameters": {
-                "required": ["rise_ma", "budget_ma_h", "window_hours", "min_window_fraction"],
+                "required": ["window_hours", "min_window_fraction"],
                 "properties": {
-                  "rise_ma":             { "type": "number", "exclusiveMinimum": 0 },
-                  "budget_ma_h":         { "type": "number", "exclusiveMinimum": 0 },
                   "window_hours":        { "type": "number", "exclusiveMinimum": 0 },
                   "min_window_fraction": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
                 }
               }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "drift" }, "signal": { "const": "standby" } },
+            "required": ["kind", "signal"]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["rise_ma", "budget_ma_h"],
+                "properties": {
+                  "rise_ma":     { "type": "number", "exclusiveMinimum": 0 },
+                  "budget_ma_h": { "type": "number", "exclusiveMinimum": 0 }
+                }
+              },
+              "references": { "$ref": "#/$defs/standbyReferences" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "drift" }, "signal": { "const": "duty_cycle" } },
+            "required": ["kind", "signal"]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["rise_pct", "budget_pct_h", "door_run_hours", "on_ma"],
+                "properties": {
+                  "rise_pct":       { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+                  "budget_pct_h":   { "type": "number", "exclusiveMinimum": 0 },
+                  "door_run_hours": { "type": "number", "exclusiveMinimum": 0 },
+                  "on_ma":          { "type": "number", "exclusiveMinimum": 0 }
+                }
+              },
+              "references": { "$ref": "#/$defs/dutyCycleReferences" }
             }
           }
         },
@@ -107,12 +144,23 @@
     "references": {
       "type": "object",
       "minProperties": 1,
+      "additionalProperties": { "type": "object" }
+    },
+    "standbyReferences": {
       "additionalProperties": {
-        "type": "object",
         "properties": {
           "healthy_ma": { "type": "number", "minimum": 0 }
         },
         "required": ["healthy_ma"],
+        "additionalProperties": false
+      }
+    },
+    "dutyCycleReferences": {
+      "additionalProperties": {
+        "properties": {
+          "healthy_duty_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+        },
+        "required": ["healthy_duty_pct"],
         "additionalProperties": false
       }
     },
