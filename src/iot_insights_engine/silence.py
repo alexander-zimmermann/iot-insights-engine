@@ -60,6 +60,10 @@ class DeviceRule(Protocol):
 # channel, not a dead register.
 DEAD_MIN_BUCKETS = 24
 
+# Two buckets is the least a gap can be read off — a channel that sent
+# fewer has no pause, and nothing measured it.
+MIN_PAUSE_BUCKETS = 2
+
 
 def main_group(ga: str) -> int:
     """The KNX main group of a group address — the granularity silence
@@ -129,7 +133,7 @@ def normal_pause(buckets: list[datetime], quantile: float) -> timedelta | None:
     Read by nearest rank: the pause is a gap the channel really showed, not
     an interpolation between two unlike ones.
     """
-    if len(buckets) < 2:
+    if len(buckets) < MIN_PAUSE_BUCKETS:
         return None
     gaps = sorted(b - a for a, b in zip(buckets, buckets[1:], strict=False))
     rank = max(1, ceil(quantile * len(gaps)))

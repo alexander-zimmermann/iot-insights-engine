@@ -8,6 +8,16 @@ leaves the engine is a severity 0–3 per main group on
 `anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
+Every kind that reports per subject runs in one shape: a `SubjectKind`
+declares how its series is measured and how its payload is shaped, and
+`_run_subjects` owns the rest — the window, the fold, the reconciliation,
+the log record, the dry run and the publish-then-write tail. A new
+per-subject kind declares those two things and inherits all of it.
+
+Channel silence measures per channel but reports per main group, so it
+keeps its own delivery; it reconciles through the same `reconcile` as
+everything else.
+
 The volume watchdog runs the loop over the engine's own output: it counts
 the incidents of the last seven days out of the episode stream and puts a
 severity on one house-wide address, so drift back into noise arrives on the
@@ -16,7 +26,7 @@ same bus as everything else.
 External faults run the same loop the other way round: Basalte detects,
 writes the severity to the fault address and delivers itself; the engine
 reads those writes back from the bus archive, records episodes marked
-externally delivered, and publishes nothing. The frontier rule above is
+externally delivered, and publishes nothing. The frontier rule below is
 the measured faults': the bus archive has no materialization lag, so
 external runs take wall-clock time where an orphaned row needs closing.
 
@@ -37,10 +47,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from . import (
     deviation,
@@ -58,8 +69,28 @@ from .episode_store import OpenEpisodeRow
 from .episodes import Episode, EpisodePolicy, Observation, fold_observations
 from .faults import Fault, FaultList, MeasurementKind
 from .logging_setup import get_logger
+from .reconcile import (
+    Measured,
+    Plan,
+    SubjectPublish,
+    Window,
+    plan_from,
+    reconcile,
+    subject_plan,
+)
 from .severity import severity_name
-from .silence import BUCKET, Channel, ChannelState, SilenceState, main_group
+from .silence import (
+    BUCKET,
+    MIN_PAUSE_BUCKETS,
+    Channel,
+    ChannelState,
+    SilenceState,
+    main_group,
+)
+
+if TYPE_CHECKING:
+    import psycopg
+    from psycopg.rows import DictRow
 
 log = get_logger(__name__)
 
@@ -67,6 +98,225 @@ log = get_logger(__name__)
 # score history all live inside it. Matches the 30 days the episode fold-in
 # started the comparison basis with.
 LOOKBACK = timedelta(days=30)
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectKind[S, P: SubjectPublish]:
+    """One per-subject fault kind, reduced to what actually differs between
+    them: how its series is measured (`frontier`, `measure`) and how its
+    payload is shaped (`publish_for`, `publish`). `event` names its log
+    record, `delivery` the target form the fault must declare for it.
+    """
+
+    event: str
+    delivery: str
+    frontier: Callable[[psycopg.Connection[DictRow]], datetime | None]
+    measure: Callable[[psycopg.Connection[DictRow], Fault, Window], Measured[S]]
+    publish_for: Callable[[str, int, S | None], P]
+    publish: Callable[[Settings, str, Iterable[P]], None]
+
+
+def _publish_subjects[P: SubjectPublish](
+    settings: Settings,
+    fault_name: str,
+    publishes: Iterable[P],
+    payload: Callable[[P], dict[str, Any]],
+) -> None:
+    """One publish per moved subject, on the subject's own address: the
+    severity decides firing, the kind decides the rest of the payload.
+    """
+    for publish in publishes:
+        firing = publish.severity > 0
+        nats_publisher.publish_anomaly(
+            settings,
+            fault_name,
+            severity_name(publish.severity) if firing else None,
+            payload(publish),
+            entity=publish.entity,
+            firing=firing,
+        )
+
+
+def _publish_devices(
+    settings: Settings, fault_name: str, publishes: Iterable[duration.DevicePublish]
+) -> None:
+    """Appliance runtime: the run so far against the device's own limit."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "device": p.device,
+            "ga": p.ga,
+            "name": p.name,
+            "running_since": p.running_since,
+            "run_hours": p.run_hours,
+            "limit_hours": p.limit_hours,
+        },
+    )
+
+
+def _publish_drift(
+    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
+) -> None:
+    """Standby drift: what the device idles at against what it should."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "device": p.device,
+            "ga": p.ga,
+            "name": p.name,
+            "standby_ma": p.standby,
+            "healthy_ma": p.healthy,
+            "excess_ma": p.excess,
+            "rising_since": p.rising_since,
+        },
+    )
+
+
+def _publish_rooms(
+    settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
+) -> None:
+    """Room deviation: the gap, and the reference and gate behind it."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "room": p.room,
+            "cold_since": p.cold_since,
+            "gap": p.gap,
+            "value": p.value,
+            "reference": p.reference,
+            "gate": p.gate,
+            "min_gap": p.min_gap,
+        },
+    )
+
+
+def _run_subjects[S, P: SubjectPublish](
+    settings: Settings, fault: Fault, kind: SubjectKind[S, P], *, dry_run: bool
+) -> None:
+    """The one shape a per-subject kind runs in: guard the declaration, take
+    the window off the aggregate, measure, fold, reconcile, log — then
+    publish before writing.
+    """
+    if fault.target is None or fault.target.form != kind.delivery:
+        raise ValueError(
+            f"fault {fault.name}: {fault.kind} delivery needs a {kind.delivery} target"
+        )
+    policy = EpisodePolicy()
+
+    with read_connection(settings) as conn:
+        frontier = kind.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window = Window(start=frontier - LOOKBACK, frontier=frontier, policy=policy)
+        measured = kind.measure(conn, fault, window)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    if measured.dataless:
+        # Never at info level: a subject nobody could measure is the one
+        # thing that keeps an open episode from ever clearing itself.
+        log.warning(
+            "subjects_dataless", fault=fault.name, subjects=sorted(measured.dataless)
+        )
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(
+        fault.name, measured.observations, history_scores, policy, frontier
+    )
+
+    def payload(subject: str, severity: int) -> P:
+        return kind.publish_for(subject, severity, measured.states.get(subject))
+
+    plan = subject_plan(
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=measured.dataless,
+        frontier=frontier,
+        publish_for=payload,
+    )
+
+    log.info(
+        kind.event,
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        **measured.counts,
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        stale_opens=list(plan.stale_opens),
+        publishes=len(plan.publishes),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        _log_dry_run(fault, episodes, plan, measured.labels)
+        return
+
+    kind.publish(settings, fault.name, plan.publishes)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
+def _log_dry_run[P: SubjectPublish](
+    fault: Fault,
+    episodes: Sequence[Episode],
+    plan: Plan[P],
+    labels: Mapping[str, str],
+) -> None:
+    """What the run would have done, by subject — the dry run's whole point,
+    so it names each subject the way a human does where the kind knows it.
+    """
+    per_subject = Counter(e.subject for e in episodes)
+    log.info(
+        "dry_run_episodes",
+        fault=fault.name,
+        per_subject={
+            labels.get(subject, subject): count
+            for subject, count in sorted(per_subject.items())
+        },
+        open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+        would_publish=[
+            {"subject": p.subject, "severity": p.severity} for p in plan.publishes
+        ],
+    )
+
+
+_SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
+    MeasurementKind.DURATION: SubjectKind(
+        event="appliance_runtime_run",
+        delivery="per_device",
+        frontier=duration.frontier,
+        measure=duration.measure,
+        publish_for=duration.publish_for,
+        publish=_publish_devices,
+    ),
+    MeasurementKind.DRIFT: SubjectKind(
+        event="appliance_standby_run",
+        delivery="per_device",
+        frontier=duration.frontier,
+        measure=drift.measure,
+        publish_for=drift.publish_for,
+        publish=_publish_drift,
+    ),
+    MeasurementKind.DEVIATION: SubjectKind(
+        event="room_deviation_run",
+        delivery="per_room",
+        frontier=silence.frontier,
+        measure=deviation.measure,
+        publish_for=deviation.publish_for,
+        publish=_publish_rooms,
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,19 +338,16 @@ class GroupPublish:
     severity: int
     channels: tuple[ChannelReport, ...]
 
+    @property
+    def subject(self) -> str:
+        return str(self.main_group)
 
-@dataclass(frozen=True, slots=True)
-class RunPlan:
-    """What one run changes: new episodes, reconciled open rows, orphaned
-    rows to close, rows kept open for want of data, and the main groups
-    whose severity or channel set moved.
-    """
+    @property
+    def entity(self) -> str:
+        return str(self.main_group)
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    stale_opens: tuple[str, ...]
-    publishes: tuple[GroupPublish, ...]
+
+RunPlan = Plan[GroupPublish]
 
 
 def plan_run(
@@ -111,70 +358,38 @@ def plan_run(
     dataless: frozenset[str],
     frontier: datetime,
 ) -> RunPlan:
-    """Pure reconciliation: computed episodes against the stored open rows.
-
-    Only open computed episodes materialize as new rows; a computed episode
-    that already ended matters only to close the open row it reconciles. A
-    stored severity is never lowered — the recompute window may have slid
-    past the peak. An open row whose subject produced no episode closes at
-    the frontier — unless the subject is `dataless` (still in scope, but
-    silent for longer than the whole window): with no data to decide a
-    recovery, the episode stays open instead of self-clearing.
+    """The shared reconciliation, delivered per main group — the one thing
+    channel silence does not share with the other kinds.
 
     A group publishes when its severity moved or its set of open channels
-    changed — a second channel going silent at the same tier still gets
-    named on the bus.
+    changed: a second channel going silent at the same tier still gets named
+    on the bus.
     """
-    open_by_subject = {row.subject: row for row in open_rows}
-
-    # Several episodes per subject can fall in the window (flicker beyond
-    # max_gap); the stored open row can only correspond to the latest one.
-    latest_by_subject: dict[str, Episode] = {}
-    for episode in episodes:
-        current = latest_by_subject.get(episode.subject)
-        if current is None or episode.started_at > current.started_at:
-            latest_by_subject[episode.subject] = episode
-
-    inserts: list[Episode] = []
-    updates: list[tuple[int, Episode]] = []
+    result = reconcile(
+        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
+    )
+    # The fold leaves at most one open episode per subject, and it is the
+    # one the reconciliation carried into `after`.
+    open_episodes = {e.subject: e for e in episodes if e.ended_at is None}
     reports: dict[str, ChannelReport] = {}
-
-    for subject, episode in sorted(latest_by_subject.items()):
-        row = open_by_subject.get(subject)
-        if episode.ended_at is None:
-            effective = max(episode.severity, row.severity if row else 0)
-            state = states_by_ga[subject]
+    for subject, severity in result.after.items():
+        episode = open_episodes.get(subject)
+        if episode is None:
+            # Kept open for want of data: nothing measured it this run, so
+            # there is no gap to report — only the address and the tier it
+            # still carries.
             reports[subject] = ChannelReport(
-                ga=subject,
-                name=state.channel.name,
-                silent_since=state.silent_since,
-                severity=effective,
-                gap_hours=episode.evidence[-1].value if episode.evidence else None,
+                ga=subject, name=subject, silent_since=None, severity=severity, gap_hours=None
             )
-            if row is not None:
-                updates.append((row.id, episode))
-            else:
-                inserts.append(episode)
-        elif row is not None:
-            updates.append((row.id, episode))
-
-    orphan_closes: list[tuple[int, datetime]] = []
-    stale_opens: list[str] = []
-    for row in open_rows:
-        if row.subject in latest_by_subject:
             continue
-        if row.subject in dataless:
-            stale_opens.append(row.subject)
-            # Still silent as far as anyone can tell — it keeps counting.
-            reports[row.subject] = ChannelReport(
-                ga=row.subject,
-                name=row.subject,
-                silent_since=None,
-                severity=row.severity,
-                gap_hours=None,
-            )
-        else:
-            orphan_closes.append((row.id, frontier))
+        state = states_by_ga[subject]
+        reports[subject] = ChannelReport(
+            ga=subject,
+            name=state.channel.name,
+            silent_since=state.silent_since,
+            severity=severity,
+            gap_hours=episode.evidence[-1].value if episode.evidence else None,
+        )
 
     before = _group_state((row.subject, row.severity) for row in open_rows)
     after = _group_state((subject, report.severity) for subject, report in reports.items())
@@ -190,13 +405,7 @@ def plan_run(
         )
         publishes.append(GroupPublish(group, severity, tuple(channels)))
 
-    return RunPlan(
-        tuple(inserts),
-        tuple(updates),
-        tuple(orphan_closes),
-        tuple(stale_opens),
-        tuple(publishes),
-    )
+    return plan_from(result, publishes)
 
 
 def _group_state(
@@ -216,28 +425,25 @@ def _group_state(
 def _publish_groups(
     settings: Settings, fault_name: str, publishes: Iterable[GroupPublish]
 ) -> None:
-    for publish in publishes:
-        firing = publish.severity > 0
-        nats_publisher.publish_anomaly(
-            settings,
-            fault_name,
-            severity_name(publish.severity) if firing else None,
-            {
-                "open_channels": len(publish.channels),
-                "channels": [
-                    {
-                        "ga": report.ga,
-                        "name": report.name,
-                        "silent_since": report.silent_since,
-                        "severity": report.severity,
-                        "gap_hours": report.gap_hours,
-                    }
-                    for report in publish.channels
-                ],
-            },
-            entity=str(publish.main_group),
-            firing=firing,
-        )
+    """Channel silence: how many channels in the group are open, and which."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "open_channels": len(p.channels),
+            "channels": [
+                {
+                    "ga": report.ga,
+                    "name": report.name,
+                    "silent_since": report.silent_since,
+                    "severity": report.severity,
+                    "gap_hours": report.gap_hours,
+                }
+                for report in p.channels
+            ],
+        },
+    )
 
 
 def _candidates(
@@ -282,26 +488,30 @@ def _log_drops(drops: Mapping[ChannelState, list[Channel]]) -> None:
 
 
 def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    if fault.target is None or not fault.target.per_main_group:
+    """Channel silence: measured per channel like the other kinds, delivered
+    per main group, which is why it runs its own loop.
+    """
+    if fault.target is None or fault.target.form != "per_main_group":
         raise ValueError(f"fault {fault.name}: silence delivery needs a per_main_group target")
     gap_factor = float(fault.parameters["gap_factor"])
     gap_quantile = float(fault.parameters["gap_quantile"])
+    policy = EpisodePolicy()
 
     with read_connection(settings) as conn:
         frontier = silence.frontier(conn)
         if frontier is None:
             log.warning("no_aggregate_data", fault=fault.name)
             return
-        window_start = frontier - LOOKBACK
+        window = Window(start=frontier - LOOKBACK, frontier=frontier, policy=policy)
         channels = silence.resolve_scope(conn, fault.channel_scope())
-        stats_by_ga = silence.channel_stats(conn, window_start)
+        stats_by_ga = silence.channel_stats(conn, window.start)
         kept, drops = silence.drop_unmeasurable(channels, stats_by_ga)
         _log_drops(drops)
         open_rows = episode_store.open_rows(conn, fault.name)
         candidates = _candidates(
             kept, stats_by_ga, open_rows, gap_factor, frontier, everything=dry_run
         )
-        series = silence.bucket_series(conn, [c.ga for c in candidates], window_start)
+        series = silence.bucket_series(conn, [c.ga for c in candidates], window.start)
         history_scores = episode_store.history_scores(conn, fault.name)
 
     states: dict[str, SilenceState] = {}
@@ -323,12 +533,28 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
                 )
             )
 
+    # A silence measurement ends at the frontier by construction: the gap
+    # walk runs right up to it for every channel whose own pause could be
+    # estimated. A channel that sent too little to show one was not measured
+    # at all, which is not the same as recovered.
+    measured_through = {
+        ga: frontier
+        for ga, stats in stats_by_ga.items()
+        if stats.buckets >= MIN_PAUSE_BUCKETS
+    }
+    dataless = frozenset(
+        channel.ga
+        for channel in channels
+        if not window.reaches(measured_through.get(channel.ga))
+    )
+    if dataless:
+        log.warning("subjects_dataless", fault=fault.name, subjects=sorted(dataless))
+
     # `now` is the frontier: episode ends are decided by aggregate progress,
     # never by wall time racing ahead of a stalled materialization.
     episodes = fold_observations(
-        fault.name, observations, history_scores, EpisodePolicy(), frontier
+        fault.name, observations, history_scores, policy, frontier
     )
-    dataless = frozenset(c.ga for c in channels) - frozenset(stats_by_ga)
     plan = plan_run(
         episodes=episodes,
         open_rows=open_rows,
@@ -355,354 +581,10 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     )
 
     if dry_run:
-        per_group = Counter(main_group(e.subject) for e in episodes)
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            per_main_group={str(g): per_group[g] for g in sorted(per_group)},
-            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-            would_publish=[
-                {"main_group": p.main_group, "severity": p.severity} for p in plan.publishes
-            ],
-        )
+        _log_dry_run(fault, episodes, plan, {c.ga: c.name for c in channels})
         return
 
     _publish_groups(settings, fault.name, plan.publishes)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
-
-
-def _publish_devices(
-    settings: Settings, fault_name: str, publishes: Iterable[duration.DevicePublish]
-) -> None:
-    for publish in publishes:
-        firing = publish.severity > 0
-        nats_publisher.publish_anomaly(
-            settings,
-            fault_name,
-            severity_name(publish.severity) if firing else None,
-            {
-                "device": publish.device,
-                "ga": publish.ga,
-                "name": publish.name,
-                "running_since": publish.running_since,
-                "run_hours": publish.run_hours,
-                "limit_hours": publish.limit_hours,
-            },
-            entity=nats_publisher.slugify(publish.ga),
-            firing=firing,
-        )
-
-
-def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    if fault.target is None or not fault.target.per_device:
-        raise ValueError(f"fault {fault.name}: duration delivery needs a per_device target")
-    active_fraction = float(fault.parameters["active_hour_fraction"])
-
-    with read_connection(settings) as conn:
-        frontier = duration.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.channel_scope())
-        # A limit without a channel or a channel without a limit fails the
-        # run loudly — never a silently unmeasured device.
-        devices = duration.resolve_devices(channels, fault.devices)
-        activity = duration.activity(conn, [d.ga for d in devices], window_start, active_fraction)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    states: dict[str, duration.DeviceState] = {}
-    observations: list[Observation] = []
-    for device in devices:
-        active = activity.active.get(device.ga, [])
-        states[device.ga] = duration.classify(device, active, frontier)
-        observations.extend(duration.duration_observations(device.ga, active, device.max_run))
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, observations, history_scores, EpisodePolicy(), frontier
-    )
-    dataless = frozenset(d.ga for d in devices) - activity.present
-    plan = duration.plan_run(
-        episodes=episodes,
-        open_rows=open_rows,
-        states_by_ga=states,
-        dataless=dataless,
-        frontier=frontier,
-    )
-
-    log.info(
-        "appliance_runtime_run",
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        devices=len(devices),
-        running=sum(1 for s in states.values() if s.running_since is not None),
-        over_limit=sum(
-            1
-            for s in states.values()
-            if s.run_hours is not None and s.run_hours * BUCKET > s.device.max_run
-        ),
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        stale_opens=list(plan.stale_opens),
-        publishes=len(plan.publishes),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        label_by_ga = {d.ga: d.label for d in devices}
-        per_device = Counter(e.subject for e in episodes)
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            per_device={label_by_ga.get(ga, ga): count for ga, count in sorted(per_device.items())},
-            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-            would_publish=[{"ga": p.ga, "severity": p.severity} for p in plan.publishes],
-        )
-        return
-
-    _publish_devices(settings, fault.name, plan.publishes)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
-
-
-def _publish_drift(
-    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
-) -> None:
-    for publish in publishes:
-        firing = publish.severity > 0
-        nats_publisher.publish_anomaly(
-            settings,
-            fault_name,
-            severity_name(publish.severity) if firing else None,
-            {
-                "device": publish.device,
-                "ga": publish.ga,
-                "name": publish.name,
-                "standby_ma": publish.standby,
-                "healthy_ma": publish.healthy,
-                "excess_ma": publish.excess,
-                "rising_since": publish.rising_since,
-            },
-            entity=nats_publisher.slugify(publish.ga),
-            firing=firing,
-        )
-
-
-def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    """Standby drift: the CUSUM walks each device's own history from the
-    healthy value declared for it, so nothing here is carried between runs.
-    """
-    if fault.target is None or not fault.target.per_device:
-        raise ValueError(f"fault {fault.name}: drift delivery needs a per_device target")
-    rise = float(fault.parameters["rise_ma"])
-    budget = float(fault.parameters["budget_ma_h"])
-    window = timedelta(hours=float(fault.parameters["window_hours"]))
-    if window > LOOKBACK:
-        # A window the lookback cannot cover measures nothing, forever, and
-        # would pin every open episode open. Fail the way a bad reference does.
-        raise ValueError(
-            f"fault {fault.name}: window_hours exceeds the {LOOKBACK.days}-day lookback"
-        )
-    min_samples = drift.min_window_samples(
-        window, float(fault.parameters["min_window_fraction"])
-    )
-    policy = EpisodePolicy()
-
-    with read_connection(settings) as conn:
-        frontier = duration.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.channel_scope())
-        # A reference without a channel or a channel without a reference
-        # fails the run loudly — never a silently unmeasured device.
-        devices = drift.resolve_devices(channels, fault.references)
-        series = drift.hourly_floors(conn, [d.ga for d in devices], window_start)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    states: dict[str, drift.DeviceState] = {}
-    observations: list[Observation] = []
-    dataless: set[str] = set()
-    for device in devices:
-        floors = drift.standby_floors(
-            series.get(device.ga, []), window=window, min_samples=min_samples
-        )
-        if not drift.reaches_frontier(floors, frontier=frontier, max_gap=policy.max_gap):
-            dataless.add(device.ga)
-        trace = drift.accumulate(floors, healthy=device.healthy, rise=rise)
-        states[device.ga] = drift.classify(device, trace, frontier=frontier)
-        observations.extend(
-            drift.drift_observations(device.ga, trace, rise=rise, budget=budget)
-        )
-
-    if dataless:
-        # Easier to trip than the other kinds' version — five missing hours
-        # in a day are enough — so it never passes at info level.
-        log.warning("devices_dataless", fault=fault.name, devices=sorted(dataless))
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(fault.name, observations, history_scores, policy, frontier)
-    plan = drift.plan_run(
-        episodes=episodes,
-        open_rows=open_rows,
-        states_by_ga=states,
-        dataless=frozenset(dataless),
-        frontier=frontier,
-    )
-
-    log.info(
-        "appliance_standby_run",
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        devices=len(devices),
-        high=sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        stale_opens=list(plan.stale_opens),
-        publishes=len(plan.publishes),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        label_by_ga = {d.ga: d.label for d in devices}
-        per_device = Counter(e.subject for e in episodes)
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            per_device={label_by_ga.get(ga, ga): count for ga, count in sorted(per_device.items())},
-            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-            would_publish=[{"ga": p.ga, "severity": p.severity} for p in plan.publishes],
-        )
-        return
-
-    _publish_drift(settings, fault.name, plan.publishes)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
-
-
-def _publish_rooms(
-    settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
-) -> None:
-    for publish in publishes:
-        firing = publish.severity > 0
-        nats_publisher.publish_anomaly(
-            settings,
-            fault_name,
-            severity_name(publish.severity) if firing else None,
-            {
-                "room": publish.room,
-                "cold_since": publish.cold_since,
-                "gap": publish.gap,
-                "value": publish.value,
-                "reference": publish.reference,
-                "gate": publish.gate,
-                "min_gap": publish.min_gap,
-            },
-            entity=publish.slug,
-            firing=firing,
-        )
-
-
-def _run_deviation(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    if fault.target is None or not fault.target.per_room:
-        raise ValueError(f"fault {fault.name}: deviation delivery needs a per_room target")
-    if fault.roles is None:
-        raise ValueError(f"fault {fault.name}: the deviation kind needs declared roles")
-    min_hours = float(fault.parameters["min_hours"])
-    gate_min = fault.parameters.get("gate_min_pct")
-
-    with read_connection(settings) as conn:
-        frontier = silence.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window_start = frontier - LOOKBACK
-        channels = silence.resolve_scope(conn, fault.channel_scope())
-        # A room without its channels or a channel without its room fails
-        # the run loudly — never a silently unmeasured room.
-        rooms = deviation.resolve_rooms(channels, fault.rooms, fault.roles)
-        gas = [ga for room in rooms for ga in room.gas]
-        series = deviation.values(conn, gas, window_start)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    dead_values = deviation.dead_value_gas(rooms, series)
-    if dead_values:
-        # A dead register reading 0.0 would score as a huge gap; the
-        # silence fault owns reporting the channel itself.
-        log.info("scope_drops", dead=len(dead_values), dead_channels=dead_values)
-        for ga in dead_values:
-            del series[ga]
-
-    states: dict[str, deviation.RoomState] = {}
-    observations: list[Observation] = []
-    dataless: set[str] = set()
-    for room in rooms:
-        buckets = deviation.room_series(room, series, window_start, frontier)
-        if not buckets:
-            dataless.add(room.slug)
-        cold = deviation.cold_buckets(room, buckets, gate_min)
-        states[room.slug] = deviation.classify(room, cold, frontier)
-        observations.extend(deviation.deviation_observations(room, cold, min_hours))
-    if dataless:
-        # A role silent for the whole window leaves the room unmeasurable —
-        # not a scope error, but never to pass in silence either.
-        log.warning("rooms_dataless", fault=fault.name, rooms=sorted(dataless))
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, observations, history_scores, EpisodePolicy(), frontier
-    )
-    plan = deviation.plan_run(
-        episodes=episodes,
-        open_rows=open_rows,
-        states_by_slug=states,
-        dataless=frozenset(dataless),
-        frontier=frontier,
-    )
-
-    log.info(
-        "room_deviation_run",
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        rooms=len(rooms),
-        cold=sum(1 for s in states.values() if s.cold_since is not None),
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        stale_opens=list(plan.stale_opens),
-        publishes=len(plan.publishes),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        per_room = Counter(e.subject for e in episodes)
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            per_room=dict(sorted(per_room.items())),
-            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-            would_publish=[{"slug": p.slug, "severity": p.severity} for p in plan.publishes],
-        )
-        return
-
-    _publish_rooms(settings, fault.name, plan.publishes)
     with write_connection(settings) as conn, conn.transaction():
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
@@ -888,14 +770,11 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
 
 
 def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    if fault.kind is MeasurementKind.SILENCE:
+    kind = _SUBJECT_KINDS.get(fault.kind)
+    if kind is not None:
+        _run_subjects(settings, fault, kind, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.SILENCE:
         _run_silence(settings, fault, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.DURATION:
-        _run_duration(settings, fault, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.DRIFT:
-        _run_drift(settings, fault, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.DEVIATION:
-        _run_deviation(settings, fault, dry_run=dry_run)
     elif fault.kind is MeasurementKind.VOLUME:
         _run_volume(settings, fault, dry_run=dry_run)
     elif fault.kind is MeasurementKind.EXTERNAL:

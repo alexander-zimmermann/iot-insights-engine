@@ -34,11 +34,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .episodes import Episode, Observation
+from .episodes import Observation
+from .logging_setup import get_logger
 from .nats_publisher import slugify
-from .reconcile import reconcile
+from .reconcile import Measured, Plan, Window, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, DEAD_MIN_BUCKETS
+from .silence import BUCKET, DEAD_MIN_BUCKETS, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -47,8 +48,11 @@ if TYPE_CHECKING:
     from psycopg.rows import DictRow
 
     from .episode_store import OpenEpisodeRow
-    from .faults import Roles, RoomRule
+    from .episodes import Episode
+    from .faults import Fault, Roles, RoomRule
     from .silence import Channel
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,19 +321,18 @@ class RoomPublish:
     gate: float | None = None
     min_gap: float | None = None
 
+    @property
+    def subject(self) -> str:
+        return self.slug
 
-@dataclass(frozen=True, slots=True)
-class DeviationPlan:
-    """What one run changes: new episodes, reconciled open rows, orphaned
-    rows to close, rows kept open for want of data, and the rooms whose
-    severity moved.
-    """
+    @property
+    def entity(self) -> str:
+        # The slug is already a NATS-safe token — the room's identity here,
+        # in the episode subject and on the bus is one string.
+        return self.slug
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    stale_opens: tuple[str, ...]
-    publishes: tuple[RoomPublish, ...]
+
+DeviationPlan = Plan[RoomPublish]
 
 
 def plan_run(
@@ -340,25 +343,21 @@ def plan_run(
     dataless: frozenset[str],
     frontier: datetime,
 ) -> DeviationPlan:
-    """The shared reconciliation, delivered per room: a publish goes out
-    when a room's severity moved, including the 0 when its episode ends.
-    """
-    result = reconcile(
-        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
-    )
-    return DeviationPlan(
-        inserts=result.inserts,
-        updates=result.updates,
-        orphan_closes=result.orphan_closes,
-        stale_opens=result.stale_opens,
-        publishes=tuple(
-            _publish_for(subject, severity, states_by_slug.get(subject))
-            for subject, severity in result.moved
-        ),
+    """The shared reconciliation, delivered per room."""
+
+    def payload(subject: str, severity: int) -> RoomPublish:
+        return publish_for(subject, severity, states_by_slug.get(subject))
+
+    return subject_plan(
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=dataless,
+        frontier=frontier,
+        publish_for=payload,
     )
 
 
-def _publish_for(subject: str, severity: int, state: RoomState | None) -> RoomPublish:
+def publish_for(subject: str, severity: int, state: RoomState | None) -> RoomPublish:
     # A room that left the scope while its row was open still gets its
     # clear; the payload then only names the slug.
     if state is None:
@@ -393,3 +392,51 @@ def values(
     for row in rows:
         series.setdefault(row["ga"], {})[row["bucket"]] = float(row["avg_value"])
     return series
+
+
+def measure(
+    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+) -> Measured[RoomState]:
+    """The kind's whole measurement: the declared rooms married to the
+    scope, then the dense series, the cold buckets and the observations per
+    room.
+    """
+    if fault.roles is None:
+        raise ValueError(f"fault {fault.name}: the deviation kind needs declared roles")
+    min_hours = float(fault.parameters["min_hours"])
+    gate_min = fault.parameters.get("gate_min_pct")
+
+    channels = resolve_scope(conn, fault.channel_scope())
+    # A room without its channels or a channel without its room fails the
+    # run loudly — never a silently unmeasured room.
+    rooms = resolve_rooms(channels, fault.rooms, fault.roles)
+    series = values(conn, [ga for room in rooms for ga in room.gas], window.start)
+
+    dead = dead_value_gas(rooms, series)
+    if dead:
+        # A dead register reading 0.0 would score as a huge gap; the silence
+        # fault owns reporting the channel itself.
+        log.info("scope_drops", fault=fault.name, dead=len(dead), dead_channels=dead)
+        for ga in dead:
+            del series[ga]
+
+    states: dict[str, RoomState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for room in rooms:
+        buckets = room_series(room, series, window.start, window.frontier)
+        if not window.reaches(buckets[-1].time if buckets else None):
+            dataless.add(room.slug)
+        cold = cold_buckets(room, buckets, gate_min)
+        states[room.slug] = classify(room, cold, window.frontier)
+        observations.extend(deviation_observations(room, cold, min_hours))
+
+    return Measured(
+        states=states,
+        observations=tuple(observations),
+        dataless=frozenset(dataless),
+        counts={
+            "rooms": len(rooms),
+            "cold": sum(1 for s in states.values() if s.cold_since is not None),
+        },
+    )

@@ -1,50 +1,184 @@
-"""Episode reconciliation: computed episodes against the stored open rows.
+"""The shape every per-subject fault kind has: measure, fold, reconcile,
+deliver.
 
-Every kind that reports per subject — a device, a room, an appliance's
-standby — reconciles the same way, and the guarantees are the interesting
-part rather than the bookkeeping:
+A kind that reports per subject — a device, a room, an appliance's standby
+— differs from its siblings in exactly two things: how its series is
+measured (what leaves that step is a `Measured`), and how its payload is
+shaped (a `SubjectPublish`). Everything between those two ends is the same
+for all of them and lives here, so a new kind declares the two ends and
+inherits the rest.
+
+Reconciliation is the computed episodes against the stored open rows, and
+the guarantees are the interesting part rather than the bookkeeping:
 
 * only open computed episodes materialize as new rows; a computed episode
   that already ended matters only to close the open row it reconciles;
 * a stored severity is never lowered — the recompute window may have slid
   past the peak;
 * an open row whose subject produced no episode closes at the frontier,
-  unless the subject is `dataless` (in scope, but with nothing measurable
-  in the whole window): with no data to decide a recovery, the episode
-  stays open instead of self-clearing.
+  unless the subject is `dataless`.
 
-What leaves here is `moved`: the subjects whose severity changed, with the
-severity they carry now — including the 0 that ends an episode. Each kind
-turns those into its own publish payload; only channel silence reconciles
-differently, because it reports per main group rather than per subject.
+`dataless` means one thing in every kind, and `measurement_reaches` is
+where it is said: a subject is dataless when this run cannot tell a
+recovery from a blind spot, because its measurement does not reach the
+frontier. With no data to decide a recovery, its episode stays open
+instead of self-clearing.
+
+What leaves a reconciliation is `after` — the severity every subject with
+an open episode carries now, the ones held open for want of data included
+— and `moved`, those of them whose severity changed, including the 0 that
+ends an episode. A per-subject kind turns `moved` straight into its
+publishes; channel silence needs `after`, because it reports the maximum
+per main group rather than per subject.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import TYPE_CHECKING
+from datetime import datetime, timedelta
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
 
 from .episodes import Episode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from .episode_store import OpenEpisodeRow
+    from .episodes import EpisodePolicy, Observation
 
 
 @dataclass(frozen=True, slots=True)
 class Reconciliation:
     """What one run changes: new episodes, reconciled open rows, orphaned
-    rows to close, rows kept open for want of data, and the subjects whose
-    severity moved.
+    rows to close, rows kept open for want of data, the severity every open
+    subject carries now, and those of them whose severity moved.
     """
 
     inserts: tuple[Episode, ...]
     updates: tuple[tuple[int, Episode], ...]
     orphan_closes: tuple[tuple[int, datetime], ...]
     stale_opens: tuple[str, ...]
+    after: Mapping[str, int]
     moved: tuple[tuple[str, int], ...]
+
+
+def measurement_reaches(
+    last: datetime | None, *, frontier: datetime, max_gap: timedelta
+) -> bool:
+    """Whether a subject's measurement reaches the present — the difference
+    between "recovered" and "unmeasured", and the whole of what `dataless`
+    means, in every kind.
+
+    A subject nobody could measure produces no observations for exactly the
+    same reason a repaired one does. Without this test the episode would end
+    on missing data and clear an address whose fault still stands, so
+    anything short of the frontier by more than the episode pipeline's own
+    gap counts as unmeasurable rather than well.
+    """
+    return last is not None and frontier - last <= max_gap
+
+
+@dataclass(frozen=True, slots=True)
+class Window:
+    """The run's measurement window: where it starts, the aggregate's
+    frontier it is measured against, and the fold policy — which also
+    decides how far behind that frontier a measurement may lag before the
+    subject counts as unmeasured.
+    """
+
+    start: datetime
+    frontier: datetime
+    policy: EpisodePolicy
+
+    @property
+    def lookback(self) -> timedelta:
+        return self.frontier - self.start
+
+    def reaches(self, last: datetime | None) -> bool:
+        """`measurement_reaches`, against this window."""
+        return measurement_reaches(
+            last, frontier=self.frontier, max_gap=self.policy.max_gap
+        )
+
+
+_NO_LABELS: Mapping[str, str] = MappingProxyType({})
+
+
+@dataclass(frozen=True, slots=True)
+class Measured[S]:
+    """What a kind's measurement saw over its whole scope: the state per
+    subject its payload is shaped from, the observations they produced, the
+    subjects whose measurement did not reach the frontier, what a human
+    calls each subject, and the counts its log record names.
+    """
+
+    states: Mapping[str, S]
+    observations: tuple[Observation, ...]
+    dataless: frozenset[str]
+    counts: Mapping[str, int]
+    labels: Mapping[str, str] = _NO_LABELS
+
+
+class SubjectPublish(Protocol):
+    """What the runner needs of any per-subject payload: the subject it
+    speaks for, the address token it is delivered on, and the severity that
+    decides firing. Everything else in the payload is the kind's own.
+    """
+
+    @property
+    def subject(self) -> str: ...
+
+    @property
+    def entity(self) -> str: ...
+
+    @property
+    def severity(self) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Plan[P]:
+    """What one run changes: the reconciled rows, and the publishes the
+    kind shaped out of the subjects whose severity moved.
+    """
+
+    inserts: tuple[Episode, ...]
+    updates: tuple[tuple[int, Episode], ...]
+    orphan_closes: tuple[tuple[int, datetime], ...]
+    stale_opens: tuple[str, ...]
+    publishes: tuple[P, ...]
+
+
+def plan_from[P](result: Reconciliation, publishes: Iterable[P]) -> Plan[P]:
+    """The reconciled rows carried into a plan beside the kind's publishes —
+    the one place those four fields are copied across.
+    """
+    return Plan(
+        inserts=result.inserts,
+        updates=result.updates,
+        orphan_closes=result.orphan_closes,
+        stale_opens=result.stale_opens,
+        publishes=tuple(publishes),
+    )
+
+
+def subject_plan[P](
+    *,
+    episodes: Sequence[Episode],
+    open_rows: Sequence[OpenEpisodeRow],
+    dataless: frozenset[str],
+    frontier: datetime,
+    publish_for: Callable[[str, int], P],
+) -> Plan[P]:
+    """Reconcile, then deliver per subject: a publish goes out when a
+    subject's severity moved, including the 0 when its episode ends.
+    """
+    result = reconcile(
+        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
+    )
+    return plan_from(
+        result, (publish_for(subject, severity) for subject, severity in result.moved)
+    )
 
 
 def reconcile(
@@ -104,5 +238,6 @@ def reconcile(
         updates=tuple(updates),
         orphan_closes=tuple(orphan_closes),
         stale_opens=tuple(stale_opens),
+        after=MappingProxyType(after),
         moved=moved,
     )
