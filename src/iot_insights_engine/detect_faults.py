@@ -40,9 +40,19 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from math import ceil
 from pathlib import Path
 
-from . import deviation, duration, episode_store, external, nats_publisher, silence, volume
+from . import (
+    deviation,
+    drift,
+    duration,
+    episode_store,
+    external,
+    nats_publisher,
+    silence,
+    volume,
+)
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -463,6 +473,118 @@ def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
+def _publish_drift(
+    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
+) -> None:
+    for publish in publishes:
+        firing = publish.severity > 0
+        nats_publisher.publish_anomaly(
+            settings,
+            fault_name,
+            severity_name(publish.severity) if firing else None,
+            {
+                "device": publish.device,
+                "ga": publish.ga,
+                "name": publish.name,
+                "standby_ma": publish.standby,
+                "healthy_ma": publish.healthy,
+                "excess_ma": publish.excess,
+                "rising_since": publish.rising_since,
+            },
+            entity=publish.ga.replace("/", "-"),
+            firing=firing,
+        )
+
+
+def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    """Standby drift: the CUSUM walks each device's own history from the
+    healthy value declared for it, so nothing here is carried between runs.
+    """
+    if fault.target is None or not fault.target.per_device:
+        raise ValueError(f"fault {fault.name}: drift delivery needs a per_device target")
+    rise = float(fault.parameters["rise_ma"])
+    budget = float(fault.parameters["budget_ma_h"])
+    window = timedelta(hours=float(fault.parameters["window_hours"]))
+    min_samples = ceil(float(fault.parameters["min_window_fraction"]) * (window / BUCKET))
+
+    with read_connection(settings) as conn:
+        frontier = drift.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window_start = frontier - LOOKBACK
+        channels = silence.resolve_scope(conn, fault.channel_scope())
+        # A reference without a channel or a channel without a reference
+        # fails the run loudly — never a silently unmeasured device.
+        devices = drift.resolve_devices(channels, fault.references)
+        series = drift.hourly_floors(conn, [d.ga for d in devices], window_start)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    states: dict[str, drift.DeviceState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for device in devices:
+        floors = drift.standby_floors(
+            series.get(device.ga, []), window=window, min_samples=min_samples
+        )
+        if not floors:
+            # A device that ran through the whole window, or sent too
+            # thinly to hold a valley, has no standby to judge.
+            dataless.add(device.ga)
+        trace = drift.accumulate(floors, healthy=device.healthy, rise=rise)
+        states[device.ga] = drift.classify(device, trace, frontier=frontier)
+        observations.extend(
+            drift.drift_observations(device.ga, trace, rise=rise, budget=budget)
+        )
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(
+        fault.name, observations, history_scores, EpisodePolicy(), frontier
+    )
+    plan = drift.plan_run(
+        episodes=episodes,
+        open_rows=open_rows,
+        states_by_ga=states,
+        dataless=frozenset(dataless),
+        frontier=frontier,
+    )
+
+    log.info(
+        "appliance_standby_run",
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        devices=len(devices),
+        dataless=sorted(dataless),
+        high=sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        stale_opens=list(plan.stale_opens),
+        publishes=len(plan.publishes),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        label_by_ga = {d.ga: d.label for d in devices}
+        per_device = Counter(e.subject for e in episodes)
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            per_device={label_by_ga.get(ga, ga): count for ga, count in sorted(per_device.items())},
+            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+            would_publish=[{"ga": p.ga, "severity": p.severity} for p in plan.publishes],
+        )
+        return
+
+    _publish_drift(settings, fault.name, plan.publishes)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
 def _publish_rooms(
     settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
 ) -> None:
@@ -745,6 +867,8 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
             _run_silence(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.DURATION:
             _run_duration(settings, fault, dry_run=args.dry_run)
+        elif fault.kind is MeasurementKind.DRIFT:
+            _run_drift(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.DEVIATION:
             _run_deviation(settings, fault, dry_run=args.dry_run)
         elif fault.kind is MeasurementKind.VOLUME:

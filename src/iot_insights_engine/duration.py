@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from .episodes import Episode, Observation
+from .reconcile import reconcile
 from .runs import split_runs
 from .silence import BUCKET
 
@@ -178,65 +179,21 @@ def plan_run(
     dataless: frozenset[str],
     frontier: datetime,
 ) -> DurationPlan:
-    """Pure reconciliation: computed episodes against the stored open rows,
-    with the same guarantees the silence plan gives — a stored severity is
-    never lowered, an open row whose device produced no episode closes at
-    the frontier unless the device is `dataless` (no bucket in the whole
-    window: with nothing to decide a recovery, it must not self-clear).
-
-    Delivery is per device: a publish goes out when a device's severity
-    moved, including the 0 when its episode ends.
+    """The shared reconciliation, delivered per device: a publish goes out
+    when a device's severity moved, including the 0 when its episode ends.
     """
-    open_by_subject = {row.subject: row for row in open_rows}
-
-    # Several episodes per device can fall in the window; the stored open
-    # row can only correspond to the latest one.
-    latest_by_subject: dict[str, Episode] = {}
-    for episode in episodes:
-        current = latest_by_subject.get(episode.subject)
-        if current is None or episode.started_at > current.started_at:
-            latest_by_subject[episode.subject] = episode
-
-    inserts: list[Episode] = []
-    updates: list[tuple[int, Episode]] = []
-    after: dict[str, int] = {}
-
-    for subject, episode in sorted(latest_by_subject.items()):
-        row = open_by_subject.get(subject)
-        if episode.ended_at is None:
-            after[subject] = max(episode.severity, row.severity if row else 0)
-            if row is not None:
-                updates.append((row.id, episode))
-            else:
-                inserts.append(episode)
-        elif row is not None:
-            updates.append((row.id, episode))
-
-    orphan_closes: list[tuple[int, datetime]] = []
-    stale_opens: list[str] = []
-    for row in open_rows:
-        if row.subject in latest_by_subject:
-            continue
-        if row.subject in dataless:
-            stale_opens.append(row.subject)
-            # Still over its limit as far as anyone can tell — it keeps counting.
-            after[row.subject] = row.severity
-        else:
-            orphan_closes.append((row.id, frontier))
-
-    before = {row.subject: row.severity for row in open_rows}
-    publishes = tuple(
-        _publish_for(subject, after.get(subject, 0), states_by_ga.get(subject))
-        for subject in sorted(set(before) | set(after))
-        if before.get(subject) != after.get(subject)
+    result = reconcile(
+        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
     )
-
     return DurationPlan(
-        inserts=tuple(inserts),
-        updates=tuple(updates),
-        orphan_closes=tuple(orphan_closes),
-        stale_opens=tuple(stale_opens),
-        publishes=publishes,
+        inserts=result.inserts,
+        updates=result.updates,
+        orphan_closes=result.orphan_closes,
+        stale_opens=result.stale_opens,
+        publishes=tuple(
+            _publish_for(subject, severity, states_by_ga.get(subject))
+            for subject, severity in result.moved
+        ),
     )
 
 

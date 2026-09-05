@@ -16,6 +16,7 @@ import pytest
 from iot_insights_engine.faults import (
     _SCHEMA_PATH,
     DeviceLimit,
+    DeviceReference,
     Dormant,
     FaultList,
     MeasurementKind,
@@ -42,17 +43,21 @@ faults:
       per_main_group: true
   - name: appliance_standby
     sentence: "Der Ruhestrom eines Geräts steigt dauerhaft um mehr als 40 mA."
-    unit: "mA"
+    unit: "× der erlaubten Erhöhung"
     kind: drift
     parameters:
-      healthy: 43
-      slack: 5
-      budget: 840
+      rise_ma: 40
+      budget_ma_h: 480
+      window_hours: 24
+      min_window_fraction: 0.8
     scope:
       dpt: "7.012"
       name_like: "%.Stromwert"
+    references:
+      Küche.K15-L1.Gefrierschrank:
+        healthy_ma: 48
     target:
-      ga: "2/2/229"
+      per_device: true
 """
 
 
@@ -78,9 +83,17 @@ def test_loads_valid_file(tmp_path: Path) -> None:
 
     standby = faults.get("appliance_standby")
     assert standby.kind is MeasurementKind.DRIFT
-    assert standby.parameters == {"healthy": 43, "slack": 5, "budget": 840}
+    assert standby.parameters == {
+        "rise_ma": 40,
+        "budget_ma_h": 480,
+        "window_hours": 24,
+        "min_window_fraction": 0.8,
+    }
+    assert standby.references == (
+        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy_ma=48),
+    )
     assert standby.target is not None
-    assert standby.target.ga == "2/2/229"
+    assert standby.target.per_device is True
     assert standby.target.per_main_group is False
 
 
@@ -213,7 +226,7 @@ def test_empty_parameters_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters: {}
             scope:
               name_like: "%.Stromwert"
@@ -233,7 +246,7 @@ def test_non_numeric_parameter_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: "high"
             scope:
@@ -275,7 +288,7 @@ def test_unknown_field_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -297,7 +310,7 @@ def test_target_requires_exactly_one_form(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -319,7 +332,7 @@ def test_invalid_ga_format_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -340,7 +353,7 @@ def test_empty_scope_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope: {}
@@ -360,7 +373,7 @@ def test_duplicate_name_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -422,7 +435,7 @@ def test_dormant_requires_reason_and_condition(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -444,7 +457,7 @@ def test_dormant_missing_active_when_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -466,7 +479,7 @@ def test_missing_name_reports_position(tmp_path: Path) -> None:
         faults:
           - sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -575,7 +588,7 @@ def test_devices_on_other_kind_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             devices:
@@ -607,6 +620,91 @@ def test_per_device_target_excludes_other_forms(tmp_path: Path) -> None:
     body = _DURATION.replace("per_device: true", 'per_device: true\n      ga: "2/2/229"')
     with pytest.raises(ValueError, match=r"'appliance_runtime'.*target"):
         FaultList.load(_write(tmp_path, body))
+
+
+_DRIFT = """
+faults:
+  - name: appliance_standby
+    sentence: "Die Standby-Aufnahme eines Geräts liegt dauerhaft mehr als
+      40 mA über ihrem gesunden Wert."
+    unit: "× der erlaubten Erhöhung"
+    kind: drift
+    parameters:
+      rise_ma: 40
+      budget_ma_h: 480
+      window_hours: 24
+      min_window_fraction: 0.8
+    scope:
+      dpt: "7.012"
+      name_like: "%.Stromwert"
+    references:
+      Küche.K15-L1.Gefrierschrank:
+        healthy_ma: 48
+      Hauswirtschaftsraum.K4-L1.Waschmaschine:
+        healthy_ma: 0
+    target:
+      per_device: true
+"""
+
+
+def test_drift_fault_loads_its_references(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _DRIFT))
+    assert fault.kind is MeasurementKind.DRIFT
+    assert fault.references == (
+        DeviceReference(match="Küche.K15-L1.Gefrierschrank", healthy_ma=48),
+        DeviceReference(match="Hauswirtschaftsraum.K4-L1.Waschmaschine", healthy_ma=0),
+    )
+
+
+def test_drift_without_references_rejected(tmp_path: Path) -> None:
+    # A drift fault whose reference is missing would have to invent one from
+    # history — the one thing the pinned reference exists to prevent.
+    head, _refs = _DRIFT.split("    references:\n", 1)
+    body = head + "    target:" + _DRIFT.split("    target:", 1)[1]
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*references"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_reference_entry_without_healthy_value_rejected(tmp_path: Path) -> None:
+    body = _DRIFT.replace("healthy_ma: 48", "note: 48")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*Gefrierschrank"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_drift_requires_its_parameters(tmp_path: Path) -> None:
+    body = _DRIFT.replace("rise_ma: 40", "other: 40")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*rise_ma"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_non_positive_rise_rejected(tmp_path: Path) -> None:
+    body = _DRIFT.replace("rise_ma: 40", "rise_ma: 0")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*rise_ma"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_references_on_other_kind_rejected(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+        faults:
+          - name: x
+            sentence: "Ein Satz mit Einheit in mA."
+            unit: "mA"
+            kind: constancy
+            parameters:
+              healthy: 43
+            references:
+              Waschmaschine:
+                healthy_ma: 0
+            scope:
+              name_like: "%.Stromwert"
+            target:
+              ga: "2/2/229"
+        """,
+    )
+    with pytest.raises(ValueError, match=r"'x'.*references"):
+        FaultList.load(path)
 
 
 _DEVIATION = """
@@ -712,7 +810,7 @@ def test_rooms_on_other_kind_rejected(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             rooms:
@@ -799,7 +897,7 @@ def test_engine_kind_still_requires_target(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             scope:
@@ -861,7 +959,7 @@ def test_measuring_kinds_still_require_a_scope(tmp_path: Path) -> None:
           - name: x
             sentence: "Ein Satz mit Einheit in mA."
             unit: "mA"
-            kind: drift
+            kind: constancy
             parameters:
               healthy: 43
             target:
