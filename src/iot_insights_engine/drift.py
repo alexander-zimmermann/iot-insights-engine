@@ -44,8 +44,9 @@ from math import ceil
 from typing import TYPE_CHECKING
 
 from .episodes import Observation
-from .reconcile import reconcile
-from .silence import BUCKET, pair_by_match
+from .nats_publisher import slugify
+from .reconcile import Measured, Plan, Window, measurement_reaches, subject_plan
+from .silence import BUCKET, pair_by_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 
     from .episode_store import OpenEpisodeRow
     from .episodes import Episode
-    from .faults import DeviceReference
+    from .faults import DeviceReference, Fault
     from .silence import Channel
 
 
@@ -147,17 +148,13 @@ def standby_floors(
 def reaches_frontier(
     floors: Sequence[tuple[datetime, float]], *, frontier: datetime, max_gap: timedelta
 ) -> bool:
-    """Whether the device's valleys reach the present — the difference
-    between "recovered" and "unmeasured".
-
-    A device that ran through the last day, or sent too thinly to hold a
-    valley, produces no observations for exactly the same reason a repaired
-    one does. Without this test the episode would end on missing data and
-    clear an address whose relay is still stuck, so anything short of the
-    frontier by more than the episode pipeline's own gap counts as
-    unmeasurable rather than well.
+    """The shared `dataless` test read off the valley series, which is where
+    a drift measurement ends: a device that ran through the last day, or
+    sent too thinly to hold a valley, is unmeasured rather than well.
     """
-    return bool(floors) and frontier - floors[-1][0] <= max_gap
+    return measurement_reaches(
+        floors[-1][0] if floors else None, frontier=frontier, max_gap=max_gap
+    )
 
 
 def accumulate(
@@ -258,19 +255,16 @@ class DevicePublish:
     excess: float | None
     rising_since: datetime | None
 
+    @property
+    def subject(self) -> str:
+        return self.ga
 
-@dataclass(frozen=True, slots=True)
-class DriftPlan:
-    """What one run changes: new episodes, reconciled open rows, orphaned
-    rows to close, rows kept open for want of data, and the devices whose
-    severity moved.
-    """
+    @property
+    def entity(self) -> str:
+        return slugify(self.ga)
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    stale_opens: tuple[str, ...]
-    publishes: tuple[DevicePublish, ...]
+
+DriftPlan = Plan[DevicePublish]
 
 
 def plan_run(
@@ -281,25 +275,21 @@ def plan_run(
     dataless: frozenset[str],
     frontier: datetime,
 ) -> DriftPlan:
-    """The shared reconciliation, delivered per device: a publish goes out
-    when a device's severity moved, including the 0 when its episode ends.
-    """
-    result = reconcile(
-        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
-    )
-    return DriftPlan(
-        inserts=result.inserts,
-        updates=result.updates,
-        orphan_closes=result.orphan_closes,
-        stale_opens=result.stale_opens,
-        publishes=tuple(
-            _publish_for(subject, severity, states_by_ga.get(subject))
-            for subject, severity in result.moved
-        ),
+    """The shared reconciliation, delivered per device."""
+
+    def payload(subject: str, severity: int) -> DevicePublish:
+        return publish_for(subject, severity, states_by_ga.get(subject))
+
+    return subject_plan(
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=dataless,
+        frontier=frontier,
+        publish_for=payload,
     )
 
 
-def _publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
+def publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
     # A device that left the scope while its row was open still gets its
     # clear; the payload then only names the address.
     if state is None:
@@ -345,3 +335,53 @@ def hourly_floors(
     for row in rows:
         series[row["ga"]].append((row["bucket"], float(row["idle_floor"])))
     return dict(series)
+
+
+def measure(
+    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+) -> Measured[DeviceState]:
+    """The kind's whole measurement: the declared references married to the
+    scope, then valley, CUSUM walk and observations per device.
+    """
+    rise = float(fault.parameters["rise_ma"])
+    budget = float(fault.parameters["budget_ma_h"])
+    trailing = timedelta(hours=float(fault.parameters["window_hours"]))
+    if trailing > window.lookback:
+        # A window the lookback cannot cover measures nothing, forever, and
+        # would pin every open episode open. Fail the way a bad reference does.
+        raise ValueError(
+            f"fault {fault.name}: window_hours exceeds the {window.lookback.days}-day lookback"
+        )
+    min_samples = min_window_samples(trailing, float(fault.parameters["min_window_fraction"]))
+
+    channels = resolve_scope(conn, fault.channel_scope())
+    # A reference without a channel or a channel without a reference fails
+    # the run loudly — never a silently unmeasured device.
+    devices = resolve_devices(channels, fault.references)
+    series = hourly_floors(conn, [d.ga for d in devices], window.start)
+
+    states: dict[str, DeviceState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for device in devices:
+        floors = standby_floors(
+            series.get(device.ga, []), window=trailing, min_samples=min_samples
+        )
+        if not reaches_frontier(
+            floors, frontier=window.frontier, max_gap=window.policy.max_gap
+        ):
+            dataless.add(device.ga)
+        trace = accumulate(floors, healthy=device.healthy, rise=rise)
+        states[device.ga] = classify(device, trace, frontier=window.frontier)
+        observations.extend(drift_observations(device.ga, trace, rise=rise, budget=budget))
+
+    return Measured(
+        states=states,
+        observations=tuple(observations),
+        dataless=frozenset(dataless),
+        counts={
+            "devices": len(devices),
+            "high": sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
+        },
+        labels={d.ga: d.label for d in devices},
+    )

@@ -76,6 +76,19 @@ class Target:
                 "target is exactly one of ga, per_main_group, per_device or per_room"
             )
 
+    @property
+    def form(self) -> str:
+        """Which of the four this target declares — exactly one, by
+        construction, so a runner can compare it against the form its kind
+        delivers on."""
+        if self.ga is not None:
+            return "ga"
+        if self.per_main_group:
+            return "per_main_group"
+        if self.per_device:
+            return "per_device"
+        return "per_room"
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceLimit:

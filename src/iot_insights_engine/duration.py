@@ -25,10 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from .episodes import Episode, Observation
-from .reconcile import reconcile
+from .episodes import Observation
+from .nats_publisher import slugify
+from .reconcile import Measured, Plan, Window, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, pair_by_match
+from .silence import BUCKET, pair_by_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -37,7 +38,8 @@ if TYPE_CHECKING:
     from psycopg.rows import DictRow
 
     from .episode_store import OpenEpisodeRow
-    from .faults import DeviceLimit
+    from .episodes import Episode
+    from .faults import DeviceLimit, Fault
     from .silence import Channel
 
 
@@ -62,13 +64,13 @@ class DeviceState:
 
 @dataclass(frozen=True, slots=True)
 class Activity:
-    """The window's activity per channel: the active buckets, and which
-    channels delivered any row at all — a channel absent here is silent,
-    which is not this fault's call to clear.
+    """The window's activity per channel: the active buckets, and the newest
+    bucket each channel delivered a row for at all — running or not, that is
+    how far the device was measured.
     """
 
     active: Mapping[str, list[datetime]]
-    present: frozenset[str]
+    last_bucket: Mapping[str, datetime]
 
 
 def resolve_devices(channels: Sequence[Channel], limits: Sequence[DeviceLimit]) -> list[Device]:
@@ -133,19 +135,16 @@ class DevicePublish:
     run_hours: float | None
     limit_hours: float | None
 
+    @property
+    def subject(self) -> str:
+        return self.ga
 
-@dataclass(frozen=True, slots=True)
-class DurationPlan:
-    """What one run changes: new episodes, reconciled open rows, orphaned
-    rows to close, rows kept open for want of data, and the devices whose
-    severity moved.
-    """
+    @property
+    def entity(self) -> str:
+        return slugify(self.ga)
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    stale_opens: tuple[str, ...]
-    publishes: tuple[DevicePublish, ...]
+
+DurationPlan = Plan[DevicePublish]
 
 
 def plan_run(
@@ -156,25 +155,21 @@ def plan_run(
     dataless: frozenset[str],
     frontier: datetime,
 ) -> DurationPlan:
-    """The shared reconciliation, delivered per device: a publish goes out
-    when a device's severity moved, including the 0 when its episode ends.
-    """
-    result = reconcile(
-        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
-    )
-    return DurationPlan(
-        inserts=result.inserts,
-        updates=result.updates,
-        orphan_closes=result.orphan_closes,
-        stale_opens=result.stale_opens,
-        publishes=tuple(
-            _publish_for(subject, severity, states_by_ga.get(subject))
-            for subject, severity in result.moved
-        ),
+    """The shared reconciliation, delivered per device."""
+
+    def payload(subject: str, severity: int) -> DevicePublish:
+        return publish_for(subject, severity, states_by_ga.get(subject))
+
+    return subject_plan(
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=dataless,
+        frontier=frontier,
+        publish_for=payload,
     )
 
 
-def _publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
+def publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
     # A device that left the scope while its row was open still gets its
     # clear; the payload then only names the address.
     if state is None:
@@ -222,10 +217,50 @@ def activity(
         {"gas": list(gas), "start": window_start},
     ).fetchall()
     active: dict[str, list[datetime]] = defaultdict(list)
-    present: set[str] = set()
+    last_bucket: dict[str, datetime] = {}
     for row in rows:
-        present.add(row["ga"])
+        last_bucket[row["ga"]] = row["bucket"]
         total = row["total_samples"]
         if total and row["on_samples"] / total >= active_fraction:
             active[row["ga"]].append(row["bucket"])
-    return Activity(active=dict(active), present=frozenset(present))
+    return Activity(active=dict(active), last_bucket=last_bucket)
+
+
+def measure(
+    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+) -> Measured[DeviceState]:
+    """The kind's whole measurement: the declared limits married to the
+    scope, the window's activity, and one run reconstruction per device.
+    """
+    active_fraction = float(fault.parameters["active_hour_fraction"])
+    channels = resolve_scope(conn, fault.channel_scope())
+    # A limit without a channel or a channel without a limit fails the run
+    # loudly — never a silently unmeasured device.
+    devices = resolve_devices(channels, fault.devices)
+    seen = activity(conn, [d.ga for d in devices], window.start, active_fraction)
+
+    states: dict[str, DeviceState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for device in devices:
+        if not window.reaches(seen.last_bucket.get(device.ga)):
+            dataless.add(device.ga)
+        active = seen.active.get(device.ga, [])
+        states[device.ga] = classify(device, active, window.frontier)
+        observations.extend(duration_observations(device.ga, active, device.max_run))
+
+    return Measured(
+        states=states,
+        observations=tuple(observations),
+        dataless=frozenset(dataless),
+        counts={
+            "devices": len(devices),
+            "running": sum(1 for s in states.values() if s.running_since is not None),
+            "over_limit": sum(
+                1
+                for s in states.values()
+                if s.run_hours is not None and s.run_hours * BUCKET > s.device.max_run
+            ),
+        },
+        labels={d.ga: d.label for d in devices},
+    )
