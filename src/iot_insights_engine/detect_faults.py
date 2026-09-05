@@ -67,7 +67,7 @@ from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
 from .episodes import Episode, EpisodePolicy, Observation, fold_observations
-from .faults import Fault, FaultList, MeasurementKind
+from .faults import DriftSignal, Fault, FaultList, MeasurementKind
 from .logging_setup import get_logger
 from .reconcile import (
     Measured,
@@ -156,7 +156,7 @@ def _publish_devices(
     )
 
 
-def _publish_drift(
+def _publish_standby(
     settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
 ) -> None:
     """Standby drift: what the device idles at against what it should."""
@@ -168,9 +168,30 @@ def _publish_drift(
             "device": p.device,
             "ga": p.ga,
             "name": p.name,
-            "standby_ma": p.standby,
+            "standby_ma": p.level,
             "healthy_ma": p.healthy,
             "excess_ma": p.excess,
+            "rising_since": p.rising_since,
+        },
+    )
+
+
+def _publish_duty_cycle(
+    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
+) -> None:
+    """Duty-cycle drift: how much of the day the compressor runs against how
+    much it should — the mail's number for "the freezer is icing up"."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "device": p.device,
+            "ga": p.ga,
+            "name": p.name,
+            "duty_pct": p.level,
+            "healthy_pct": p.healthy,
+            "excess_pct": p.excess,
             "rising_since": p.rising_since,
         },
     )
@@ -300,14 +321,6 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
         publish_for=duration.publish_for,
         publish=_publish_devices,
     ),
-    MeasurementKind.DRIFT: SubjectKind(
-        event="appliance_standby_run",
-        delivery="per_device",
-        frontier=duration.frontier,
-        measure=drift.measure,
-        publish_for=drift.publish_for,
-        publish=_publish_drift,
-    ),
     MeasurementKind.DEVIATION: SubjectKind(
         event="room_deviation_run",
         delivery="per_room",
@@ -315,6 +328,29 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
         measure=deviation.measure,
         publish_for=deviation.publish_for,
         publish=_publish_rooms,
+    ),
+}
+
+
+# The drift kind runs one shape per signal: same CUSUM, different series,
+# so the run record and the payload's units differ with the signal the
+# fault declares.
+_DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
+    DriftSignal.STANDBY: SubjectKind(
+        event="appliance_standby_run",
+        delivery="per_device",
+        frontier=duration.frontier,
+        measure=drift.measure_standby,
+        publish_for=drift.publish_for,
+        publish=_publish_standby,
+    ),
+    DriftSignal.DUTY_CYCLE: SubjectKind(
+        event="duty_cycle_drift_run",
+        delivery="per_device",
+        frontier=duration.frontier,
+        measure=drift.measure_duty_cycle,
+        publish_for=drift.publish_for,
+        publish=_publish_duty_cycle,
     ),
 }
 
@@ -771,8 +807,21 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     return 0
 
 
+def _subject_kind(fault: Fault) -> SubjectKind[Any, Any] | None:
+    """The per-subject shape this fault runs in, if it has one. Drift picks
+    it by the signal the file declares — the loader rejects one without, so
+    a fault that got here signalless is a new kind of drift nobody wired up,
+    and it fails rather than reporting nothing.
+    """
+    if fault.kind is MeasurementKind.DRIFT:
+        if fault.signal is None:
+            raise ValueError(f"fault {fault.name}: a drift fault declares which series it walks")
+        return _DRIFT_SIGNALS[fault.signal]
+    return _SUBJECT_KINDS.get(fault.kind)
+
+
 def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    kind = _SUBJECT_KINDS.get(fault.kind)
+    kind = _subject_kind(fault)
     if kind is not None:
         _run_subjects(settings, fault, kind, dry_run=dry_run)
     elif fault.kind is MeasurementKind.SILENCE:

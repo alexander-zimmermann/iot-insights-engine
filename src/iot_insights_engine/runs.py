@@ -2,9 +2,9 @@
 
 The shared preparation step of the fault list. Two faults read runs —
 appliance runtime reads the length of the current run, freezer icing reads
-how run lengths grow over weeks — so the awkward parts (gaps, dropouts,
-where one run ends and the next begins) are built once and can be wrong in
-at most one place.
+the stretches the compressor never left to cut door events out of its duty
+cycle — so the awkward parts (gaps, dropouts, where one run ends and the
+next begins) are built once and can be wrong in at most one place.
 
 Cadence-agnostic: a run is a stretch of samples each one cadence step after
 the previous; a missing step ends it. A sample covers its full step, so a
