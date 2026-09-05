@@ -27,6 +27,7 @@
           "additionalProperties": { "type": "number" }
         },
         "devices":    { "$ref": "#/$defs/devices" },
+        "references": { "$ref": "#/$defs/references" },
         "roles":      { "$ref": "#/$defs/roles" },
         "rooms":      { "$ref": "#/$defs/rooms" },
         "scope":      { "$ref": "#/$defs/scope" },
@@ -66,6 +67,23 @@
           }
         },
         {
+          "if":   { "properties": { "kind": { "const": "drift" } }, "required": ["kind"] },
+          "then": {
+            "required": ["references"],
+            "properties": {
+              "parameters": {
+                "required": ["rise_ma", "budget_ma_h", "window_hours", "min_window_fraction"],
+                "properties": {
+                  "rise_ma":             { "type": "number", "exclusiveMinimum": 0 },
+                  "budget_ma_h":         { "type": "number", "exclusiveMinimum": 0 },
+                  "window_hours":        { "type": "number", "exclusiveMinimum": 0 },
+                  "min_window_fraction": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+                }
+              }
+            }
+          }
+        },
+        {
           "if":   { "properties": { "kind": { "const": "deviation" } }, "required": ["kind"] },
           "then": {
             "required": ["roles", "rooms"],
@@ -83,6 +101,18 @@
           "max_run_hours": { "type": "number", "exclusiveMinimum": 0 }
         },
         "required": ["max_run_hours"],
+        "additionalProperties": false
+      }
+    },
+    "references": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "healthy_ma": { "type": "number", "minimum": 0 }
+        },
+        "required": ["healthy_ma"],
         "additionalProperties": false
       }
     },

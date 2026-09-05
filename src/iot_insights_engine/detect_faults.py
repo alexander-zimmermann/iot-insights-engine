@@ -42,7 +42,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import deviation, duration, episode_store, external, nats_publisher, silence, volume
+from . import (
+    deviation,
+    drift,
+    duration,
+    episode_store,
+    external,
+    nats_publisher,
+    silence,
+    volume,
+)
 from .config import Settings
 from .db_write import read_connection, write_connection
 from .episode_store import OpenEpisodeRow
@@ -380,7 +389,7 @@ def _publish_devices(
                 "run_hours": publish.run_hours,
                 "limit_hours": publish.limit_hours,
             },
-            entity=publish.ga.replace("/", "-"),
+            entity=nats_publisher.slugify(publish.ga),
             firing=firing,
         )
 
@@ -459,6 +468,127 @@ def _run_duration(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         return
 
     _publish_devices(settings, fault.name, plan.publishes)
+    with write_connection(settings) as conn, conn.transaction():
+        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
+def _publish_drift(
+    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
+) -> None:
+    for publish in publishes:
+        firing = publish.severity > 0
+        nats_publisher.publish_anomaly(
+            settings,
+            fault_name,
+            severity_name(publish.severity) if firing else None,
+            {
+                "device": publish.device,
+                "ga": publish.ga,
+                "name": publish.name,
+                "standby_ma": publish.standby,
+                "healthy_ma": publish.healthy,
+                "excess_ma": publish.excess,
+                "rising_since": publish.rising_since,
+            },
+            entity=nats_publisher.slugify(publish.ga),
+            firing=firing,
+        )
+
+
+def _run_drift(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    """Standby drift: the CUSUM walks each device's own history from the
+    healthy value declared for it, so nothing here is carried between runs.
+    """
+    if fault.target is None or not fault.target.per_device:
+        raise ValueError(f"fault {fault.name}: drift delivery needs a per_device target")
+    rise = float(fault.parameters["rise_ma"])
+    budget = float(fault.parameters["budget_ma_h"])
+    window = timedelta(hours=float(fault.parameters["window_hours"]))
+    if window > LOOKBACK:
+        # A window the lookback cannot cover measures nothing, forever, and
+        # would pin every open episode open. Fail the way a bad reference does.
+        raise ValueError(
+            f"fault {fault.name}: window_hours exceeds the {LOOKBACK.days}-day lookback"
+        )
+    min_samples = drift.min_window_samples(
+        window, float(fault.parameters["min_window_fraction"])
+    )
+    policy = EpisodePolicy()
+
+    with read_connection(settings) as conn:
+        frontier = duration.frontier(conn)
+        if frontier is None:
+            log.warning("no_aggregate_data", fault=fault.name)
+            return
+        window_start = frontier - LOOKBACK
+        channels = silence.resolve_scope(conn, fault.channel_scope())
+        # A reference without a channel or a channel without a reference
+        # fails the run loudly — never a silently unmeasured device.
+        devices = drift.resolve_devices(channels, fault.references)
+        series = drift.hourly_floors(conn, [d.ga for d in devices], window_start)
+        open_rows = episode_store.open_rows(conn, fault.name)
+        history_scores = episode_store.history_scores(conn, fault.name)
+
+    states: dict[str, drift.DeviceState] = {}
+    observations: list[Observation] = []
+    dataless: set[str] = set()
+    for device in devices:
+        floors = drift.standby_floors(
+            series.get(device.ga, []), window=window, min_samples=min_samples
+        )
+        if not drift.reaches_frontier(floors, frontier=frontier, max_gap=policy.max_gap):
+            dataless.add(device.ga)
+        trace = drift.accumulate(floors, healthy=device.healthy, rise=rise)
+        states[device.ga] = drift.classify(device, trace, frontier=frontier)
+        observations.extend(
+            drift.drift_observations(device.ga, trace, rise=rise, budget=budget)
+        )
+
+    if dataless:
+        # Easier to trip than the other kinds' version — five missing hours
+        # in a day are enough — so it never passes at info level.
+        log.warning("devices_dataless", fault=fault.name, devices=sorted(dataless))
+
+    # `now` is the frontier: episode ends are decided by aggregate progress,
+    # never by wall time racing ahead of a stalled materialization.
+    episodes = fold_observations(fault.name, observations, history_scores, policy, frontier)
+    plan = drift.plan_run(
+        episodes=episodes,
+        open_rows=open_rows,
+        states_by_ga=states,
+        dataless=frozenset(dataless),
+        frontier=frontier,
+    )
+
+    log.info(
+        "appliance_standby_run",
+        fault=fault.name,
+        frontier=frontier.isoformat(),
+        devices=len(devices),
+        high=sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
+        episodes=len(episodes),
+        open_episodes=sum(1 for e in episodes if e.ended_at is None),
+        inserts=len(plan.inserts),
+        updates=len(plan.updates),
+        orphan_closes=len(plan.orphan_closes),
+        stale_opens=list(plan.stale_opens),
+        publishes=len(plan.publishes),
+        dry_run=dry_run,
+    )
+
+    if dry_run:
+        label_by_ga = {d.ga: d.label for d in devices}
+        per_device = Counter(e.subject for e in episodes)
+        log.info(
+            "dry_run_episodes",
+            fault=fault.name,
+            per_device={label_by_ga.get(ga, ga): count for ga, count in sorted(per_device.items())},
+            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
+            would_publish=[{"ga": p.ga, "severity": p.severity} for p in plan.publishes],
+        )
+        return
+
+    _publish_drift(settings, fault.name, plan.publishes)
     with write_connection(settings) as conn, conn.transaction():
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
@@ -740,19 +870,37 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     for fault in fault_list:
         if fault.dormant is not None:
             log.info("fault_dormant", fault=fault.name, active_when=fault.dormant.active_when)
+    failed: list[str] = []
     for fault in fault_list.schedulable():
-        if fault.kind is MeasurementKind.SILENCE:
-            _run_silence(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.DURATION:
-            _run_duration(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.DEVIATION:
-            _run_deviation(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.VOLUME:
-            _run_volume(settings, fault, dry_run=args.dry_run)
-        elif fault.kind is MeasurementKind.EXTERNAL:
-            _run_external(settings, fault, dry_run=args.dry_run)
-        else:
-            # Arrives with its own ticket; a declared fault must not fail
-            # the ones already running.
-            log.warning("fault_kind_not_implemented", fault=fault.name, kind=str(fault.kind))
+        # One fault must not take the others down with it: a catalog change
+        # that leaves a device undeclared fails its own fault loudly, while
+        # the rest of the list — the volume watchdog last of all — still
+        # runs. The job still exits non-zero, so the CronJob shows it.
+        try:
+            _run_fault(settings, fault, dry_run=args.dry_run)
+        except Exception:
+            log.exception("fault_run_failed", fault=fault.name, kind=str(fault.kind))
+            failed.append(fault.name)
+    if failed:
+        log.error("detect_faults_incomplete", failed=failed)
+        return 1
     return 0
+
+
+def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
+    if fault.kind is MeasurementKind.SILENCE:
+        _run_silence(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DURATION:
+        _run_duration(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DRIFT:
+        _run_drift(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.DEVIATION:
+        _run_deviation(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.VOLUME:
+        _run_volume(settings, fault, dry_run=dry_run)
+    elif fault.kind is MeasurementKind.EXTERNAL:
+        _run_external(settings, fault, dry_run=dry_run)
+    else:
+        # Arrives with its own ticket; a declared fault must not fail
+        # the ones already running.
+        log.warning("fault_kind_not_implemented", fault=fault.name, kind=str(fault.kind))

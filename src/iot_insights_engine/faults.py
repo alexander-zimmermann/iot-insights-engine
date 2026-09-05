@@ -89,6 +89,19 @@ class DeviceLimit:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceReference:
+    """One device's declared healthy level: a unique fragment of its catalog
+    name, and the standby draw it sits at when nothing is wrong — written
+    here after someone read it off the data once, never derived from
+    history. A reference the detector computed for itself would adopt a
+    months-old fault as healthy, which is the whole reason it is declared.
+    """
+
+    match: str
+    healthy_ma: float
+
+
+@dataclass(frozen=True, slots=True)
 class Roles:
     """The deviation kind's shared channel roles, each a catalog-name LIKE
     pattern matched inside every room's channels: the reference the value
@@ -146,6 +159,7 @@ class Fault:
     target: Target | None = None
     dormant: Dormant | None = None
     devices: tuple[DeviceLimit, ...] = ()
+    references: tuple[DeviceReference, ...] = ()
     roles: Roles | None = None
     rooms: tuple[RoomRule, ...] = ()
 
@@ -204,6 +218,7 @@ class FaultList:
                 _check_external(raw)
                 or _check_volume(raw)
                 or _check_devices(raw)
+                or _check_references(raw)
                 or _check_rooms(raw)
             )
             if problem is not None:
@@ -276,6 +291,19 @@ def _check_devices(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_references(raw: dict[str, Any]) -> str | None:
+    """Healthy references belong to the drift kind alone; anywhere else they
+    would be dead configuration nothing reads. Checked in the loader because
+    the schema's false-subschema error loses the field name.
+    """
+    if raw["kind"] != MeasurementKind.DRIFT and "references" in raw:
+        return (
+            f"fault {raw['name']!r}: references: "
+            f"only a drift fault declares healthy references"
+        )
+    return None
+
+
 def _check_rooms(raw: dict[str, Any]) -> str | None:
     """Roles and per-room rules belong to the deviation kind alone, and a
     gate role needs its threshold (and the other way round) — half a gate
@@ -333,6 +361,10 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         devices=tuple(
             DeviceLimit(match=match, max_run_hours=limit["max_run_hours"])
             for match, limit in raw.get("devices", {}).items()
+        ),
+        references=tuple(
+            DeviceReference(match=match, healthy_ma=reference["healthy_ma"])
+            for match, reference in raw.get("references", {}).items()
         ),
         roles=(
             Roles(reference=roles["reference"], gate=roles.get("gate"))

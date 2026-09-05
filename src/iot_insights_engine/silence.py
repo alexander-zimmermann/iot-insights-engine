@@ -20,16 +20,22 @@ Channels that never sent are excluded without a report — symmetry
 addresses are normal, not findings. Dead registers (a constant zero over
 the whole window, like the L2 voltage that read 0.0 for 717 buckets) drop
 out where the scope resolves; both drops are logged by the caller.
+
+This module also holds what every kind needs before it can measure
+anything: the `Channel` a catalog query resolves to, the query itself
+(`resolve_scope`), and the strict pairing of declared per-device rules to
+those channels (`pair_by_match`).
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from math import ceil
-from typing import Any
+from typing import Any, Protocol
 
 import psycopg
 from psycopg.rows import DictRow
@@ -38,6 +44,17 @@ from .episodes import Observation
 from .faults import Scope
 
 BUCKET = timedelta(hours=1)
+
+
+class DeviceRule(Protocol):
+    """What `pair_by_match` needs of a declared per-device rule: the unique
+    fragment of the catalog name it claims. The rest — a runtime limit, a
+    healthy reference — belongs to the kind that declared it.
+    """
+
+    @property
+    def match(self) -> str: ...
+
 
 # Constant-zero evidence shorter than a day is thin — an idle binary
 # channel, not a dead register.
@@ -200,6 +217,47 @@ def resolve_scope(conn: psycopg.Connection[DictRow], scope: Scope) -> list[Chann
         sql += " WHERE " + " AND ".join(clauses)
     rows = conn.execute(sql + " ORDER BY ga", params).fetchall()
     return [Channel(ga=r["ga"], name=r["name"], dpt=r["dpt"]) for r in rows]
+
+
+def pair_by_match[R: DeviceRule](
+    channels: Sequence[Channel], rules: Sequence[R], *, noun: str
+) -> list[tuple[Channel, R]]:
+    """Marry declared per-device rules to the scoped channels, strictly both
+    ways: every rule names exactly one channel, every channel is named by
+    exactly one rule. Ordered by group address.
+
+    Every problem is reported at once — a config error should name the whole
+    repair, not one field per run — and `noun` names what the file declares
+    ("limit", "reference"), so the message points at the block to edit.
+    """
+    problems: list[str] = []
+    matched: dict[str, tuple[Channel, R]] = {}
+    for rule in rules:
+        hits = [c for c in channels if rule.match in c.name]
+        if len(hits) != 1:
+            gas = ", ".join(c.ga for c in hits)
+            problems.append(
+                f"device {rule.match!r} matches no channel in scope"
+                if not hits
+                else f"device {rule.match!r} matches {len(hits)} channels: {gas}"
+            )
+            continue
+        channel = hits[0]
+        if channel.ga in matched:
+            problems.append(
+                f"channel {channel.ga} matched by "
+                f"{matched[channel.ga][1].match!r} and {rule.match!r}"
+            )
+            continue
+        matched[channel.ga] = (channel, rule)
+    problems.extend(
+        f"channel {c.ga} ({c.name}) has no declared {noun}"
+        for c in channels
+        if c.ga not in matched
+    )
+    if problems:
+        raise ValueError(f"device {noun}s do not fit the scope: " + "; ".join(problems))
+    return [matched[ga] for ga in sorted(matched)]
 
 
 def channel_stats(
