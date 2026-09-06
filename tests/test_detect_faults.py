@@ -1,8 +1,9 @@
-"""Runner-planning tests for the detect-faults job.
+"""Plan and wire tests for the detect-faults kinds.
 
-The plan is a pure function: computed episodes plus the open rows the
-database holds in, inserts/updates/closes plus per-main-group publishes
-out. The SQL and NATS edges stay thin; the cluster smoke test covers them.
+The silence plan is a pure function: computed episodes plus the open rows
+the database holds in, inserts/updates/closes plus per-main-group
+publishes out. The wire tests pin each kind's subject and payload bytes.
+The SQL and NATS edges stay thin; the cluster smoke test covers them.
 """
 
 from __future__ import annotations
@@ -10,9 +11,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-from iot_insights_engine import detect_faults, deviation, drift, duration, nats_publisher, volume
+from iot_insights_engine import (
+    detect_faults,
+    deviation,
+    drift,
+    duration,
+    nats_publisher,
+    silence,
+    volume,
+)
 from iot_insights_engine.config import Settings
-from iot_insights_engine.detect_faults import GroupPublish, plan_run
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import (
     Episode,
@@ -20,8 +28,15 @@ from iot_insights_engine.episodes import (
     EvidenceRow,
     NotificationEvent,
 )
+from iot_insights_engine.reconcile import Measured, Plan
 from iot_insights_engine.runner import NatsPublisher, publish_subjects
-from iot_insights_engine.silence import Channel, ChannelState, SilenceState
+from iot_insights_engine.silence import (
+    Channel,
+    ChannelState,
+    GroupPublish,
+    SilenceState,
+    plan_run,
+)
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
@@ -70,12 +85,17 @@ def _plan(
     open_rows: list[OpenEpisodeRow],
     states: dict[str, SilenceState] | None = None,
     dataless: frozenset[str] = frozenset(),
-) -> detect_faults.RunPlan:
+) -> Plan[GroupPublish]:
+    measured = Measured(
+        states=states if states is not None else _states(_FREEZER, _BOILER),
+        observations=(),
+        dataless=dataless,
+        counts={},
+    )
     return plan_run(
         episodes=episodes,
         open_rows=open_rows,
-        states_by_ga=states if states is not None else _states(_FREEZER, _BOILER),
-        dataless=dataless,
+        measured=measured,
         frontier=_FRONTIER,
     )
 
@@ -150,7 +170,7 @@ def test_group_severity_is_the_maximum_over_its_channels() -> None:
 
 def test_historical_ended_episode_without_open_row_is_ignored() -> None:
     plan = _plan([_episode("2/2/227", severity=1, ended=True)], open_rows=[])
-    assert plan == detect_faults.RunPlan((), (), (), (), ())
+    assert plan == Plan((), (), (), (), ())
 
 
 def test_second_channel_at_the_same_tier_is_still_published() -> None:
@@ -191,7 +211,7 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
     plan = _plan([episode], open_rows=[])
     with patch.object(nats_publisher, "publish") as pub:
         publish_subjects(
-            NatsPublisher(settings), "channel_silence", plan.publishes, detect_faults._group_payload
+            NatsPublisher(settings), "channel_silence", plan.publishes, silence.group_payload
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.2"
@@ -208,7 +228,7 @@ def test_publish_clear_forces_level_zero() -> None:
             NatsPublisher(settings),
             "channel_silence",
             (GroupPublish(main_group=15, severity=0, channels=()),),
-            detect_faults._group_payload,
+            silence.group_payload,
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.15"

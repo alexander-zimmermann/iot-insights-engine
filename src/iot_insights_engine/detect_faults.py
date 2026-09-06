@@ -16,9 +16,9 @@ tail, behind its injected store and publisher ends. This module is the
 job: it loads the fault list, wires each kind's declaration, and keeps
 the loops the runner does not cover yet.
 
-Channel silence measures per channel but reports per main group, so it
-keeps its own delivery; it reconciles through the same `reconcile` as
-everything else.
+Channel silence measures per channel but reports per main group, so its
+declaration carries its own plan; the lifecycle around it is the same
+runner as everything else's.
 
 The volume watchdog runs the loop over the engine's own output: it counts
 the incidents of the last seven days out of the episode stream and puts a
@@ -48,8 +48,7 @@ touches neither the database nor NATS.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -66,29 +65,17 @@ from . import (
 )
 from .config import Settings
 from .db_write import read_connection, write_connection
-from .episode_store import OpenEpisodeRow
-from .episodes import Episode, EpisodePolicy, Observation, fold_observations
+from .episodes import EpisodePolicy, fold_observations
 from .faults import DriftSignal, Fault, FaultList, MeasurementKind
 from .logging_setup import get_logger
-from .reconcile import Plan, Window, plan_from, reconcile
 from .runner import (
     LOOKBACK,
     DbStore,
     Kind,
     NatsPublisher,
-    log_dry_run,
-    publish_subjects,
     run_subjects,
 )
 from .severity import severity_name
-from .silence import (
-    BUCKET,
-    MIN_PAUSE_BUCKETS,
-    Channel,
-    ChannelState,
-    SilenceState,
-    main_group,
-)
 
 log = get_logger(__name__)
 
@@ -109,6 +96,21 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
         measure=deviation.measure,
         publish_for=deviation.publish_for,
         payload=deviation.payload,
+    ),
+    MeasurementKind.SILENCE: Kind(
+        event="channel_silence_run",
+        delivery="per_main_group",
+        frontier=silence.frontier,
+        measure=silence.measure,
+        # Measured per channel, delivered per main group — the one kind
+        # whose plan is its own.
+        plan=silence.plan_run,
+        payload=silence.group_payload,
+        # The dataless set is every never-sent symmetry address in the
+        # catalog — a thousand of them, normal, and already counted by the
+        # measurement's scope_drops record. The ones actually held open are
+        # `stale_opens` in the run record.
+        warn_dataless=False,
     ),
 }
 
@@ -144,271 +146,6 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, Kind[Any, Any]] = {
         payload=drift.payload_recovery,
     ),
 }
-
-
-@dataclass(frozen=True, slots=True)
-class ChannelReport:
-    """One open silent channel inside a group publish — the payload names
-    the exact channel, silent since when, and how far past its pause.
-    """
-
-    ga: str
-    name: str
-    silent_since: datetime | None
-    severity: int
-    gap_hours: float | None
-
-
-@dataclass(frozen=True, slots=True)
-class GroupPublish:
-    main_group: int
-    severity: int
-    channels: tuple[ChannelReport, ...]
-
-    @property
-    def subject(self) -> str:
-        return str(self.main_group)
-
-    @property
-    def entity(self) -> str:
-        return str(self.main_group)
-
-
-RunPlan = Plan[GroupPublish]
-
-
-def plan_run(
-    *,
-    episodes: Sequence[Episode],
-    open_rows: Sequence[OpenEpisodeRow],
-    states_by_ga: Mapping[str, SilenceState],
-    dataless: frozenset[str],
-    frontier: datetime,
-) -> RunPlan:
-    """The shared reconciliation, delivered per main group — the one thing
-    channel silence does not share with the other kinds.
-
-    A group publishes when its severity moved or its set of open channels
-    changed: a second channel going silent at the same tier still gets named
-    on the bus.
-    """
-    result = reconcile(
-        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
-    )
-    # The fold leaves at most one open episode per subject, and it is the
-    # one the reconciliation carried into `after`.
-    open_episodes = {e.subject: e for e in episodes if e.ended_at is None}
-    reports: dict[str, ChannelReport] = {}
-    for subject, severity in result.after.items():
-        episode = open_episodes.get(subject)
-        if episode is None:
-            # Kept open for want of data: nothing measured it this run, so
-            # there is no gap to report — only the address and the tier it
-            # still carries.
-            reports[subject] = ChannelReport(
-                ga=subject, name=subject, silent_since=None, severity=severity, gap_hours=None
-            )
-            continue
-        state = states_by_ga[subject]
-        reports[subject] = ChannelReport(
-            ga=subject,
-            name=state.channel.name,
-            silent_since=state.silent_since,
-            severity=severity,
-            gap_hours=episode.evidence[-1].value if episode.evidence else None,
-        )
-
-    before = _group_state((row.subject, row.severity) for row in open_rows)
-    after = _group_state((subject, report.severity) for subject, report in reports.items())
-
-    publishes: list[GroupPublish] = []
-    for group in sorted(set(before) | set(after)):
-        severity, _ = after.get(group, (0, frozenset()))
-        if after.get(group) == before.get(group):
-            continue
-        channels = sorted(
-            (r for r in reports.values() if main_group(r.ga) == group),
-            key=lambda r: (-r.severity, -(r.gap_hours or 0.0), r.ga),
-        )
-        publishes.append(GroupPublish(group, severity, tuple(channels)))
-
-    return plan_from(result, publishes)
-
-
-def _group_state(
-    subject_severities: Iterable[tuple[str, int]],
-) -> dict[int, tuple[int, frozenset[str]]]:
-    """Per main group: the maximum severity and the set of open subjects —
-    the two things whose change warrants a publish."""
-    severities: dict[int, int] = {}
-    subjects: dict[int, set[str]] = {}
-    for subject, severity in subject_severities:
-        group = main_group(subject)
-        severities[group] = max(severities.get(group, 0), severity)
-        subjects.setdefault(group, set()).add(subject)
-    return {g: (severities[g], frozenset(subjects[g])) for g in severities}
-
-
-def _group_payload(publish: GroupPublish) -> dict[str, Any]:
-    """Channel silence: how many channels in the group are open, and which."""
-    return {
-        "open_channels": len(publish.channels),
-        "channels": [
-            {
-                "ga": report.ga,
-                "name": report.name,
-                "silent_since": report.silent_since,
-                "severity": report.severity,
-                "gap_hours": report.gap_hours,
-            }
-            for report in publish.channels
-        ],
-    }
-
-
-def _candidates(
-    kept: list[Channel],
-    stats_by_ga: Mapping[str, silence.ChannelStats],
-    open_rows: Sequence[OpenEpisodeRow],
-    gap_factor: float,
-    frontier: datetime,
-    *,
-    everything: bool,
-) -> list[Channel]:
-    """Channels whose bucket series is worth fetching: possibly silent (the
-    current gap exceeds the threshold at the tightest possible pause) or
-    carrying an open episode. A dry run fetches everything so historical
-    episodes are counted too.
-    """
-    if everything:
-        return kept
-    open_subjects = {row.subject for row in open_rows}
-    return [
-        channel
-        for channel in kept
-        if channel.ga in open_subjects
-        or frontier - stats_by_ga[channel.ga].last_bucket > gap_factor * BUCKET
-    ]
-
-
-def _log_drops(drops: Mapping[ChannelState, list[Channel]]) -> None:
-    dead = drops[ChannelState.DEAD]
-    never_sent = drops[ChannelState.NEVER_SENT]
-    if dead or never_sent:
-        # Dead registers are the actionable list; never-sent is the normal
-        # symmetry-address case and stays a count at info level.
-        log.info(
-            "scope_drops",
-            never_sent=len(never_sent),
-            dead=len(dead),
-            dead_channels=[c.ga for c in dead],
-        )
-    if never_sent:
-        log.debug("scope_drops_never_sent", channels=[c.ga for c in never_sent])
-
-
-def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    """Channel silence: measured per channel like the other kinds, delivered
-    per main group, which is why it runs its own loop.
-    """
-    if fault.target is None or fault.target.form != "per_main_group":
-        raise ValueError(f"fault {fault.name}: silence delivery needs a per_main_group target")
-    gap_factor = float(fault.parameters["gap_factor"])
-    gap_quantile = float(fault.parameters["gap_quantile"])
-    policy = EpisodePolicy()
-
-    with read_connection(settings) as conn:
-        frontier = silence.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window = Window(start=frontier - LOOKBACK, frontier=frontier, policy=policy)
-        channels = silence.resolve_scope(conn, fault.channel_scope())
-        stats_by_ga = silence.channel_stats(conn, window.start)
-        kept, drops = silence.drop_unmeasurable(channels, stats_by_ga)
-        _log_drops(drops)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        candidates = _candidates(
-            kept, stats_by_ga, open_rows, gap_factor, frontier, everything=dry_run
-        )
-        series = silence.bucket_series(conn, [c.ga for c in candidates], window.start)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    states: dict[str, SilenceState] = {}
-    observations: list[Observation] = []
-    for channel in candidates:
-        buckets = series.get(channel.ga, [])
-        state = silence.classify(
-            channel,
-            buckets,
-            frontier=frontier,
-            gap_factor=gap_factor,
-            gap_quantile=gap_quantile,
-        )
-        states[channel.ga] = state
-        if state.pause is not None:
-            observations.extend(
-                silence.silence_observations(
-                    channel.ga, buckets, state.pause, gap_factor, frontier
-                )
-            )
-
-    # A silence measurement ends at the frontier by construction: the gap
-    # walk runs right up to it for every channel whose own pause could be
-    # estimated. A channel that sent too little to show one was not measured
-    # at all, which is not the same as recovered.
-    measured_through = {
-        ga: frontier
-        for ga, stats in stats_by_ga.items()
-        if stats.buckets >= MIN_PAUSE_BUCKETS
-    }
-    # Deliberately without the per-subject kinds' dataless warning: here the
-    # set is every never-sent symmetry address in the catalog — a thousand of
-    # them, normal, and already counted by `_log_drops`. The ones it actually
-    # holds open are `stale_opens` in the run record below.
-    dataless = frozenset(
-        channel.ga
-        for channel in channels
-        if not window.reaches(measured_through.get(channel.ga))
-    )
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, observations, history_scores, policy, frontier
-    )
-    plan = plan_run(
-        episodes=episodes,
-        open_rows=open_rows,
-        states_by_ga=states,
-        dataless=dataless,
-        frontier=frontier,
-    )
-
-    log.info(
-        "channel_silence_run",
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        channels=len(kept),
-        candidates=len(candidates),
-        silent=sum(1 for s in states.values() if s.state is ChannelState.SILENT),
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        stale_opens=list(plan.stale_opens),
-        publishes=len(plan.publishes),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        log_dry_run(fault, episodes, plan, {c.ga: c.name for c in channels})
-        return
-
-    publish_subjects(NatsPublisher(settings), fault.name, plan.publishes, _group_payload)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
 
 def _publish_volume(
@@ -598,8 +335,6 @@ def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     kind = _subject_kind(fault)
     if kind is not None:
         run_subjects(DbStore(settings), NatsPublisher(settings), fault, kind, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.SILENCE:
-        _run_silence(settings, fault, dry_run=dry_run)
     elif fault.kind is MeasurementKind.VOLUME:
         _run_volume(settings, fault, dry_run=dry_run)
     elif fault.kind is MeasurementKind.EXTERNAL:
