@@ -1,9 +1,9 @@
 """Duration-measurement tests — the `duration` kind against invented series.
 
 Every test feeds invented active buckets and asserts only what comes out:
-observations with their scores, the current-run state, a reconciliation
-plan, or a resolution error naming the device. No cluster, no live
-database.
+observations with their scores, the current-run state, the published
+payload, or a resolution error naming the device. The shared
+reconciliation is `test_reconcile`'s; no cluster, no live database.
 """
 
 from __future__ import annotations
@@ -16,21 +16,12 @@ from iot_insights_engine.duration import (
     Device,
     DevicePublish,
     DeviceState,
-    DurationPlan,
     classify,
     duration_observations,
-    plan_run,
+    publish_for,
     resolve_devices,
 )
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import (
-    Episode,
-    EpisodePolicy,
-    EventKind,
-    EvidenceRow,
-    NotificationEvent,
-    fold_observations,
-)
+from iot_insights_engine.episodes import EpisodePolicy, fold_observations
 from iot_insights_engine.faults import DeviceLimit
 from iot_insights_engine.silence import Channel
 
@@ -134,8 +125,6 @@ class TestState:
         assert s.running_since is None
 
 
-_FRONTIER = _T0 + 8 * _HOUR
-
 _WASHER_DEVICE = Device(
     ga="2/1/197",
     name=_WASHER.name,
@@ -144,58 +133,13 @@ _WASHER_DEVICE = Device(
 )
 
 
-def _episode(subject: str, severity: int, *, ended: bool = False) -> Episode:
-    start = _T0 + 6 * _HOUR
-    evidence = (
-        EvidenceRow(time=start, score=1.25, severity=severity, value=5.0),
-        EvidenceRow(time=start + _HOUR, score=1.5, severity=severity, value=6.0),
-    )
-    events = [NotificationEvent(EventKind.APPEARED, start, severity)]
-    ended_at = None
-    if ended:
-        ended_at = start + 5 * _HOUR
-        events.append(NotificationEvent(EventKind.ENDED, ended_at, 0))
-    return Episode(
-        fault="appliance_runtime",
-        subject=subject,
-        started_at=start,
-        last_seen_at=start + _HOUR,
-        ended_at=ended_at,
-        severity=severity,
-        peak_score=1.5,
-        evidence=evidence,
-        events=tuple(events),
-    )
-
-
 def _running(device: Device, hours: float) -> DeviceState:
     return DeviceState(device, running_since=_T0, run_hours=hours)
 
 
-class TestPlanRun:
-    def _plan(
-        self,
-        episodes: list[Episode],
-        open_rows: list[OpenEpisodeRow],
-        states: dict[str, DeviceState] | None = None,
-        dataless: frozenset[str] = frozenset(),
-    ) -> DurationPlan:
-        return plan_run(
-            episodes=episodes,
-            open_rows=open_rows,
-            states_by_ga=states
-            if states is not None
-            else {"2/1/197": _running(_WASHER_DEVICE, 6.0)},
-            dataless=dataless,
-            frontier=_FRONTIER,
-        )
-
-    def test_new_overlong_run_is_inserted_and_published(self) -> None:
-        episode = _episode("2/1/197", severity=1)
-        plan = self._plan([episode], open_rows=[])
-        assert plan.inserts == (episode,)
-        assert plan.updates == ()
-        (publish,) = plan.publishes
+class TestPublishFor:
+    def test_the_payload_names_the_device_its_run_and_its_limit(self) -> None:
+        publish = publish_for("2/1/197", 1, _running(_WASHER_DEVICE, 6.0))
         assert publish == DevicePublish(
             ga="2/1/197",
             severity=1,
@@ -205,56 +149,20 @@ class TestPlanRun:
             run_hours=6.0,
             limit_hours=4.0,
         )
+        assert publish.subject == "2/1/197"
+        assert publish.entity == "2-1-197"
 
-    def test_ongoing_episode_with_unchanged_severity_publishes_nothing(self) -> None:
-        episode = _episode("2/1/197", severity=1)
-        row = OpenEpisodeRow(id=7, subject="2/1/197", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.inserts == ()
-        assert plan.updates == ((7, episode),)
-        assert plan.publishes == ()
-
-    def test_escalation_publishes_the_new_severity(self) -> None:
-        episode = _episode("2/1/197", severity=2)
-        row = OpenEpisodeRow(id=7, subject="2/1/197", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        (publish,) = plan.publishes
-        assert publish.severity == 2
-
-    def test_stored_severity_is_never_lowered(self) -> None:
-        episode = _episode("2/1/197", severity=1)
-        row = OpenEpisodeRow(id=7, subject="2/1/197", severity=2)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.publishes == ()
-
-    def test_recovery_publishes_zero_and_reconciles_the_ended_episode(self) -> None:
-        episode = _episode("2/1/197", severity=1, ended=True)
-        row = OpenEpisodeRow(id=7, subject="2/1/197", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.updates == ((7, episode),)
-        (publish,) = plan.publishes
-        assert publish.severity == 0
-        assert publish.ga == "2/1/197"
-
-    def test_open_row_without_computed_counterpart_is_closed_at_frontier(self) -> None:
-        row = OpenEpisodeRow(id=9, subject="2/1/197", severity=1)
-        plan = self._plan([], open_rows=[row])
-        assert plan.orphan_closes == ((9, _FRONTIER),)
-        (publish,) = plan.publishes
-        assert publish.severity == 0
-
-    def test_device_outliving_the_window_stays_open(self) -> None:
-        row = OpenEpisodeRow(id=9, subject="2/1/197", severity=2)
-        plan = self._plan([], open_rows=[row], dataless=frozenset({"2/1/197"}))
-        assert plan.orphan_closes == ()
-        assert plan.stale_opens == ("2/1/197",)
-        assert plan.publishes == ()
-
-    def test_historical_ended_episode_without_open_row_is_ignored(self) -> None:
-        plan = self._plan([_episode("2/1/197", severity=1, ended=True)], open_rows=[])
-        assert plan.inserts == ()
-        assert plan.updates == ()
-        assert plan.publishes == ()
+    def test_a_device_that_left_the_scope_still_gets_its_clear(self) -> None:
+        publish = publish_for("2/1/197", 0, None)
+        assert publish == DevicePublish(
+            ga="2/1/197",
+            severity=0,
+            device="2/1/197",
+            name="2/1/197",
+            running_since=None,
+            run_hours=None,
+            limit_hours=None,
+        )
 
 
 def test_four_hour_run_becomes_one_episode_with_few_events() -> None:

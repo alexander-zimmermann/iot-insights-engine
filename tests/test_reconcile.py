@@ -70,6 +70,29 @@ class TestAfter:
         assert result.stale_opens == ("2/2/227",)
         assert result.moved == ()
 
+    def test_an_escalation_moves_to_the_new_severity(self) -> None:
+        result = reconcile(
+            episodes=[_episode("2/2/227", 2)],
+            open_rows=[OpenEpisodeRow(id=7, subject="2/2/227", severity=1)],
+            dataless=frozenset(),
+            frontier=_FRONTIER,
+        )
+        assert dict(result.after) == {"2/2/227": 2}
+        assert result.moved == (("2/2/227", 2),)
+
+    def test_an_ended_episode_without_a_row_changes_nothing(self) -> None:
+        # Only open computed episodes materialize as new rows; a historical
+        # ended episode matters only to the open row it reconciles.
+        result = reconcile(
+            episodes=[_episode("2/2/227", 1, ended=True)],
+            open_rows=[],
+            dataless=frozenset(),
+            frontier=_FRONTIER,
+        )
+        assert result.inserts == ()
+        assert result.updates == ()
+        assert result.moved == ()
+
     def test_an_ended_episode_leaves_after_and_moves_to_zero(self) -> None:
         result = reconcile(
             episodes=[_episode("2/2/227", 1, ended=True)],

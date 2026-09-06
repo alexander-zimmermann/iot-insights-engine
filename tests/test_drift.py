@@ -2,8 +2,9 @@
 
 Every test feeds an invented series and asserts only what comes out: the
 level the signal reads (a standby valley, a duty cycle), the accumulation,
-observations with their scores, the current state, a reconciliation plan,
-or a resolution error naming the device. No cluster, no live database.
+observations with their scores, the current state, the published payload,
+or a resolution error naming the device. The shared reconciliation is
+`test_reconcile`'s; no cluster, no live database.
 
 The load-bearing cases are the two the z-score provably could not tell
 apart: a slow ramp must fire, and a small permanent step must never fire,
@@ -22,7 +23,6 @@ from iot_insights_engine.drift import (
     Device,
     DevicePublish,
     DeviceState,
-    DriftPlan,
     Exchanger,
     ExchangerPublish,
     ExchangerState,
@@ -37,16 +37,14 @@ from iot_insights_engine.drift import (
     duty_cycles,
     efficiency_series,
     min_window_samples,
-    plan_run,
+    publish_for,
     publish_for_exchanger,
     reaches_frontier,
     resolve_devices,
     resolve_exchanger,
     standby_floors,
 )
-from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import (
-    Episode,
     EpisodePolicy,
     Observation,
     fold_observations,
@@ -467,85 +465,36 @@ class TestResolveDevices:
             resolve_devices([_FREEZER, _WASHER], _REFERENCES[:1])
 
 
-class TestPlanRun:
-    def _episode(self, subject: str, *, ended: bool, severity: int = 1) -> Episode:
-        return Episode(
-            fault="appliance_standby",
-            subject=subject,
-            started_at=_T0,
-            last_seen_at=_T0 + 5 * _HOUR,
-            ended_at=_T0 + 9 * _HOUR if ended else None,
-            severity=severity,
-            peak_score=11.3,
-            evidence=(),
-            events=(),
-        )
-
-    def test_an_open_episode_without_a_row_is_inserted_and_published(self) -> None:
+class TestPublishFor:
+    def test_the_payload_names_the_device_and_its_numbers(self) -> None:
         device = _device(_FREEZER, _REFERENCES[1])
         state = DeviceState(device, level=500.0, excess=452.0, rising_since=_T0)
-        plan = plan_run(
-            episodes=[self._episode(_FREEZER.ga, ended=False)],
-            open_rows=[],
-            states_by_ga={_FREEZER.ga: state},
-            dataless=frozenset(),
-            frontier=_T0 + 9 * _HOUR,
+        publish = publish_for(_FREEZER.ga, 1, state)
+        assert publish == DevicePublish(
+            ga=_FREEZER.ga,
+            severity=1,
+            device=device.label,
+            name=device.name,
+            level=500.0,
+            healthy=48.0,
+            excess=452.0,
+            rising_since=_T0,
         )
-        assert plan == DriftPlan(
-            inserts=(self._episode(_FREEZER.ga, ended=False),),
-            updates=(),
-            orphan_closes=(),
-            stale_opens=(),
-            publishes=(
-                DevicePublish(
-                    ga=_FREEZER.ga,
-                    severity=1,
-                    device=device.label,
-                    name=device.name,
-                    level=500.0,
-                    healthy=48.0,
-                    excess=452.0,
-                    rising_since=_T0,
-                ),
-            ),
-        )
+        assert publish.subject == _FREEZER.ga
+        assert publish.entity == "2-2-227"
 
-    def test_a_recovered_device_closes_its_row_and_publishes_the_clear(self) -> None:
-        device = _device(_FREEZER, _REFERENCES[1])
-        plan = plan_run(
-            episodes=[],
-            open_rows=[OpenEpisodeRow(id=7, subject=_FREEZER.ga, severity=2)],
-            states_by_ga={_FREEZER.ga: DeviceState(device, level=48.0, excess=0.0)},
-            dataless=frozenset(),
-            frontier=_T0 + 9 * _HOUR,
+    def test_a_device_that_left_the_scope_still_gets_its_clear(self) -> None:
+        publish = publish_for(_FREEZER.ga, 0, None)
+        assert publish == DevicePublish(
+            ga=_FREEZER.ga,
+            severity=0,
+            device=_FREEZER.ga,
+            name=_FREEZER.ga,
+            level=None,
+            healthy=None,
+            excess=None,
+            rising_since=None,
         )
-        assert plan.orphan_closes == ((7, _T0 + 9 * _HOUR),)
-        assert [(p.ga, p.severity) for p in plan.publishes] == [(_FREEZER.ga, 0)]
-
-    def test_a_device_without_data_keeps_its_open_row(self) -> None:
-        plan = plan_run(
-            episodes=[],
-            open_rows=[OpenEpisodeRow(id=7, subject=_FREEZER.ga, severity=2)],
-            states_by_ga={},
-            dataless=frozenset({_FREEZER.ga}),
-            frontier=_T0 + 9 * _HOUR,
-        )
-        assert plan.orphan_closes == ()
-        assert plan.stale_opens == (_FREEZER.ga,)
-        assert plan.publishes == ()
-
-    def test_a_stored_severity_is_never_lowered(self) -> None:
-        device = _device(_FREEZER, _REFERENCES[1])
-        state = DeviceState(device, level=500.0, excess=452.0, rising_since=_T0)
-        plan = plan_run(
-            episodes=[self._episode(_FREEZER.ga, ended=False, severity=1)],
-            open_rows=[OpenEpisodeRow(id=7, subject=_FREEZER.ga, severity=3)],
-            states_by_ga={_FREEZER.ga: state},
-            dataless=frozenset(),
-            frontier=_T0 + 9 * _HOUR,
-        )
-        assert plan.updates == ((7, self._episode(_FREEZER.ga, ended=False, severity=1)),)
-        assert plan.publishes == ()
 
 
 # The recovery seam's invented numbers — the deployed fault declares its own
