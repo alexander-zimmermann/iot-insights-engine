@@ -53,6 +53,9 @@ class DriftSignal(StrEnum):
     # The share of the day a compressor runs, in percent: an evaporator
     # icing up makes the same cold cost more running.
     DUTY_CYCLE = "duty_cycle"
+    # The heat-recovery efficiency of an air exchanger, in percent: the one
+    # signal that walks downward — fouling lowers what the exchanger can do.
+    RECOVERY = "recovery"
 
 
 # What each signal calls its declared healthy level. The unit is in the
@@ -61,14 +64,17 @@ class DriftSignal(StrEnum):
 _HEALTHY_FIELD = {
     DriftSignal.STANDBY: "healthy_ma",
     DriftSignal.DUTY_CYCLE: "healthy_duty_pct",
+    DriftSignal.RECOVERY: "healthy_pct",
 }
 
 # And what each signal calls the numbers it walks by. The schema requires
-# its own; this is what makes the other signal's an error rather than a
-# line that sits there looking authoritative while nothing reads it.
+# its own; this is what makes another signal's an error rather than a
+# line that sits there looking authoritative while nothing reads it. A
+# name two signals share (the budget in percent-hours) is no one's error.
 _SIGNAL_PARAMETERS = {
     DriftSignal.STANDBY: ("rise_ma", "budget_ma_h"),
     DriftSignal.DUTY_CYCLE: ("rise_pct", "budget_pct_h", "door_run_hours", "on_ma"),
+    DriftSignal.RECOVERY: ("fall_pct", "budget_pct_h", "min_delta_k"),
 }
 
 
@@ -164,6 +170,19 @@ class Roles:
 
 
 @dataclass(frozen=True, slots=True)
+class ExchangerRoles:
+    """The recovery signal's channel roles, each a catalog-name LIKE pattern
+    matched against the scope: which air is which decides the sign of every
+    efficiency the fault computes, so the file says it instead of the code
+    guessing from the names.
+    """
+
+    outdoor: str
+    extract: str
+    supply: str
+
+
+@dataclass(frozen=True, slots=True)
 class RoomRule:
     """One room's declared rule: a unique fragment of its catalog names, the
     channel it is measured on, and the gap under the reference it may not
@@ -209,7 +228,7 @@ class Fault:
     dormant: Dormant | None = None
     devices: tuple[DeviceLimit, ...] = ()
     references: tuple[DeviceReference, ...] = ()
-    roles: Roles | None = None
+    roles: Roles | ExchangerRoles | None = None
     rooms: tuple[RoomRule, ...] = ()
 
     def channel_scope(self) -> Scope:
@@ -343,22 +362,33 @@ def _check_devices(raw: dict[str, Any]) -> str | None:
 
 def _check_references(raw: dict[str, Any]) -> str | None:
     """Healthy references belong to the drift kind alone; anywhere else they
-    would be dead configuration nothing reads. Checked in the loader because
-    the schema's false-subschema error loses the field name.
+    would be dead configuration nothing reads. The recovery signal declares
+    exactly one — its subject is the one exchanger, not a fleet of devices.
+    Checked in the loader because the schema's false-subschema error loses
+    the field name.
     """
     if raw["kind"] != MeasurementKind.DRIFT and "references" in raw:
         return (
             f"fault {raw['name']!r}: references: "
             f"only a drift fault declares healthy references"
         )
+    if (
+        raw["kind"] == MeasurementKind.DRIFT
+        and raw.get("signal") == DriftSignal.RECOVERY
+        and len(raw.get("references", {})) != 1
+    ):
+        return (
+            f"fault {raw['name']!r}: references: "
+            f"a recovery fault declares exactly one exchanger"
+        )
     return None
 
 
 def _check_signal(raw: dict[str, Any]) -> str | None:
     """The signal belongs to the drift kind alone, and it owns the unit of
-    every number the fault walks by: a fault switched from one signal to the
-    other must lose the parameters of the one it left. Checked in the loader
-    because the schema's false-subschema error loses the field name.
+    every number the fault walks by: a fault switched from one signal to
+    another must lose the parameters of the one it left. Checked in the
+    loader because the schema's false-subschema error loses the field name.
     """
     if raw["kind"] != MeasurementKind.DRIFT:
         if "signal" in raw:
@@ -368,12 +398,13 @@ def _check_signal(raw: dict[str, Any]) -> str | None:
             )
         return None
     signal = DriftSignal(raw["signal"])
+    mine = set(_SIGNAL_PARAMETERS[signal])
     foreign = {
         name: other
         for other, names in _SIGNAL_PARAMETERS.items()
         if other is not signal
         for name in names
-        if name in raw["parameters"]
+        if name not in mine and name in raw["parameters"]
     }
     if foreign:
         named = ", ".join(f"{name} belongs to {other}" for name, other in sorted(foreign.items()))
@@ -381,19 +412,31 @@ def _check_signal(raw: dict[str, Any]) -> str | None:
     return None
 
 
-def _check_rooms(raw: dict[str, Any]) -> str | None:
-    """Roles and per-room rules belong to the deviation kind alone, and a
-    gate role needs its threshold (and the other way round) — half a gate
-    would silently measure ungated. Checked in the loader because the
-    schema's false-subschema error loses the field name.
+def _roles_owner(raw: dict[str, Any]) -> bool:
+    """Whether this fault's kind (and signal) declares channel roles at all:
+    the deviation kind's reference and gate, or the recovery signal's airs.
     """
+    return raw["kind"] == MeasurementKind.DEVIATION or (
+        raw["kind"] == MeasurementKind.DRIFT and raw.get("signal") == DriftSignal.RECOVERY
+    )
+
+
+def _check_rooms(raw: dict[str, Any]) -> str | None:
+    """Roles belong to the deviation kind and the recovery signal, per-room
+    rules to the deviation kind alone; anywhere else they would be dead
+    configuration nothing reads. A deviation gate role needs its threshold
+    (and the other way round) — half a gate would silently measure ungated.
+    Checked in the loader because the schema's false-subschema error loses
+    the field name.
+    """
+    if not _roles_owner(raw) and "roles" in raw:
+        return (
+            f"fault {raw['name']!r}: roles: only a deviation fault or a "
+            f"recovery drift declares channel roles"
+        )
     if raw["kind"] != MeasurementKind.DEVIATION:
-        for field in ("roles", "rooms"):
-            if field in raw:
-                return (
-                    f"fault {raw['name']!r}: {field}: "
-                    f"only a deviation fault declares channel roles and rooms"
-                )
+        if "rooms" in raw:
+            return f"fault {raw['name']!r}: rooms: only a deviation fault declares rooms"
         return None
     has_gate = "gate" in raw["roles"]
     has_gate_min = "gate_min_pct" in raw.get("parameters", {})
@@ -420,6 +463,22 @@ def _parse_references(
         DeviceReference(match=match, healthy=reference[field])
         for match, reference in raw.get("references", {}).items()
     )
+
+
+def _parse_roles(
+    roles: dict[str, Any] | None, signal: DriftSignal | None
+) -> Roles | ExchangerRoles | None:
+    """The declared channel roles in the shape their owner gives them — the
+    checks above already pinned roles to the deviation kind or the recovery
+    signal, so the signal alone decides which shape this is.
+    """
+    if roles is None:
+        return None
+    if signal is DriftSignal.RECOVERY:
+        return ExchangerRoles(
+            outdoor=roles["outdoor"], extract=roles["extract"], supply=roles["supply"]
+        )
+    return Roles(reference=roles["reference"], gate=roles.get("gate"))
 
 
 def _parse_fault(raw: dict[str, Any]) -> Fault:
@@ -459,11 +518,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
             for match, limit in raw.get("devices", {}).items()
         ),
         references=_parse_references(raw, signal),
-        roles=(
-            Roles(reference=roles["reference"], gate=roles.get("gate"))
-            if roles is not None
-            else None
-        ),
+        roles=_parse_roles(roles, signal),
         rooms=tuple(
             RoomRule(match=match, min_gap_k=rule["min_gap_k"], value=rule["value"])
             for match, rule in raw.get("rooms", {}).items()

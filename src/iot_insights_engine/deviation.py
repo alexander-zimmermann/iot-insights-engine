@@ -29,17 +29,17 @@ unit. Like silence and duration, time is the aggregate's own frontier.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .episodes import Observation
+from .faults import Roles
 from .logging_setup import get_logger
 from .nats_publisher import slugify
 from .reconcile import Measured, Plan, Window, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, DEAD_MIN_BUCKETS, resolve_scope
+from .silence import BUCKET, DEAD_MIN_BUCKETS, like_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
     from .episode_store import OpenEpisodeRow
     from .episodes import Episode
-    from .faults import Fault, Roles, RoomRule
+    from .faults import Fault, RoomRule
     from .silence import Channel
 
 log = get_logger(__name__)
@@ -103,14 +103,6 @@ class RoomState:
     gate: float | None = None
 
 
-def _like(pattern: str, name: str) -> bool:
-    """SQL LIKE against a full name (`%` any run, `_` any character) — the
-    same dialect the scope's catalog query speaks, so a role pattern reads
-    like a scope line."""
-    regex = ".*".join(re.escape(part).replace("_", ".") for part in pattern.split("%"))
-    return re.fullmatch(regex, name) is not None
-
-
 def resolve_rooms(
     channels: Sequence[Channel], rules: Sequence[RoomRule], roles: Roles
 ) -> list[Room]:
@@ -148,7 +140,7 @@ def resolve_rooms(
                     ("reference", roles.reference),
                     ("gate", roles.gate),
                 )
-                if pattern is not None and _like(pattern, channel.name)
+                if pattern is not None and like_match(pattern, channel.name)
             ]
             if len(hits) != 1:
                 problems.append(
@@ -401,7 +393,7 @@ def measure(
     scope, then the dense series, the cold buckets and the observations per
     room.
     """
-    if fault.roles is None:
+    if not isinstance(fault.roles, Roles):
         raise ValueError(f"fault {fault.name}: the deviation kind needs declared roles")
     min_hours = float(fault.parameters["min_hours"])
     gate_min = fault.parameters.get("gate_min_pct")

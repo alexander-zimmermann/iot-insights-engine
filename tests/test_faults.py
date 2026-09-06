@@ -19,6 +19,7 @@ from iot_insights_engine.faults import (
     DeviceReference,
     Dormant,
     DriftSignal,
+    ExchangerRoles,
     FaultList,
     MeasurementKind,
     Roles,
@@ -798,6 +799,119 @@ def test_a_reference_in_the_other_signal_unit_rejected(tmp_path: Path) -> None:
     standby = _DRIFT.replace("healthy_ma: 48", "healthy_duty_pct: 48")
     with pytest.raises(ValueError, match=r"'appliance_standby'.*Gefrierschrank"):
         FaultList.load(_write(tmp_path, standby))
+
+
+_RECOVERY = """
+faults:
+  - name: heat_recovery_decay
+    sentence: "Der Wärmetauscher der KWL holt dauerhaft mehr als 10
+      Prozentpunkte weniger Wärme zurück als im gesunden Zustand."
+    unit: "× des erlaubten Abfalls"
+    kind: drift
+    signal: recovery
+    parameters:
+      fall_pct: 10
+      budget_pct_h: 480
+      window_hours: 72
+      min_window_fraction: 0.1
+      min_delta_k: 10
+    roles:
+      outdoor: "%.KWL.Temperatur-Außenluft"
+      extract: "%.KWL.Temperatur-Abluft"
+      supply: "%.KWL.Temperatur-Zuluft"
+    scope:
+      name_like:
+        - "%.KWL.Temperatur-Außenluft"
+        - "%.KWL.Temperatur-Abluft"
+        - "%.KWL.Temperatur-Zuluft"
+    references:
+      KWL:
+        healthy_pct: 88
+    target:
+      ga: "15/3/34"
+"""
+
+
+def test_recovery_drift_loads_roles_and_reference(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _RECOVERY))
+    assert fault.kind is MeasurementKind.DRIFT
+    assert fault.signal is DriftSignal.RECOVERY
+    assert fault.roles == ExchangerRoles(
+        outdoor="%.KWL.Temperatur-Außenluft",
+        extract="%.KWL.Temperatur-Abluft",
+        supply="%.KWL.Temperatur-Zuluft",
+    )
+    assert fault.references == (DeviceReference(match="KWL", healthy=88),)
+    assert fault.target is not None
+    assert fault.target.ga == "15/3/34"
+
+
+def test_recovery_drift_requires_its_roles(tmp_path: Path) -> None:
+    # Which channel is which air decides the sign of every efficiency the
+    # fault computes; a recovery fault that does not say it is not loadable.
+    head, _roles = _RECOVERY.split("    roles:\n", 1)
+    body = head + "    scope:" + _RECOVERY.split("    scope:", 1)[1]
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*roles"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_recovery_drift_requires_its_gate(tmp_path: Path) -> None:
+    # Without the delta gate the efficiency is a quotient of noise whenever
+    # inside and outside agree.
+    body = _RECOVERY.replace("      min_delta_k: 10\n", "")
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*min_delta_k"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_recovery_drift_declares_exactly_one_exchanger(tmp_path: Path) -> None:
+    body = _RECOVERY.replace(
+        "      KWL:\n        healthy_pct: 88\n",
+        "      KWL:\n        healthy_pct: 88\n      KWL2:\n        healthy_pct: 88\n",
+    )
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*references"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_recovery_reference_in_another_signal_unit_rejected(tmp_path: Path) -> None:
+    body = _RECOVERY.replace("healthy_pct: 88", "healthy_duty_pct: 88")
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*KWL"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_recovery_parameter_in_another_signal_unit_rejected(tmp_path: Path) -> None:
+    # rise_pct belongs to the duty-cycle walk; the recovery walk falls.
+    body = _RECOVERY.replace(
+        "      fall_pct: 10\n", "      fall_pct: 10\n      rise_pct: 15\n"
+    )
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*rise_pct"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_fall_parameter_on_another_signal_rejected(tmp_path: Path) -> None:
+    body = _DRIFT.replace("      rise_ma: 40\n", "      rise_ma: 40\n      fall_pct: 10\n")
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*fall_pct"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_roles_on_a_standby_drift_rejected(tmp_path: Path) -> None:
+    # Standby walks one declared channel per device; air roles on it would
+    # be dead configuration nothing reads.
+    body = _DRIFT.replace(
+        "    scope:\n",
+        '    roles:\n      outdoor: "%.Temperatur-Außenluft"\n    scope:\n',
+    )
+    with pytest.raises(ValueError, match=r"'appliance_standby'.*roles"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_rooms_on_a_recovery_drift_rejected(tmp_path: Path) -> None:
+    body = _RECOVERY.replace(
+        "    scope:\n",
+        "    rooms:\n      EG.Büro:\n        min_gap_k: 1.0\n"
+        '        value: "Sensorik.EG.Büro.Sensor.Temperatur"\n    scope:\n',
+    )
+    with pytest.raises(ValueError, match=r"'heat_recovery_decay'.*rooms"):
+        FaultList.load(_write(tmp_path, body))
 
 
 _DEVIATION = """

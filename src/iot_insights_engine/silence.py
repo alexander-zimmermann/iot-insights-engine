@@ -29,6 +29,7 @@ those channels (`pair_by_match`).
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -200,6 +201,14 @@ def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
     measured against."""
     row = conn.execute("SELECT max(bucket) AS frontier FROM knx_1h").fetchone()
     return row["frontier"] if row else None
+
+
+def like_match(pattern: str, name: str) -> bool:
+    """SQL LIKE against a full name (`%` any run, `_` any character) — the
+    same dialect the scope's catalog query speaks, so a role pattern reads
+    like a scope line."""
+    regex = ".*".join(re.escape(part).replace("_", ".") for part in pattern.split("%"))
+    return re.fullmatch(regex, name) is not None
 
 
 def resolve_scope(conn: psycopg.Connection[DictRow], scope: Scope) -> list[Channel]:

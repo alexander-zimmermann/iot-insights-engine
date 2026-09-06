@@ -23,16 +23,25 @@ from iot_insights_engine.drift import (
     DevicePublish,
     DeviceState,
     DriftPlan,
+    Exchanger,
+    ExchangerPublish,
+    ExchangerState,
     OnTime,
     accumulate,
+    accumulate_fall,
+    capability_levels,
     classify,
+    classify_exchanger,
     door_hours,
     drift_observations,
     duty_cycles,
+    efficiency_series,
     min_window_samples,
     plan_run,
+    publish_for_exchanger,
     reaches_frontier,
     resolve_devices,
+    resolve_exchanger,
     standby_floors,
 )
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -42,7 +51,7 @@ from iot_insights_engine.episodes import (
     Observation,
     fold_observations,
 )
-from iot_insights_engine.faults import DeviceReference
+from iot_insights_engine.faults import DeviceReference, ExchangerRoles
 from iot_insights_engine.silence import Channel
 
 _T0 = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
@@ -537,3 +546,325 @@ class TestPlanRun:
         )
         assert plan.updates == ((7, self._episode(_FREEZER.ga, ended=False, severity=1)),)
         assert plan.publishes == ()
+
+
+# The declared numbers of the heat_recovery_decay fault: a healthy exchanger
+# recovers 88 % of the gradient, 10 points less is the line, and hours where
+# inside and outside are within 10 K of each other measure nothing.
+_KWL_HEALTHY = 88.0
+_FALL = 10.0
+_FALL_BUDGET = 480.0
+_RECOVERY_WINDOW = timedelta(hours=72)
+_RECOVERY_COVERAGE = min_window_samples(_RECOVERY_WINDOW, 0.1)
+_MIN_DELTA = 10.0
+
+_OUTDOOR = Channel(
+    ga="15/3/28", name="Versorgungstechnik.KWL.Temperatur-Außenluft", dpt="9.001"
+)
+_EXTRACT = Channel(
+    ga="15/3/26", name="Versorgungstechnik.KWL.Temperatur-Abluft", dpt="9.001"
+)
+_SUPPLY = Channel(
+    ga="15/3/29", name="Versorgungstechnik.KWL.Temperatur-Zuluft", dpt="9.001"
+)
+_AIRS = ExchangerRoles(
+    outdoor="%.KWL.Temperatur-Außenluft",
+    extract="%.KWL.Temperatur-Abluft",
+    supply="%.KWL.Temperatur-Zuluft",
+)
+_KWL_REFERENCE = DeviceReference(match="KWL", healthy=_KWL_HEALTHY)
+_KWL = Exchanger(
+    label="KWL",
+    outdoor_ga=_OUTDOOR.ga,
+    extract_ga=_EXTRACT.ga,
+    supply_ga=_SUPPLY.ga,
+    healthy=_KWL_HEALTHY,
+)
+
+
+def _temps(
+    outdoor: Sequence[float],
+    extract: Sequence[float],
+    supply: Sequence[float],
+    start: datetime = _T0,
+) -> dict[str, dict[datetime, float]]:
+    return {
+        _KWL.outdoor_ga: {start + n * _HOUR: v for n, v in enumerate(outdoor)},
+        _KWL.extract_ga: {start + n * _HOUR: v for n, v in enumerate(extract)},
+        _KWL.supply_ga: {start + n * _HOUR: v for n, v in enumerate(supply)},
+    }
+
+
+class TestEfficiencySeries:
+    def test_the_efficiency_is_the_supply_share_of_the_gradient(self) -> None:
+        by_ga = _temps([0.0, 0.0], [20.0, 20.0], [18.0, 17.0])
+        etas = efficiency_series(_KWL, by_ga, _T0, _T0 + _HOUR, min_delta=_MIN_DELTA)
+        assert etas == [(_T0, 90.0), (_T0 + _HOUR, 85.0)]
+
+    def test_hours_inside_the_delta_gate_measure_nothing(self) -> None:
+        # Inside and outside agree to 5 K: the quotient would be noise over
+        # noise, and in summer that is every hour of the day.
+        by_ga = _temps([15.0], [20.0], [19.0])
+        assert efficiency_series(_KWL, by_ga, _T0, _T0, min_delta=_MIN_DELTA) == []
+
+    def test_the_declared_delta_itself_still_measures(self) -> None:
+        by_ga = _temps([10.0], [20.0], [19.0])
+        etas = efficiency_series(_KWL, by_ga, _T0, _T0, min_delta=_MIN_DELTA)
+        assert etas == [(_T0, 90.0)]
+
+    def test_a_silent_role_carries_its_last_value(self) -> None:
+        # KNX channels are state: an outdoor sensor that sent once holds
+        # until it sends again; the silence fault owns the dead channel.
+        by_ga = _temps([0.0], [20.0, 20.0, 20.0], [18.0, 18.0, 16.0])
+        etas = efficiency_series(_KWL, by_ga, _T0, _T0 + 2 * _HOUR, min_delta=_MIN_DELTA)
+        assert etas == [(_T0, 90.0), (_T0 + _HOUR, 90.0), (_T0 + 2 * _HOUR, 80.0)]
+
+    def test_no_efficiency_before_every_role_has_appeared(self) -> None:
+        by_ga = _temps([0.0, 0.0, 0.0], [20.0, 20.0, 20.0], [])
+        by_ga[_KWL.supply_ga] = {_T0 + 2 * _HOUR: 18.0}
+        etas = efficiency_series(_KWL, by_ga, _T0, _T0 + 2 * _HOUR, min_delta=_MIN_DELTA)
+        assert etas == [(_T0 + 2 * _HOUR, 90.0)]
+
+
+class TestCapabilityLevels:
+    def _levels(
+        self, etas: Sequence[tuple[datetime, float]], frontier: datetime
+    ) -> list[tuple[datetime, float]]:
+        return capability_levels(
+            etas,
+            window_start=_T0,
+            frontier=frontier,
+            window=_RECOVERY_WINDOW,
+            min_samples=_RECOVERY_COVERAGE,
+        )
+
+    def test_the_level_is_the_best_hour_of_the_trailing_window(self) -> None:
+        etas = _series([80.0, 81.0, 82.0, 83.0, 84.0, 85.0, 86.0, 87.0])
+        assert self._levels(etas, _T0 + 7 * _HOUR) == [(_T0 + 7 * _HOUR, 87.0)]
+
+    def test_the_level_is_read_at_every_hour_once_covered(self) -> None:
+        # Twelve valid hours, then a gated day and a half: the trailing
+        # window keeps reading, so a stretch of small gradients does not
+        # split one decay into an episode per cold night.
+        etas = _series([88.0] * 12)
+        levels = self._levels(etas, _T0 + 35 * _HOUR)
+        assert levels[0] == (_T0 + 7 * _HOUR, 88.0)
+        assert levels[-1] == (_T0 + 35 * _HOUR, 88.0)
+        assert len(levels) == 29
+
+    def test_a_window_short_of_valid_hours_yields_nothing(self) -> None:
+        etas = _series([88.0] * 5)
+        assert self._levels(etas, _T0 + 9 * _HOUR) == []
+
+    def test_good_hours_older_than_the_window_fall_out(self) -> None:
+        etas = _series([88.0] * 24 + [70.0] * 72)
+        levels = self._levels(etas, _T0 + 95 * _HOUR)
+        by_time = dict(levels)
+        assert by_time[_T0 + 30 * _HOUR] == 88.0
+        assert by_time[_T0 + 95 * _HOUR] == 70.0
+
+
+class TestAccumulateFall:
+    def test_a_healthy_exchanger_never_accumulates(self) -> None:
+        trace = accumulate_fall(
+            _series([88.0, 87.0, 89.0, 88.5]), healthy=_KWL_HEALTHY, fall=_FALL
+        )
+        assert [a.budget_used for a in trace] == [0.0, 0.0, 0.0, 0.0]
+        assert all(a.since is None for a in trace)
+
+    def test_only_the_deficit_past_the_declared_fall_accumulates(self) -> None:
+        # 68 % on an 88 % exchanger is 20 points down; 10 of them count.
+        trace = accumulate_fall(_series([68.0, 68.0, 68.0]), healthy=_KWL_HEALTHY, fall=_FALL)
+        assert [a.budget_used for a in trace] == [10.0, 20.0, 30.0]
+        assert [a.excess for a in trace] == [20.0, 20.0, 20.0]
+        assert [a.level for a in trace] == [68.0, 68.0, 68.0]
+        assert all(a.since == _T0 for a in trace)
+
+    def test_a_sag_within_the_band_never_accumulates(self) -> None:
+        # A real, permanent 8-point sag that is not this fault: the fall is
+        # a floor, not a noise band, or this would fire eventually.
+        trace = accumulate_fall(_series([80.0] * 500), healthy=_KWL_HEALTHY, fall=_FALL)
+        assert all(a.budget_used == 0.0 for a in trace)
+
+    def test_returning_into_the_band_starts_the_count_over(self) -> None:
+        trace = accumulate_fall(
+            _series([68.0, 85.0, 68.0]), healthy=_KWL_HEALTHY, fall=_FALL
+        )
+        assert [a.budget_used for a in trace] == [10.0, 0.0, 10.0]
+
+
+class TestDecay:
+    """The heat_recovery_decay fault end to end over its own signal:
+    temperatures in, observations out, with the declared numbers of the
+    fault file."""
+
+    def _measured(
+        self, targets: Sequence[float], by_ga: dict[str, dict[datetime, float]] | None = None
+    ) -> tuple[list[Observation], list[tuple[datetime, float]], datetime]:
+        frontier = _T0 + (len(targets) - 1) * _HOUR
+        if by_ga is None:
+            by_ga = _temps(
+                [0.0] * len(targets),
+                [20.0] * len(targets),
+                [e / 100.0 * 20.0 for e in targets],
+            )
+        etas = efficiency_series(_KWL, by_ga, _T0, frontier, min_delta=_MIN_DELTA)
+        levels = capability_levels(
+            etas,
+            window_start=_T0,
+            frontier=frontier,
+            window=_RECOVERY_WINDOW,
+            min_samples=_RECOVERY_COVERAGE,
+        )
+        trace = accumulate_fall(levels, healthy=_KWL.healthy, fall=_FALL)
+        observations = drift_observations(
+            _KWL.slug, trace, rise=_FALL, budget=_FALL_BUDGET
+        )
+        return observations, levels, frontier
+
+    def test_a_slowly_decaying_exchanger_fires(self) -> None:
+        # The fault sentence's case: a week healthy, then four weeks sliding
+        # from 88 to 68 % — the exchanger fouling, nothing jumping.
+        decline = [88.0 - 20.0 * n / 671 for n in range(672)]
+        observations, _, frontier = self._measured([88.0] * 168 + decline)
+        assert observations
+        episodes = fold_observations(
+            "heat_recovery_decay", observations, [], EpisodePolicy(), frontier
+        )
+        assert len(episodes) == 1
+        assert episodes[0].subject == "kwl"
+        assert episodes[0].ended_at is None
+
+    def test_a_stable_exchanger_stays_quiet(self) -> None:
+        # Five weeks of ordinary jitter around healthy: the acceptance
+        # criterion's other half.
+        jitter = [88.0, 85.0, 90.0, 83.0, 89.0]
+        observations, _, _ = self._measured([jitter[n % 5] for n in range(840)])
+        assert observations == []
+
+    def test_bypass_hours_do_not_read_as_fouling(self) -> None:
+        # Nights that pass the gate with the exchanger deliberately bypassed
+        # look exactly like fouling — but only hour by hour. The best hour
+        # of the trailing window is still the exchanger's own.
+        days = ([88.0] * 12 + [25.0] * 12) * 10
+        observations, _, _ = self._measured(days)
+        assert observations == []
+
+    def test_a_summer_stretch_is_unmeasured_not_recovered(self) -> None:
+        # Ten days inside the gate after five valid ones: no level reaches
+        # the frontier, so an open episode must be held open, not cleared.
+        n_valid, n_gated = 120, 240
+        by_ga = _temps(
+            [0.0] * n_valid + [18.0] * n_gated,
+            [20.0] * (n_valid + n_gated),
+            [17.6] * n_valid + [19.76] * n_gated,
+        )
+        observations, levels, frontier = self._measured(
+            [88.0] * (n_valid + n_gated), by_ga
+        )
+        assert observations == []
+        assert not reaches_frontier(
+            levels, frontier=frontier, max_gap=EpisodePolicy().max_gap
+        )
+
+    def test_the_episode_ends_after_a_cleaning(self) -> None:
+        # Three days healthy, twelve fouled at 68 %, three healthy again:
+        # the drop reaches the level once the last good hour leaves the
+        # trailing window (hour 143), the 480 point-hour budget fills 48 h
+        # later, and the cleaning closes the episode so the address clears.
+        targets = [88.0] * 72 + [68.0] * 288 + [88.0] * 72
+        observations, _, frontier = self._measured(targets)
+        assert observations
+        assert observations[0].time == _T0 + 191 * _HOUR
+        assert observations[0].value == pytest.approx(20.0)
+        assert observations[0].score == pytest.approx(2.0)
+        episodes = fold_observations(
+            "heat_recovery_decay", observations, [], EpisodePolicy(), frontier
+        )
+        assert len(episodes) == 1
+        assert episodes[0].ended_at is not None
+
+    def test_the_same_history_yields_the_same_observations(self) -> None:
+        decline = [88.0] * 100 + [88.0 - 20.0 * n / 671 for n in range(672)]
+        first, _, _ = self._measured(decline)
+        second, _, _ = self._measured(decline)
+        assert first == second
+
+
+class TestResolveExchanger:
+    def test_maps_each_role_to_its_channel(self) -> None:
+        exchanger = resolve_exchanger(
+            [_EXTRACT, _OUTDOOR, _SUPPLY], (_KWL_REFERENCE,), _AIRS
+        )
+        assert exchanger == _KWL
+
+    def test_a_role_matching_no_channel_is_an_error(self) -> None:
+        with pytest.raises(ValueError, match=r"supply.*no channel"):
+            resolve_exchanger([_EXTRACT, _OUTDOOR], (_KWL_REFERENCE,), _AIRS)
+
+    def test_a_channel_matching_no_role_is_an_error(self) -> None:
+        exhaust = Channel(
+            ga="15/3/27", name="Versorgungstechnik.KWL.Temperatur-Fortluft", dpt="9.001"
+        )
+        with pytest.raises(ValueError, match=r"15/3/27.*no role"):
+            resolve_exchanger(
+                [_EXTRACT, _OUTDOOR, _SUPPLY, exhaust], (_KWL_REFERENCE,), _AIRS
+            )
+
+    def test_two_channels_for_one_role_is_an_error(self) -> None:
+        twin = Channel(
+            ga="15/3/99", name="Keller.KWL.Temperatur-Außenluft", dpt="9.001"
+        )
+        with pytest.raises(ValueError, match=r"outdoor.*2 channels"):
+            resolve_exchanger(
+                [_EXTRACT, _OUTDOOR, _SUPPLY, twin], (_KWL_REFERENCE,), _AIRS
+            )
+
+    def test_anything_but_one_reference_is_an_error(self) -> None:
+        with pytest.raises(ValueError, match=r"exactly one exchanger"):
+            resolve_exchanger([_EXTRACT, _OUTDOOR, _SUPPLY], (), _AIRS)
+
+
+class TestClassifyExchanger:
+    def test_a_decaying_exchanger_names_its_deficit_and_since(self) -> None:
+        trace = accumulate_fall(_series([68.0] * 6), healthy=_KWL.healthy, fall=_FALL)
+        state = classify_exchanger(_KWL, trace, frontier=_T0 + 5 * _HOUR)
+        assert state == ExchangerState(
+            exchanger=_KWL, efficiency=68.0, deficit=20.0, falling_since=_T0
+        )
+
+    def test_a_healthy_exchanger_names_only_its_efficiency(self) -> None:
+        trace = accumulate_fall(_series([88.0] * 6), healthy=_KWL.healthy, fall=_FALL)
+        state = classify_exchanger(_KWL, trace, frontier=_T0 + 5 * _HOUR)
+        assert state == ExchangerState(exchanger=_KWL, efficiency=88.0, deficit=0.0)
+
+    def test_a_trace_short_of_the_frontier_leaves_the_state_empty(self) -> None:
+        trace = accumulate_fall(_series([68.0] * 6), healthy=_KWL.healthy, fall=_FALL)
+        assert classify_exchanger(_KWL, trace, frontier=_T0 + 20 * _HOUR) == ExchangerState(
+            exchanger=_KWL
+        )
+
+
+class TestPublishForExchanger:
+    def test_the_payload_names_the_exchanger_and_its_numbers(self) -> None:
+        state = ExchangerState(
+            exchanger=_KWL, efficiency=68.0, deficit=20.0, falling_since=_T0
+        )
+        publish = publish_for_exchanger("kwl", 2, state)
+        assert publish == ExchangerPublish(
+            slug="kwl",
+            severity=2,
+            exchanger="KWL",
+            efficiency=68.0,
+            healthy=_KWL_HEALTHY,
+            deficit=20.0,
+            falling_since=_T0,
+        )
+        assert publish.subject == "kwl"
+        assert publish.entity == "kwl"
+
+    def test_a_subject_that_left_the_scope_still_gets_its_clear(self) -> None:
+        publish = publish_for_exchanger("kwl", 0, None)
+        assert publish.severity == 0
+        assert publish.exchanger == "kwl"
+        assert publish.efficiency is None
