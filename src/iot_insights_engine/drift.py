@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
+    from .episode_store import OpenEpisodeRow
     from .faults import DeviceReference, Fault
     from .silence import Channel
 
@@ -582,7 +583,10 @@ def _walk(
 
 
 def measure_standby(
-    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
 ) -> Measured[DeviceState]:
     """The standby signal: the declared references married to the scope,
     then valley, CUSUM walk and observations per device.
@@ -607,7 +611,10 @@ def measure_standby(
 
 
 def measure_duty_cycle(
-    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
 ) -> Measured[DeviceState]:
     """The duty-cycle signal: the same walk over the share of the day the
     compressor runs, with door events cut out of the series first.
@@ -904,7 +911,10 @@ def payload_recovery(publish: ExchangerPublish) -> dict[str, Any]:
 
 
 def measure_recovery(
-    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
 ) -> Measured[ExchangerState]:
     """The recovery signal: the declared roles married to the scope, then
     the hourly efficiency, the capability, and the downward walk — one

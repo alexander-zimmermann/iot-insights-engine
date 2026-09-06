@@ -8,11 +8,13 @@ leaves the engine is a severity 0–3 per main group on
 `anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
-Every kind that reports per subject runs in one shape: a `SubjectKind`
+Every kind that reports per subject runs in one shape: a `runner.Kind`
 declares how its series is measured and how its payload is shaped, and
-`_run_subjects` owns the rest — the window, the fold, the reconciliation,
-the log record, the dry run and the publish-then-write tail. A new
-per-subject kind declares those two things and inherits all of it.
+the runner module owns the rest — the window, the fold, the
+reconciliation, the log record, the dry run and the publish-then-write
+tail, behind its injected store and publisher ends. This module is the
+job: it loads the fault list, wires each kind's declaration, and keeps
+the loops the runner does not cover yet.
 
 Channel silence measures per channel but reports per main group, so it
 keeps its own delivery; it reconciles through the same `reconcile` as
@@ -46,12 +48,11 @@ touches neither the database nor NATS.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import (
     deviation,
@@ -69,14 +70,15 @@ from .episode_store import OpenEpisodeRow
 from .episodes import Episode, EpisodePolicy, Observation, fold_observations
 from .faults import DriftSignal, Fault, FaultList, MeasurementKind
 from .logging_setup import get_logger
-from .reconcile import (
-    Measured,
-    Plan,
-    SubjectPublish,
-    Window,
-    plan_from,
-    reconcile,
-    subject_plan,
+from .reconcile import Plan, Window, plan_from, reconcile
+from .runner import (
+    LOOKBACK,
+    DbStore,
+    Kind,
+    NatsPublisher,
+    log_dry_run,
+    publish_subjects,
+    run_subjects,
 )
 from .severity import severity_name
 from .silence import (
@@ -88,154 +90,11 @@ from .silence import (
     main_group,
 )
 
-if TYPE_CHECKING:
-    import psycopg
-    from psycopg.rows import DictRow
-
 log = get_logger(__name__)
 
-# Measurement window: pause estimation, observation reconstruction and the
-# score history all live inside it. Matches the 30 days the episode fold-in
-# started the comparison basis with.
-LOOKBACK = timedelta(days=30)
 
-
-@dataclass(frozen=True, slots=True)
-class SubjectKind[S, P: SubjectPublish]:
-    """One per-subject fault kind, reduced to what actually differs between
-    them: how its series is measured (`frontier`, `measure`) and how its
-    payload is shaped (`publish_for`, `payload`) — both live in the kind's
-    own module, so the whole wire story of a kind is read in one place.
-    `event` names its log record, `delivery` the target form the fault must
-    declare for it.
-    """
-
-    event: str
-    delivery: str
-    frontier: Callable[[psycopg.Connection[DictRow]], datetime | None]
-    measure: Callable[[psycopg.Connection[DictRow], Fault, Window], Measured[S]]
-    publish_for: Callable[[str, int, S | None], P]
-    payload: Callable[[P], dict[str, Any]]
-
-
-def _publish_subjects[P: SubjectPublish](
-    settings: Settings,
-    fault_name: str,
-    publishes: Iterable[P],
-    payload: Callable[[P], dict[str, Any]],
-) -> None:
-    """One publish per moved subject, on the subject's own address: the
-    severity decides firing, the kind decides the rest of the payload.
-    """
-    for publish in publishes:
-        firing = publish.severity > 0
-        nats_publisher.publish_anomaly(
-            settings,
-            fault_name,
-            severity_name(publish.severity) if firing else None,
-            payload(publish),
-            entity=publish.entity,
-            firing=firing,
-        )
-
-
-def _run_subjects[S, P: SubjectPublish](
-    settings: Settings, fault: Fault, kind: SubjectKind[S, P], *, dry_run: bool
-) -> None:
-    """The one shape a per-subject kind runs in: guard the declaration, take
-    the window off the aggregate, measure, fold, reconcile, log — then
-    publish before writing.
-    """
-    if fault.target is None or fault.target.form != kind.delivery:
-        raise ValueError(
-            f"fault {fault.name}: {fault.kind} delivery needs a {kind.delivery} target"
-        )
-    policy = EpisodePolicy()
-
-    with read_connection(settings) as conn:
-        frontier = kind.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window = Window(start=frontier - LOOKBACK, frontier=frontier, policy=policy)
-        measured = kind.measure(conn, fault, window)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    if measured.dataless:
-        # Never at info level: a subject nobody could measure is the one
-        # thing that keeps an open episode from ever clearing itself.
-        log.warning(
-            "subjects_dataless", fault=fault.name, subjects=sorted(measured.dataless)
-        )
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, measured.observations, history_scores, policy, frontier
-    )
-
-    def payload(subject: str, severity: int) -> P:
-        return kind.publish_for(subject, severity, measured.states.get(subject))
-
-    plan = subject_plan(
-        episodes=episodes,
-        open_rows=open_rows,
-        dataless=measured.dataless,
-        frontier=frontier,
-        publish_for=payload,
-    )
-
-    log.info(
-        kind.event,
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        **measured.counts,
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        stale_opens=list(plan.stale_opens),
-        publishes=len(plan.publishes),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        _log_dry_run(fault, episodes, plan, measured.labels)
-        return
-
-    _publish_subjects(settings, fault.name, plan.publishes, kind.payload)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
-
-
-def _log_dry_run[P: SubjectPublish](
-    fault: Fault,
-    episodes: Sequence[Episode],
-    plan: Plan[P],
-    labels: Mapping[str, str],
-) -> None:
-    """What the run would have done, by subject — the dry run's whole point,
-    so it names each subject the way a human does where the kind knows it.
-    """
-    per_subject = Counter(e.subject for e in episodes)
-    log.info(
-        "dry_run_episodes",
-        fault=fault.name,
-        per_subject={
-            labels.get(subject, subject): count
-            for subject, count in sorted(per_subject.items())
-        },
-        open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-        would_publish=[
-            {"subject": p.subject, "severity": p.severity} for p in plan.publishes
-        ],
-    )
-
-
-_SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
-    MeasurementKind.DURATION: SubjectKind(
+_SUBJECT_KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
+    MeasurementKind.DURATION: Kind(
         event="appliance_runtime_run",
         delivery="per_device",
         frontier=duration.frontier,
@@ -243,7 +102,7 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
         publish_for=duration.publish_for,
         payload=duration.payload,
     ),
-    MeasurementKind.DEVIATION: SubjectKind(
+    MeasurementKind.DEVIATION: Kind(
         event="room_deviation_run",
         delivery="per_room",
         frontier=silence.frontier,
@@ -257,8 +116,8 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
 # The drift kind runs one shape per signal: same CUSUM, different series,
 # so the run record and the payload's units differ with the signal the
 # fault declares.
-_DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
-    DriftSignal.STANDBY: SubjectKind(
+_DRIFT_SIGNALS: Mapping[DriftSignal, Kind[Any, Any]] = {
+    DriftSignal.STANDBY: Kind(
         event="appliance_standby_run",
         delivery="per_device",
         frontier=duration.frontier,
@@ -266,7 +125,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         publish_for=drift.publish_for,
         payload=drift.payload_standby,
     ),
-    DriftSignal.DUTY_CYCLE: SubjectKind(
+    DriftSignal.DUTY_CYCLE: Kind(
         event="duty_cycle_drift_run",
         delivery="per_device",
         frontier=duration.frontier,
@@ -274,7 +133,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         publish_for=drift.publish_for,
         payload=drift.payload_duty_cycle,
     ),
-    DriftSignal.RECOVERY: SubjectKind(
+    DriftSignal.RECOVERY: Kind(
         event="heat_recovery_run",
         # One exchanger, one declared address — the volume watchdog's form,
         # not the appliances' per-device fan-out.
@@ -544,10 +403,10 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     )
 
     if dry_run:
-        _log_dry_run(fault, episodes, plan, {c.ga: c.name for c in channels})
+        log_dry_run(fault, episodes, plan, {c.ga: c.name for c in channels})
         return
 
-    _publish_subjects(settings, fault.name, plan.publishes, _group_payload)
+    publish_subjects(NatsPublisher(settings), fault.name, plan.publishes, _group_payload)
     with write_connection(settings) as conn, conn.transaction():
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
@@ -722,7 +581,7 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     return 0
 
 
-def _subject_kind(fault: Fault) -> SubjectKind[Any, Any] | None:
+def _subject_kind(fault: Fault) -> Kind[Any, Any] | None:
     """The per-subject shape this fault runs in, if it has one. Drift picks
     it by the signal the file declares — the loader rejects one without, so
     a fault that got here signalless is a new kind of drift nobody wired up,
@@ -738,7 +597,7 @@ def _subject_kind(fault: Fault) -> SubjectKind[Any, Any] | None:
 def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
     kind = _subject_kind(fault)
     if kind is not None:
-        _run_subjects(settings, fault, kind, dry_run=dry_run)
+        run_subjects(DbStore(settings), NatsPublisher(settings), fault, kind, dry_run=dry_run)
     elif fault.kind is MeasurementKind.SILENCE:
         _run_silence(settings, fault, dry_run=dry_run)
     elif fault.kind is MeasurementKind.VOLUME:

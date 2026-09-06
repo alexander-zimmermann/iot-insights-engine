@@ -20,6 +20,7 @@ from iot_insights_engine.episodes import (
     EvidenceRow,
     NotificationEvent,
 )
+from iot_insights_engine.runner import NatsPublisher, publish_subjects
 from iot_insights_engine.silence import Channel, ChannelState, SilenceState
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
@@ -189,8 +190,8 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
     episode = _episode("2/2/227", severity=2)
     plan = _plan([episode], open_rows=[])
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "channel_silence", plan.publishes, detect_faults._group_payload
+        publish_subjects(
+            NatsPublisher(settings), "channel_silence", plan.publishes, detect_faults._group_payload
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.2"
@@ -203,8 +204,8 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
 def test_publish_clear_forces_level_zero() -> None:
     settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings,
+        publish_subjects(
+            NatsPublisher(settings),
             "channel_silence",
             (GroupPublish(main_group=15, severity=0, channels=()),),
             detect_faults._group_payload,
@@ -228,8 +229,8 @@ def test_publish_device_carries_run_details_on_the_slug_subject() -> None:
         limit_hours=4.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "appliance_runtime", (publish,), duration.payload
+        publish_subjects(
+            NatsPublisher(settings), "appliance_runtime", (publish,), duration.payload
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
@@ -253,8 +254,8 @@ def test_publish_device_clear_forces_level_zero() -> None:
         limit_hours=4.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "appliance_runtime", (publish,), duration.payload
+        publish_subjects(
+            NatsPublisher(settings), "appliance_runtime", (publish,), duration.payload
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
@@ -276,8 +277,8 @@ def test_publish_standby_carries_drift_details_on_the_slug_subject() -> None:
         rising_since=_T0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "appliance_standby", (publish,), drift.payload_standby
+        publish_subjects(
+            NatsPublisher(settings), "appliance_standby", (publish,), drift.payload_standby
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_standby.2-2-227"
@@ -303,8 +304,8 @@ def test_publish_duty_cycle_carries_drift_details_on_the_slug_subject() -> None:
         rising_since=_T0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "freezer_icing", (publish,), drift.payload_duty_cycle
+        publish_subjects(
+            NatsPublisher(settings), "freezer_icing", (publish,), drift.payload_duty_cycle
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.freezer_icing.2-2-227"
@@ -331,7 +332,7 @@ def test_publish_room_carries_cold_details_on_the_slug_subject() -> None:
         min_gap=1.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(settings, "fbh_cold", (publish,), deviation.payload)
+        publish_subjects(NatsPublisher(settings), "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
     payload = call.args[2]
@@ -356,7 +357,7 @@ def test_publish_room_clear_forces_level_zero() -> None:
         min_gap=1.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(settings, "fbh_cold", (publish,), deviation.payload)
+        publish_subjects(NatsPublisher(settings), "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
     assert call.args[2]["severity_level"] == 0
@@ -376,8 +377,8 @@ def test_publish_exchanger_carries_recovery_details_on_the_slug_subject() -> Non
         falling_since=_T0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "heat_recovery_decay", (publish,), drift.payload_recovery
+        publish_subjects(
+            NatsPublisher(settings), "heat_recovery_decay", (publish,), drift.payload_recovery
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
@@ -403,8 +404,8 @@ def test_publish_exchanger_clear_forces_level_zero() -> None:
         falling_since=None,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_subjects(
-            settings, "heat_recovery_decay", (publish,), drift.payload_recovery
+        publish_subjects(
+            NatsPublisher(settings), "heat_recovery_decay", (publish,), drift.payload_recovery
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.heat_recovery_decay.kwl"

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
+    from .episode_store import OpenEpisodeRow
     from .faults import Fault, RoomRule
     from .silence import Channel
 
@@ -355,7 +356,10 @@ def payload(publish: RoomPublish) -> dict[str, Any]:
 
 
 def measure(
-    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
 ) -> Measured[RoomState]:
     """The kind's whole measurement: the declared rooms married to the
     scope, then the dense series, the cold buckets and the observations per
