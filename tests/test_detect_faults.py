@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-from iot_insights_engine import detect_faults, deviation, duration, nats_publisher, volume
+from iot_insights_engine import detect_faults, deviation, drift, duration, nats_publisher, volume
 from iot_insights_engine.config import Settings
 from iot_insights_engine.detect_faults import GroupPublish, plan_run
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -298,6 +298,51 @@ def test_publish_room_clear_forces_level_zero() -> None:
         detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
+    assert call.args[2]["firing"] is False
+
+
+def test_publish_exchanger_carries_recovery_details_on_the_slug_subject() -> None:
+    settings = _settings()
+    publish = drift.ExchangerPublish(
+        slug="kwl",
+        severity=2,
+        exchanger="KWL",
+        efficiency=68.0,
+        healthy=88.0,
+        deficit=20.0,
+        falling_since=_T0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_recovery(settings, "heat_recovery_decay", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["exchanger"] == "KWL"
+    assert payload["efficiency_pct"] == 68.0
+    assert payload["healthy_pct"] == 88.0
+    assert payload["deficit_pct"] == 20.0
+    assert payload["falling_since"] == _T0
+
+
+def test_publish_exchanger_clear_forces_level_zero() -> None:
+    settings = _settings()
+    publish = drift.ExchangerPublish(
+        slug="kwl",
+        severity=0,
+        exchanger="KWL",
+        efficiency=86.0,
+        healthy=88.0,
+        deficit=2.0,
+        falling_since=None,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_recovery(settings, "heat_recovery_decay", (publish,))
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False

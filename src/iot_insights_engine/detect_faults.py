@@ -197,6 +197,25 @@ def _publish_duty_cycle(
     )
 
 
+def _publish_recovery(
+    settings: Settings, fault_name: str, publishes: Iterable[drift.ExchangerPublish]
+) -> None:
+    """Recovery drift: what the exchanger recovers against what it should —
+    the number behind "the supply air is approaching the outdoor air"."""
+    _publish_subjects(
+        settings,
+        fault_name,
+        publishes,
+        lambda p: {
+            "exchanger": p.exchanger,
+            "efficiency_pct": p.efficiency,
+            "healthy_pct": p.healthy,
+            "deficit_pct": p.deficit,
+            "falling_since": p.falling_since,
+        },
+    )
+
+
 def _publish_rooms(
     settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
 ) -> None:
@@ -351,6 +370,16 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         measure=drift.measure_duty_cycle,
         publish_for=drift.publish_for,
         publish=_publish_duty_cycle,
+    ),
+    DriftSignal.RECOVERY: SubjectKind(
+        event="heat_recovery_run",
+        # One exchanger, one declared address — the volume watchdog's form,
+        # not the appliances' per-device fan-out.
+        delivery="ga",
+        frontier=silence.frontier,
+        measure=drift.measure_recovery,
+        publish_for=drift.publish_for_exchanger,
+        publish=_publish_recovery,
     ),
 }
 

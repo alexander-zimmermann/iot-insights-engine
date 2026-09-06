@@ -8,13 +8,17 @@ trailing reference would be worse than useless here — against a rolling
 window a linear ramp scores the same whatever its slope (#1593), which is
 why the z-score this replaces could never have seen a creeping standby.
 
-Two signals walk that same CUSUM, and the fault file says which:
+Three signals walk that same CUSUM, and the fault file says which:
 
 * **standby** — the device's idle draw in mA. A relay that no longer opens,
   not a savings topic.
 * **duty_cycle** — the share of the day a compressor runs, in percent. An
   iced-up evaporator buys the same cold with far more running, months
   before anything in the freezer thaws.
+* **recovery** — the heat-recovery efficiency of an air exchanger, in
+  percent of the extract–outdoor gradient. The one signal that walks
+  *downward*: fouling lowers what the exchanger can do, so the deficit
+  below healthy accumulates instead of the excess above it.
 
 Three steps, each its own function:
 
@@ -48,16 +52,17 @@ of clearing episodes nobody fixed.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from math import ceil
 from typing import TYPE_CHECKING
 
 from .episodes import Observation
+from .faults import ExchangerRoles
 from .nats_publisher import slugify
 from .reconcile import Measured, Plan, Window, measurement_reaches, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, pair_by_match, resolve_scope
+from .silence import BUCKET, hourly_averages, like_match, pair_by_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -334,7 +339,7 @@ def accumulate(
 
 
 def drift_observations(
-    ga: str, trace: Sequence[Step], *, rise: float, budget: float
+    subject: str, trace: Sequence[Step], *, rise: float, budget: float
 ) -> list[Observation]:
     """One observation per hour the spent budget stands past the declared
     one, for the episode pipeline. The score is the excess in units of the
@@ -342,7 +347,7 @@ def drift_observations(
     the signal's unit, the number a human acts on.
     """
     return [
-        Observation(subject=ga, time=s.time, score=s.excess / rise, value=s.excess)
+        Observation(subject=subject, time=s.time, score=s.excess / rise, value=s.excess)
         for s in trace
         if s.budget_used > budget
     ]
@@ -636,4 +641,300 @@ def measure_duty_cycle(
         # resolution it is indistinguishable from a door standing open,
         # and Basalte owns that one.
         counts={"door_hours": sum(len(hours) for hours in doors.values())},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Exchanger:
+    """The declared heat exchanger: its three air-temperature channels and
+    the healthy recovery efficiency declared for it, in percent of the
+    extract–outdoor gradient."""
+
+    label: str
+    outdoor_ga: str
+    extract_ga: str
+    supply_ga: str
+    healthy: float
+
+    @property
+    def slug(self) -> str:
+        """Episode subject and NATS entity in one: the writer rules pin
+        `anomaly.<fault>.<slug>` to the exchanger's fault address."""
+        return slugify(self.label)
+
+    @property
+    def gas(self) -> tuple[str, str, str]:
+        return (self.outdoor_ga, self.extract_ga, self.supply_ga)
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangerState:
+    """The exchanger at the frontier: what it recovers now, how far that is
+    below healthy, and since when it has been falling."""
+
+    exchanger: Exchanger
+    efficiency: float | None = None
+    deficit: float | None = None
+    falling_since: datetime | None = None
+
+
+def resolve_exchanger(
+    channels: Sequence[Channel],
+    references: Sequence[DeviceReference],
+    roles: ExchangerRoles,
+) -> Exchanger:
+    """The declared roles married to the scoped channels, strictly both
+    ways: every role resolves exactly one channel, every scoped channel
+    belongs to exactly one role, and exactly one reference names the
+    exchanger. Every problem is reported at once.
+    """
+    problems: list[str] = []
+    if len(references) != 1:
+        problems.append(
+            f"{len(references)} references declared — "
+            f"a recovery fault declares exactly one exchanger"
+        )
+    by_role: dict[str, list[Channel]] = {}
+    claimed: dict[str, str] = {}
+    for role, pattern in (
+        ("outdoor", roles.outdoor),
+        ("extract", roles.extract),
+        ("supply", roles.supply),
+    ):
+        hits = [c for c in channels if like_match(pattern, c.name)]
+        by_role[role] = hits
+        if len(hits) != 1:
+            gas = ", ".join(c.ga for c in hits)
+            problems.append(
+                f"role {role} matches no channel in scope"
+                if not hits
+                else f"role {role} matches {len(hits)} channels: {gas}"
+            )
+        for channel in hits:
+            if channel.ga in claimed:
+                problems.append(
+                    f"channel {channel.ga} matched by roles {claimed[channel.ga]} and {role}"
+                )
+            claimed[channel.ga] = role
+    problems.extend(
+        f"channel {c.ga} ({c.name}) matches no role"
+        for c in channels
+        if c.ga not in claimed
+    )
+    if problems:
+        raise ValueError("exchanger roles do not fit the scope: " + "; ".join(problems))
+    return Exchanger(
+        label=references[0].match,
+        outdoor_ga=by_role["outdoor"][0].ga,
+        extract_ga=by_role["extract"][0].ga,
+        supply_ga=by_role["supply"][0].ga,
+        healthy=references[0].healthy,
+    )
+
+
+def efficiency_series(
+    exchanger: Exchanger,
+    by_ga: Mapping[str, Mapping[datetime, float]],
+    window_start: datetime,
+    frontier: datetime,
+    *,
+    min_delta: float,
+) -> list[tuple[datetime, float]]:
+    """The exchanger's hourly recovery efficiency: how much of the
+    extract–outdoor gradient the supply air keeps, in percent.
+
+    Each role's last seen hourly average is carried forward across silent
+    buckets — KNX channels are state, not samples — deliberately without a
+    staleness bound: a role dying mid-window freezes the picture, and the
+    silence fault owns the dead channel. Hours where the gradient is inside
+    `min_delta` measure nothing: the quotient would be noise over noise,
+    and in summer that is every hour of the day.
+    """
+    carry: dict[str, float] = {}
+    etas: list[tuple[datetime, float]] = []
+    t = window_start
+    while t <= frontier:
+        for ga in exchanger.gas:
+            value = by_ga.get(ga, {}).get(t)
+            if value is not None:
+                carry[ga] = value
+        outdoor = carry.get(exchanger.outdoor_ga)
+        extract = carry.get(exchanger.extract_ga)
+        supply = carry.get(exchanger.supply_ga)
+        if outdoor is not None and extract is not None and supply is not None:
+            delta = extract - outdoor
+            if delta >= min_delta:
+                etas.append((t, 100.0 * (supply - outdoor) / delta))
+        t += BUCKET
+    return etas
+
+
+def capability_levels(
+    etas: Sequence[tuple[datetime, float]],
+    *,
+    window_start: datetime,
+    frontier: datetime,
+    window: timedelta,
+    min_samples: int,
+) -> list[tuple[datetime, float]]:
+    """The exchanger's capability at each bucket: the best valid hour in the
+    trailing `window` — the mirror of the standby valley. Bypass, defrost
+    and boost transients can only lower single hours; fouling lowers the
+    best one, which is why the maximum is the honest reading of what the
+    exchanger can still do.
+
+    The level is read *at* every bucket of the hourly grid but only *from*
+    the valid hours, so a stretch of small gradients inside the window does
+    not split one decay into an episode per cold night. A window carrying
+    fewer than `min_samples` valid hours yields nothing at all — a summer
+    week is unmeasured, not healthy.
+    """
+    levels: list[tuple[datetime, float]] = []
+    first, past = 0, 0
+    t = window_start
+    while t <= frontier:
+        while past < len(etas) and etas[past][0] <= t:
+            past += 1
+        while first < past and etas[first][0] <= t - window:
+            first += 1
+        span = etas[first:past]
+        if len(span) >= min_samples:
+            levels.append((t, max(v for _, v in span)))
+        t += BUCKET
+    return levels
+
+
+def accumulate_fall(
+    levels: Sequence[tuple[datetime, float]], *, healthy: float, fall: float
+) -> list[Step]:
+    """The CUSUM walk downward: a decay is a rise of the negated series, so
+    the same walk runs upside down and `excess` reads as the deficit below
+    healthy. Everything `accumulate` guarantees — the floor, the reset on
+    returning into the band, hours nobody looked contributing nothing —
+    holds here word for word, with "above" read as "below".
+    """
+    trace = accumulate([(t, -v) for t, v in levels], healthy=-healthy, rise=fall)
+    return [replace(step, level=-step.level) for step in trace]
+
+
+def classify_exchanger(
+    exchanger: Exchanger, trace: Sequence[Step], *, frontier: datetime
+) -> ExchangerState:
+    """What the exchanger reads now — the payload's side of the severity. A
+    trace that does not reach the frontier says nothing about now.
+
+    `falling_since` is bounded by the replay window, like the devices'
+    `rising_since`; the episode's `started_at` in the database is the
+    stable onset.
+    """
+    if not trace or trace[-1].time != frontier:
+        return ExchangerState(exchanger)
+    last = trace[-1]
+    return ExchangerState(
+        exchanger=exchanger,
+        efficiency=last.level,
+        deficit=last.excess,
+        falling_since=last.since,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangerPublish:
+    """The exchanger when its severity moved — the payload names what it
+    recovers, what it should, and since when it has been falling; the
+    writer rule carries only the severity to the fault address."""
+
+    slug: str
+    severity: int
+    exchanger: str
+    efficiency: float | None
+    healthy: float | None
+    deficit: float | None
+    falling_since: datetime | None
+
+    @property
+    def subject(self) -> str:
+        return self.slug
+
+    @property
+    def entity(self) -> str:
+        return self.slug
+
+
+def publish_for_exchanger(
+    subject: str, severity: int, state: ExchangerState | None
+) -> ExchangerPublish:
+    # An exchanger that left the scope while its row was open still gets
+    # its clear; the payload then only names the subject.
+    if state is None:
+        return ExchangerPublish(
+            slug=subject,
+            severity=severity,
+            exchanger=subject,
+            efficiency=None,
+            healthy=None,
+            deficit=None,
+            falling_since=None,
+        )
+    return ExchangerPublish(
+        slug=subject,
+        severity=severity,
+        exchanger=state.exchanger.label,
+        efficiency=state.efficiency,
+        healthy=state.exchanger.healthy,
+        deficit=state.deficit,
+        falling_since=state.falling_since,
+    )
+
+
+def measure_recovery(
+    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+) -> Measured[ExchangerState]:
+    """The recovery signal: the declared roles married to the scope, then
+    the hourly efficiency, the capability, and the downward walk — one
+    subject, the exchanger itself.
+    """
+    if not isinstance(fault.roles, ExchangerRoles):
+        raise ValueError(f"fault {fault.name}: the recovery signal needs declared air roles")
+    trailing, min_samples = _trailing_window(fault, window)
+    fall = float(fault.parameters["fall_pct"])
+    budget = float(fault.parameters["budget_pct_h"])
+
+    exchanger = resolve_exchanger(
+        resolve_scope(conn, fault.channel_scope()), fault.references, fault.roles
+    )
+    series = hourly_averages(conn, exchanger.gas, window.start)
+    etas = efficiency_series(
+        exchanger,
+        series,
+        window.start,
+        window.frontier,
+        min_delta=float(fault.parameters["min_delta_k"]),
+    )
+    levels = capability_levels(
+        etas,
+        window_start=window.start,
+        frontier=window.frontier,
+        window=trailing,
+        min_samples=min_samples,
+    )
+    trace = accumulate_fall(levels, healthy=exchanger.healthy, fall=fall)
+
+    dataless: set[str] = set()
+    if not reaches_frontier(levels, frontier=window.frontier, max_gap=window.policy.max_gap):
+        dataless.add(exchanger.slug)
+    state = classify_exchanger(exchanger, trace, frontier=window.frontier)
+
+    return Measured(
+        states={exchanger.slug: state},
+        observations=tuple(
+            drift_observations(exchanger.slug, trace, rise=fall, budget=budget)
+        ),
+        dataless=frozenset(dataless),
+        counts={
+            "valid_hours": len(etas),
+            "measured_hours": len(levels),
+            "falling": int(state.deficit is not None and state.deficit > fall),
+        },
+        labels={exchanger.slug: exchanger.label},
     )

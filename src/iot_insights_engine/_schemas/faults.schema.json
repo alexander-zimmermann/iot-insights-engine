@@ -21,7 +21,7 @@
         "sentence":   { "type": "string", "minLength": 1 },
         "unit":       { "type": "string", "minLength": 1 },
         "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy", "external", "volume"] },
-        "signal":     { "enum": ["standby", "duty_cycle"] },
+        "signal":     { "enum": ["standby", "duty_cycle", "recovery"] },
         "parameters": {
           "type": "object",
           "minProperties": 1,
@@ -29,7 +29,7 @@
         },
         "devices":    { "$ref": "#/$defs/devices" },
         "references": { "$ref": "#/$defs/references" },
-        "roles":      { "$ref": "#/$defs/roles" },
+        "roles":      { "oneOf": [ { "$ref": "#/$defs/roles" }, { "$ref": "#/$defs/exchangerRoles" } ] },
         "rooms":      { "$ref": "#/$defs/rooms" },
         "scope":      { "$ref": "#/$defs/scope" },
         "target":     { "$ref": "#/$defs/target" },
@@ -121,10 +121,34 @@
           }
         },
         {
+          "if": {
+            "properties": { "kind": { "const": "drift" }, "signal": { "const": "recovery" } },
+            "required": ["kind", "signal"]
+          },
+          "then": {
+            "required": ["roles"],
+            "properties": {
+              "parameters": {
+                "required": ["fall_pct", "budget_pct_h", "min_delta_k"],
+                "properties": {
+                  "fall_pct":     { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+                  "budget_pct_h": { "type": "number", "exclusiveMinimum": 0 },
+                  "min_delta_k":  { "type": "number", "exclusiveMinimum": 0 }
+                }
+              },
+              "references": { "$ref": "#/$defs/recoveryReferences" },
+              "roles":      { "$ref": "#/$defs/exchangerRoles" }
+            }
+          }
+        },
+        {
           "if":   { "properties": { "kind": { "const": "deviation" } }, "required": ["kind"] },
           "then": {
             "required": ["roles", "rooms"],
-            "properties": { "parameters": { "required": ["min_hours"] } }
+            "properties": {
+              "parameters": { "required": ["min_hours"] },
+              "roles":      { "$ref": "#/$defs/roles" }
+            }
           }
         }
       ]
@@ -164,6 +188,16 @@
         "additionalProperties": false
       }
     },
+    "recoveryReferences": {
+      "maxProperties": 1,
+      "additionalProperties": {
+        "properties": {
+          "healthy_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+        },
+        "required": ["healthy_pct"],
+        "additionalProperties": false
+      }
+    },
     "roles": {
       "type": "object",
       "properties": {
@@ -171,6 +205,16 @@
         "gate":      { "type": "string", "minLength": 1 }
       },
       "required": ["reference"],
+      "additionalProperties": false
+    },
+    "exchangerRoles": {
+      "type": "object",
+      "properties": {
+        "outdoor": { "type": "string", "minLength": 1 },
+        "extract": { "type": "string", "minLength": 1 },
+        "supply":  { "type": "string", "minLength": 1 }
+      },
+      "required": ["outdoor", "extract", "supply"],
       "additionalProperties": false
     },
     "rooms": {
