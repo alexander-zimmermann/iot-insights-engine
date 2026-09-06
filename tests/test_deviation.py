@@ -1,30 +1,43 @@
 """Deviation-measurement tests — the `deviation` kind against invented series.
 
-Every test feeds invented hourly values for a room's channel triple (value,
-reference, gate) and asserts only what comes out: the dense room series,
-which buckets count as cold, observations with their scores, the current
-state, the published payload, or a resolution error naming the room. The
-shared reconciliation is `test_reconcile`'s; no cluster, no live database.
+Both shapes of the kind. For rooms, every test feeds invented hourly values
+for a room's channel triple (value, reference, gate); for the daily yield,
+invented days of kWh and an invented forecast curve. Each asserts only what
+comes out: the series, which buckets or days count, observations with their
+scores, the current state, the published payload, or a resolution error
+naming the room. The shared reconciliation is `test_reconcile`'s; no
+cluster, no live database.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from iot_insights_engine.deviation import (
+    DAY,
+    PLANT,
+    YIELD_POLICY,
     Room,
     RoomBucket,
     RoomPublish,
     RoomState,
+    YieldDay,
+    YieldState,
     classify,
+    classify_yield,
     cold_buckets,
+    daily_energy,
     dead_value_gas,
     deviation_observations,
+    judged_days,
+    payload_yield,
     publish_for,
+    publish_for_plant,
     resolve_rooms,
     room_series,
+    yield_observations,
 )
 from iot_insights_engine.episodes import EpisodePolicy, fold_observations
 from iot_insights_engine.faults import Roles, RoomRule
@@ -389,3 +402,191 @@ def test_three_cold_hours_become_one_episode_with_few_events() -> None:
         _BUERO, room_series(_BUERO, closed_valve, _T0, _T0 + 3 * _HOUR), gate_min=50.0
     )
     assert deviation_observations(_BUERO, quiet, min_hours=2.0) == []
+
+
+# --- the daily-yield shape -------------------------------------------------
+#
+# Days of invented kWh and an invented forecast curve, never a database: a
+# known bad day must fire, and the cloudy days around it must not.
+
+_DAY0 = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+_MIN_SHORTFALL = 35.0
+
+
+def _day(n: int) -> datetime:
+    return _DAY0 + n * DAY
+
+
+def _days(pairs: dict[int, tuple[float, float]]) -> list[YieldDay]:
+    """One `YieldDay` per (actual, expected) pair, keyed by day offset."""
+    return [
+        YieldDay(day=_day(n), actual_kwh=actual, expected_kwh=expected)
+        for n, (actual, expected) in sorted(pairs.items())
+    ]
+
+
+def _curve(*points: tuple[datetime, float]) -> list[tuple[datetime, float]]:
+    return list(points)
+
+
+def _hourly_day(n: int, watts: dict[int, float]) -> list[tuple[datetime, float]]:
+    """A day's forecast curve as hourly samples, hour → watts."""
+    return [(_day(n) + hour * _HOUR, value) for hour, value in sorted(watts.items())]
+
+
+class TestDailyEnergy:
+    def test_an_hourly_curve_integrates_to_kwh_per_day(self) -> None:
+        # 0 → 2000 → 2000 → 0 W over four hourly samples: two trapezoids of
+        # 1 kWh each plus the flat 2 kWh hour between them.
+        energy = daily_energy(_hourly_day(0, {6: 0.0, 7: 2000.0, 8: 2000.0, 9: 0.0}))
+        assert energy == {_day(0): 4.0}
+
+    def test_the_night_between_two_days_is_not_integrated_across(self) -> None:
+        # Sunset on one day and sunrise on the next are not one interval:
+        # bridging them would invent a whole night of production.
+        curve = _hourly_day(0, {8: 0.0, 9: 2000.0}) + _hourly_day(1, {8: 0.0, 9: 2000.0})
+        assert daily_energy(curve) == {_day(0): 1.0, _day(1): 1.0}
+
+    def test_a_hole_in_the_curve_lowers_the_expectation(self) -> None:
+        # A missing midday sample drops its intervals rather than drawing a
+        # straight line through the peak — expectations only fall.
+        whole = _hourly_day(0, {6: 0.0, 7: 2000.0, 8: 2000.0, 9: 0.0})
+        holed = [point for point in whole if point[0] != _day(0) + 7 * _HOUR]
+        assert daily_energy(holed)[_day(0)] < daily_energy(whole)[_day(0)]
+
+    def test_a_session_in_another_timezone_still_buckets_utc_days(self) -> None:
+        # psycopg renders timestamptz in the session timezone; the day a
+        # sample belongs to must not move with it.
+        berlin = timezone(timedelta(hours=2))
+        curve = [
+            (point.astimezone(berlin), watts)
+            for point, watts in _hourly_day(0, {6: 0.0, 7: 2000.0})
+        ]
+        assert daily_energy(curve) == {_day(0): 1.0}
+
+    def test_an_empty_curve_expects_nothing(self) -> None:
+        assert daily_energy(_curve()) == {}
+
+
+class TestJudgedDays:
+    def test_only_days_both_sides_know_and_that_expected_enough(self) -> None:
+        actual = {_day(0): 30.0, _day(1): 5.0, _day(2): 40.0}
+        expected = {_day(0): 40.0, _day(1): 1.0, _day(3): 40.0}
+        judged = judged_days(
+            actual, expected, min_expected_kwh=3.0, frontier=_day(3)
+        )
+        # Day 1 expected too little to score, day 2 has no forecast and day 3
+        # no production.
+        assert [d.day for d in judged] == [_day(0)]
+
+    def test_a_day_past_the_frontier_is_not_judged_yet(self) -> None:
+        actual = {_day(0): 30.0, _day(1): 10.0}
+        expected = {_day(0): 40.0, _day(1): 40.0}
+        judged = judged_days(actual, expected, min_expected_kwh=3.0, frontier=_day(0))
+        assert [d.day for d in judged] == [_day(0)]
+
+    def test_the_shortfall_is_a_percentage_of_the_expectation(self) -> None:
+        [day] = judged_days(
+            {_day(0): 26.0}, {_day(0): 40.0}, min_expected_kwh=3.0, frontier=_day(0)
+        )
+        assert day.shortfall_pct == 35.0
+
+
+class TestYieldObservations:
+    def test_a_known_bad_day_fires_and_cloudy_days_stay_quiet(self) -> None:
+        # The acceptance case: the forecast is already weather-adjusted, so
+        # a cloudy day that met its lowered expectation is not a fault, and
+        # a day that made a third of it is.
+        days = _days({0: (7.0, 8.0), 1: (12.0, 40.0), 2: (30.0, 34.0)})
+        [observation] = yield_observations(days, _MIN_SHORTFALL)
+        assert observation.subject == PLANT
+        assert observation.time == _day(1)
+        assert observation.value == pytest.approx(70.0)
+        # The score is the shortfall in units of the declared minimum.
+        assert observation.score == pytest.approx(2.0)
+
+    def test_exactly_the_declared_shortfall_already_counts(self) -> None:
+        [observation] = yield_observations(_days({0: (26.0, 40.0)}), _MIN_SHORTFALL)
+        assert observation.score == pytest.approx(1.0)
+
+    def test_a_day_over_its_expectation_is_never_a_fault(self) -> None:
+        assert yield_observations(_days({0: (48.0, 40.0)}), _MIN_SHORTFALL) == []
+
+
+class TestClassifyYield:
+    def test_a_short_stretch_reaching_the_frontier(self) -> None:
+        days = _days({0: (38.0, 40.0), 1: (10.0, 40.0), 2: (12.0, 40.0)})
+        state = classify_yield(days, _MIN_SHORTFALL, "forecast_solar", frontier=_day(2))
+        assert state.short_since == _day(1)
+        assert state.actual_kwh == 12.0
+        assert state.expected_kwh == 40.0
+        assert state.shortfall_pct == pytest.approx(70.0)
+        assert state.expectation == "forecast_solar"
+        assert state.min_shortfall_pct == _MIN_SHORTFALL
+
+    def test_a_plant_that_recovered_before_the_frontier(self) -> None:
+        days = _days({0: (10.0, 40.0), 1: (39.0, 40.0)})
+        state = classify_yield(days, _MIN_SHORTFALL, "forecast_solar", frontier=_day(1))
+        assert state == YieldState(
+            expectation="forecast_solar", min_shortfall_pct=_MIN_SHORTFALL
+        )
+
+
+class TestPublishForPlant:
+    def test_the_payload_names_the_day_and_what_it_was_measured_against(self) -> None:
+        state = classify_yield(
+            _days({0: (12.0, 40.0)}), _MIN_SHORTFALL, "forecast_solar", frontier=_day(0)
+        )
+        publish = publish_for_plant(PLANT, 2, state)
+        assert publish.subject == PLANT
+        # One plant, one declared address: no entity token on the bus.
+        assert publish.entity is None
+        assert payload_yield(publish) == {
+            "expectation": "forecast_solar",
+            "short_since": _day(0),
+            "shortfall_pct": pytest.approx(70.0),
+            "actual_kwh": 12.0,
+            "expected_kwh": 40.0,
+            "min_shortfall_pct": _MIN_SHORTFALL,
+        }
+
+    def test_a_publish_without_a_measured_state_is_a_wiring_error(self) -> None:
+        # The plant is the whole scope and is always measured, so this can
+        # only mean the kind was wired to the wrong measurement.
+        with pytest.raises(ValueError, match="without a measured state"):
+            publish_for_plant(PLANT, 0, None)
+
+
+def test_three_short_days_become_one_episode_with_few_events() -> None:
+    # The acceptance case end to end, in the cadence the fault folds in: a
+    # dead string over three days is one incident, not three.
+    days = _days({0: (12.0, 40.0), 1: (11.0, 40.0), 2: (13.0, 40.0)})
+    observations = yield_observations(days, _MIN_SHORTFALL)
+    [episode] = fold_observations(
+        "pv_underperformance", observations, [], YIELD_POLICY, _day(2)
+    )
+    assert episode.subject == PLANT
+    assert episode.started_at == _day(0)
+    assert episode.last_seen_at == _day(2)
+    assert episode.ended_at is None
+    assert len(episode.events) <= 3
+
+
+def test_one_good_day_between_two_bad_ones_stays_one_episode() -> None:
+    # Weather flickers; a fault does not become two incidents because of it.
+    days = _days({0: (12.0, 40.0), 1: (39.0, 40.0), 2: (13.0, 40.0)})
+    observations = yield_observations(days, _MIN_SHORTFALL)
+    [episode] = fold_observations(
+        "pv_underperformance", observations, [], YIELD_POLICY, _day(2)
+    )
+    assert episode.started_at == _day(0)
+    assert episode.last_seen_at == _day(2)
+
+
+def test_a_recovered_plant_ends_its_episode_after_the_quiet_days() -> None:
+    days = _days({0: (12.0, 40.0), 1: (39.0, 40.0), 2: (40.0, 40.0), 3: (39.0, 40.0)})
+    observations = yield_observations(days, _MIN_SHORTFALL)
+    [episode] = fold_observations(
+        "pv_underperformance", observations, [], YIELD_POLICY, _day(3)
+    )
+    assert episode.ended_at == _day(2)

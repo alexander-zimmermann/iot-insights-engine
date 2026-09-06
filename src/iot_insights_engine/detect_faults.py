@@ -19,6 +19,10 @@ Channel silence measures per channel but reports per main group, so its
 declaration carries its own plan; the lifecycle around it is the same
 runner as everything else's.
 
+A deviation fault that names an expectation runs the loop in days rather
+than hours: the plant's whole-day yield against the kWh its named model
+expected of it, on the plant's own address.
+
 The volume watchdog runs the loop over the engine's own output: it counts
 the incidents of the last seven days out of the episode stream and puts a
 severity on one house-wide address, so drift back into noise arrives on the
@@ -130,6 +134,20 @@ _KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
 }
 
 
+# The deviation kind's other shape: a fault that names an expectation
+# measures the plant's whole-day yield against it, in daily buckets, on the
+# plant's one declared address.
+_DAILY_YIELD: Kind[Any, Any] = Kind(
+    event="daily_yield_run",
+    delivery="ga",
+    frontier=deviation.yield_frontier,
+    measure=deviation.measure_yield,
+    publish_for=deviation.publish_for_plant,
+    payload=deviation.payload_yield,
+    policy=deviation.YIELD_POLICY,
+)
+
+
 # The drift kind runs one shape per signal: same CUSUM, different series,
 # so the run record and the payload's units differ with the signal the
 # fault declares.
@@ -193,12 +211,16 @@ def _kind_for(fault: Fault) -> Kind[Any, Any] | None:
     """The shape this fault runs in, if it has one. Drift picks it by the
     signal the file declares — the loader rejects one without, so a fault
     that got here signalless is a new kind of drift nobody wired up, and it
-    fails rather than reporting nothing.
+    fails rather than reporting nothing. Deviation picks it by whether the
+    fault names an expectation: with one it measures a daily yield against
+    that model, without one a room against its setpoint.
     """
     if fault.kind is MeasurementKind.DRIFT:
         if fault.signal is None:
             raise ValueError(f"fault {fault.name}: a drift fault declares which series it walks")
         return _DRIFT_SIGNALS[fault.signal]
+    if fault.kind is MeasurementKind.DEVIATION and fault.expectation is not None:
+        return _DAILY_YIELD
     return _KINDS.get(fault.kind)
 
 

@@ -22,6 +22,7 @@
         "unit":       { "type": "string", "minLength": 1 },
         "kind":       { "enum": ["drift", "duration", "deviation", "silence", "constancy", "external", "volume"] },
         "signal":     { "enum": ["standby", "duty_cycle", "recovery"] },
+        "expectation": { "enum": ["forecast_solar"] },
         "parameters": {
           "type": "object",
           "minProperties": 1,
@@ -40,8 +41,19 @@
       "allOf": [
         {
           "if":   { "properties": { "kind": { "const": "volume" } }, "required": ["kind"] },
-          "then": { "properties": { "parameters": { "required": ["max_episodes_per_week"] } } },
-          "else": { "required": ["scope"] }
+          "then": { "properties": { "parameters": { "required": ["max_episodes_per_week"] } } }
+        },
+        {
+          "$comment": "A fault that measures no channels declares no catalog query: the volume watchdog counts episodes, a deviation fault with a named expectation measures against that model.",
+          "if": {
+            "not": {
+              "anyOf": [
+                { "properties": { "kind": { "const": "volume" } }, "required": ["kind"] },
+                { "required": ["expectation"] }
+              ]
+            }
+          },
+          "then": { "required": ["scope"] }
         },
         {
           "if":   { "properties": { "kind": { "const": "silence" } }, "required": ["kind"] },
@@ -142,12 +154,32 @@
           }
         },
         {
-          "if":   { "properties": { "kind": { "const": "deviation" } }, "required": ["kind"] },
+          "if": {
+            "allOf": [
+              { "properties": { "kind": { "const": "deviation" } }, "required": ["kind"] },
+              { "not": { "required": ["expectation"] } }
+            ]
+          },
           "then": {
             "required": ["roles", "rooms"],
             "properties": {
               "parameters": { "required": ["min_hours"] },
               "roles":      { "$ref": "#/$defs/roles" }
+            }
+          }
+        },
+        {
+          "$comment": "The deviation kind's other shape: a daily yield against a named model.",
+          "if":   { "required": ["expectation"] },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["min_shortfall_pct", "min_expected_kwh"],
+                "properties": {
+                  "min_shortfall_pct": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+                  "min_expected_kwh":  { "type": "number", "exclusiveMinimum": 0 }
+                }
+              }
             }
           }
         }
