@@ -62,7 +62,7 @@ from .faults import ExchangerRoles
 from .nats_publisher import slugify
 from .reconcile import Measured, Plan, Window, measurement_reaches, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, like_match, pair_by_match, resolve_scope
+from .silence import BUCKET, hourly_averages, like_match, pair_by_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -887,25 +887,6 @@ def publish_for_exchanger(
     )
 
 
-def hourly_means(
-    conn: psycopg.Connection[DictRow], gas: Sequence[str], window_start: datetime
-) -> dict[str, dict[datetime, float]]:
-    """The roles' hourly averages over the window, one query for the whole
-    scope — three temperature channels, not 2500."""
-    rows = conn.execute(
-        """
-        SELECT ga, bucket, avg_value FROM knx_1h
-        WHERE ga = ANY(%(gas)s) AND bucket >= %(start)s
-        ORDER BY ga, bucket
-        """,
-        {"gas": list(gas), "start": window_start},
-    ).fetchall()
-    series: dict[str, dict[datetime, float]] = {}
-    for row in rows:
-        series.setdefault(row["ga"], {})[row["bucket"]] = float(row["avg_value"])
-    return series
-
-
 def measure_recovery(
     conn: psycopg.Connection[DictRow], fault: Fault, window: Window
 ) -> Measured[ExchangerState]:
@@ -922,7 +903,7 @@ def measure_recovery(
     exchanger = resolve_exchanger(
         resolve_scope(conn, fault.channel_scope()), fault.references, fault.roles
     )
-    series = hourly_means(conn, exchanger.gas, window.start)
+    series = hourly_averages(conn, exchanger.gas, window.start)
     etas = efficiency_series(
         exchanger,
         series,

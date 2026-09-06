@@ -548,9 +548,10 @@ class TestPlanRun:
         assert plan.publishes == ()
 
 
-# The declared numbers of the heat_recovery_decay fault: a healthy exchanger
-# recovers 88 % of the gradient, 10 points less is the line, and hours where
-# inside and outside are within 10 K of each other measure nothing.
+# The recovery seam's invented numbers — the deployed fault declares its own
+# (calibrated against history): a healthy exchanger recovers 88 % of the
+# gradient, 10 points less is the line, and hours where inside and outside
+# are within 10 K of each other measure nothing.
 _KWL_HEALTHY = 88.0
 _FALL = 10.0
 _FALL_BUDGET = 480.0

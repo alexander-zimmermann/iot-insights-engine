@@ -203,6 +203,25 @@ def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
     return row["frontier"] if row else None
 
 
+def hourly_averages(
+    conn: psycopg.Connection[DictRow], gas: Sequence[str], window_start: datetime
+) -> dict[str, dict[datetime, float]]:
+    """The channels' hourly averages over the window, one query for the
+    whole scope — a fault's few role channels, not 2500."""
+    rows = conn.execute(
+        """
+        SELECT ga, bucket, avg_value FROM knx_1h
+        WHERE ga = ANY(%(gas)s) AND bucket >= %(start)s
+        ORDER BY ga, bucket
+        """,
+        {"gas": list(gas), "start": window_start},
+    ).fetchall()
+    series: dict[str, dict[datetime, float]] = {}
+    for row in rows:
+        series.setdefault(row["ga"], {})[row["bucket"]] = float(row["avg_value"])
+    return series
+
+
 def like_match(pattern: str, name: str) -> bool:
     """SQL LIKE against a full name (`%` any run, `_` any character) — the
     same dialect the scope's catalog query speaks, so a role pattern reads

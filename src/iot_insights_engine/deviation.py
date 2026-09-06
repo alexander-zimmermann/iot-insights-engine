@@ -39,7 +39,7 @@ from .logging_setup import get_logger
 from .nats_publisher import slugify
 from .reconcile import Measured, Plan, Window, subject_plan
 from .runs import split_runs
-from .silence import BUCKET, DEAD_MIN_BUCKETS, like_match, resolve_scope
+from .silence import BUCKET, DEAD_MIN_BUCKETS, hourly_averages, like_match, resolve_scope
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -367,25 +367,6 @@ def publish_for(subject: str, severity: int, state: RoomState | None) -> RoomPub
     )
 
 
-def values(
-    conn: psycopg.Connection[DictRow], gas: Sequence[str], window_start: datetime
-) -> dict[str, dict[datetime, float]]:
-    """The rooms' hourly averages over the window, one query for the whole
-    scope — 14 room triples, not 2500 channels."""
-    rows = conn.execute(
-        """
-        SELECT ga, bucket, avg_value FROM knx_1h
-        WHERE ga = ANY(%(gas)s) AND bucket >= %(start)s
-        ORDER BY ga, bucket
-        """,
-        {"gas": list(gas), "start": window_start},
-    ).fetchall()
-    series: dict[str, dict[datetime, float]] = {}
-    for row in rows:
-        series.setdefault(row["ga"], {})[row["bucket"]] = float(row["avg_value"])
-    return series
-
-
 def measure(
     conn: psycopg.Connection[DictRow], fault: Fault, window: Window
 ) -> Measured[RoomState]:
@@ -402,7 +383,7 @@ def measure(
     # A room without its channels or a channel without its room fails the
     # run loudly — never a silently unmeasured room.
     rooms = resolve_rooms(channels, fault.rooms, fault.roles)
-    series = values(conn, [ga for room in rooms for ga in room.gas], window.start)
+    series = hourly_averages(conn, [ga for room in rooms for ga in room.gas], window.start)
 
     dead = dead_value_gas(rooms, series)
     if dead:
