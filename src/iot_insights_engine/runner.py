@@ -153,19 +153,40 @@ class NatsPublisher:
         )
 
 
+class PlanHook[S, P](Protocol):
+    """A kind's own planning step: the computed episodes against the stored
+    open rows, delivered the kind's way — declared only where the default
+    per-subject delivery does not fit (silence reports per main group).
+    """
+
+    def __call__(
+        self,
+        *,
+        episodes: Sequence[Episode],
+        open_rows: Sequence[OpenEpisodeRow],
+        measured: Measured[S],
+        frontier: datetime,
+    ) -> Plan[P]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Kind[S, P: SubjectPublish]:
-    """One per-subject fault kind, reduced to what actually differs between
-    them: how its series is measured (`frontier`, `measure`) and how its
-    payload is shaped (`publish_for`, `payload`) — both live in the kind's
-    own module, so the whole wire story of a kind is read in one place.
-    `event` names its log record, `delivery` the target form the fault must
-    declare for it.
+    """One fault kind, reduced to what actually differs between them: how
+    its series is measured (`frontier`, `measure`) and how its payload is
+    shaped (`publish_for`, `payload`) — both live in the kind's own module,
+    so the whole wire story of a kind is read in one place. `event` names
+    its log record, `delivery` the target form the fault must declare for
+    it.
 
     `measure` receives the fault's open rows beside the window: most kinds
     ignore them, a kind that prunes its scope by what is already open (or
     seeds its fold with stored severities) reads them instead of re-asking
     the store.
+
+    Planning defaults to the shared per-subject delivery through
+    `publish_for`; a kind delivered another way declares `plan` instead —
+    one of the two is required. `warn_dataless` is off for the one kind
+    whose dataless set is routinely huge and already accounted for.
     """
 
     event: str
@@ -175,8 +196,10 @@ class Kind[S, P: SubjectPublish]:
         [psycopg.Connection[DictRow], Fault, Window, Sequence[OpenEpisodeRow]],
         Measured[S],
     ]
-    publish_for: Callable[[str, int, S | None], P]
     payload: Callable[[P], dict[str, Any]]
+    publish_for: Callable[[str, int, S | None], P] | None = None
+    plan: PlanHook[S, P] | None = None
+    warn_dataless: bool = True
 
 
 def publish_subjects[P: SubjectPublish](
@@ -222,7 +245,7 @@ def run_subjects[S, P: SubjectPublish](
         measured = kind.measure(conn, fault, window, open_rows)
         history_scores = store.history_scores(conn, fault.name)
 
-    if measured.dataless:
+    if measured.dataless and kind.warn_dataless:
         # Never at info level: a subject nobody could measure is the one
         # thing that keeps an open episode from ever clearing itself.
         log.warning(
@@ -235,16 +258,7 @@ def run_subjects[S, P: SubjectPublish](
         fault.name, measured.observations, history_scores, policy, frontier
     )
 
-    def payload(subject: str, severity: int) -> P:
-        return kind.publish_for(subject, severity, measured.states.get(subject))
-
-    plan = subject_plan(
-        episodes=episodes,
-        open_rows=open_rows,
-        dataless=measured.dataless,
-        frontier=frontier,
-        publish_for=payload,
-    )
+    plan = _plan_for(kind, episodes, open_rows, measured, frontier)
 
     log.info(
         kind.event,
@@ -267,6 +281,35 @@ def run_subjects[S, P: SubjectPublish](
 
     publish_subjects(publisher, fault.name, plan.publishes, kind.payload)
     store.apply(fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+
+
+def _plan_for[S, P: SubjectPublish](
+    kind: Kind[S, P],
+    episodes: Sequence[Episode],
+    open_rows: Sequence[OpenEpisodeRow],
+    measured: Measured[S],
+    frontier: datetime,
+) -> Plan[P]:
+    """The kind's own plan where it declares one, the shared per-subject
+    delivery otherwise."""
+    if kind.plan is not None:
+        return kind.plan(
+            episodes=episodes, open_rows=open_rows, measured=measured, frontier=frontier
+        )
+    publish_for = kind.publish_for
+    if publish_for is None:
+        raise ValueError(f"kind {kind.event}: declares neither publish_for nor plan")
+
+    def payload(subject: str, severity: int) -> P:
+        return publish_for(subject, severity, measured.states.get(subject))
+
+    return subject_plan(
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=measured.dataless,
+        frontier=frontier,
+        publish_for=payload,
+    )
 
 
 def log_dry_run[P: SubjectPublish](

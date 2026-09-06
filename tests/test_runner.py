@@ -19,7 +19,7 @@ import pytest
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import Episode, Observation
 from iot_insights_engine.faults import Fault, MeasurementKind, Target
-from iot_insights_engine.reconcile import Measured, Window
+from iot_insights_engine.reconcile import Measured, Plan, Window
 from iot_insights_engine.runner import LOOKBACK, Kind, run_subjects
 
 if TYPE_CHECKING:
@@ -202,6 +202,63 @@ def test_a_fault_declaring_the_wrong_target_form_is_rejected() -> None:
             store, publisher, _fault(target=Target(ga="0/0/230")), _kind(), dry_run=False
         )
     assert events == []
+
+
+def test_a_kind_declaring_its_own_plan_is_planned_by_it() -> None:
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+
+    def plan(
+        *,
+        episodes: Sequence[Episode],
+        open_rows: Sequence[OpenEpisodeRow],
+        measured: Measured[Any],
+        frontier: datetime,
+    ) -> Plan[_Publish]:
+        return Plan(
+            inserts=(),
+            updates=(),
+            orphan_closes=(),
+            stale_opens=(),
+            publishes=(_Publish("2", 2),),
+        )
+
+    kind = Kind(
+        event="test_group_run",
+        delivery="per_device",
+        frontier=lambda _conn: _FRONTIER,
+        measure=lambda _conn, _fault, _window, _open_rows: Measured(
+            states={}, observations=(), dataless=frozenset(), counts={}
+        ),
+        payload=lambda p: {"subject": p.subject},
+        plan=plan,
+    )
+    run_subjects(store, publisher, _fault(), kind, dry_run=False)
+
+    assert events == ["read", "publish", "apply"]
+    ((_, _, payload, entity, firing),) = publisher.published
+    assert payload == {"subject": "2"}
+    assert entity == "2"
+    assert firing is True
+
+
+def test_a_kind_declaring_neither_publish_for_nor_plan_fails_loudly() -> None:
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+
+    kind: Kind[Any, Any] = Kind(
+        event="test_undeclared_run",
+        delivery="per_device",
+        frontier=lambda _conn: _FRONTIER,
+        measure=lambda _conn, _fault, _window, _open_rows: Measured(
+            states={}, observations=(), dataless=frozenset(), counts={}
+        ),
+        payload=lambda p: {"subject": p.subject},
+    )
+    with pytest.raises(ValueError, match="neither publish_for nor plan"):
+        run_subjects(store, publisher, _fault(), kind, dry_run=False)
+    assert publisher.published == []
+    assert store.applied is None
 
 
 def test_the_measurement_sees_the_window_and_the_open_rows() -> None:
