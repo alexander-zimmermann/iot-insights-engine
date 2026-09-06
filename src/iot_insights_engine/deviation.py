@@ -67,11 +67,12 @@ has to agree on.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Protocol
 
+from . import forecast_solar
 from .episodes import EpisodePolicy, Observation
 from .faults import DeviationExpectation, Roles
 from .logging_setup import get_logger
@@ -459,9 +460,6 @@ YIELD_POLICY = EpisodePolicy(bucket=DAY, quiet_runs=1, promote_after_runs=3)
 # — a 1:1 subject with no entity token, like the volume watchdog's.
 PLANT = "pv"
 
-# What `mcp_forecasts` calls the rows the forecast-solar job writes.
-_FORECAST_SOLAR = ("forecast_solar", "pv_production", "forecast_solar")
-
 # The forecast is a sampled power curve. Two samples further apart than
 # this are not one interval but a hole in it — the night between two days
 # above all, which must never be integrated across.
@@ -491,16 +489,20 @@ class YieldDay:
 
 @dataclass(frozen=True, slots=True)
 class YieldState:
-    """The plant at the frontier: whether the newest judged day came in
-    short, since when it has, and the numbers behind it — what the publish
-    payload names beside the severity."""
+    """The plant at the frontier: the newest judged day and how it came in
+    against its expectation, plus the start of the short stretch if one is
+    still standing — what the publish payload names beside the severity.
+    The numbers are reported whether or not the day was short: an episode
+    stays open for a few quiet days, and "yesterday made its forecast" is
+    what a human needs to read in that window."""
 
-    expectation: str
+    expectation: DeviationExpectation
     min_shortfall_pct: float
-    short_since: datetime | None = None
-    shortfall_pct: float | None = None
+    day: datetime | None = None
     actual_kwh: float | None = None
     expected_kwh: float | None = None
+    shortfall_pct: float | None = None
+    short_since: datetime | None = None
 
 
 class Expectation(Protocol):
@@ -530,32 +532,50 @@ def yield_frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
     return row["frontier"] if row else None
 
 
-def daily_yield(
+def daily_counters(
     conn: psycopg.Connection[DictRow], window_start: datetime
-) -> dict[datetime, float]:
-    """What the plant produced per day, in kWh, summed over its inverters.
-    `energytotal` is a lifetime Wh counter, so the day's advance is exactly
-    its last reading minus its first — cheap and exact where a power
-    integral is neither. A counter reset reads as a negative advance and
-    floors at zero rather than inventing a record day. What falls between a
-    day's last sample and midnight is night, and is not missed.
-    """
+) -> dict[int, dict[datetime, float]]:
+    """Each inverter's lifetime energy counter, in Wh, as it stood at the
+    close of every day since `window_start`. A counter is exact and cheap
+    where a power integral is neither, and closing readings are all the
+    day's production can be read from."""
     rows = conn.execute(
         """
-        WITH per_inverter AS (
-            SELECT time_bucket(INTERVAL '1 day', bucket) AS day,
-                   inverter_id,
-                   last(energytotal_last, bucket) - first(energytotal_last, bucket) AS wh
-            FROM solaredge_inverter_1h
-            WHERE bucket >= %(start)s AND energytotal_last IS NOT NULL
-            GROUP BY day, inverter_id
-        )
-        SELECT day, sum(GREATEST(wh, 0)) / 1000.0 AS kwh
-        FROM per_inverter GROUP BY day ORDER BY day
+        SELECT time_bucket(INTERVAL '1 day', bucket) AS day,
+               inverter_id,
+               last(energytotal_last, bucket) AS wh
+        FROM solaredge_inverter_1h
+        WHERE bucket >= %(start)s AND energytotal_last IS NOT NULL
+        GROUP BY day, inverter_id
+        ORDER BY inverter_id, day
         """,
         {"start": window_start},
     ).fetchall()
-    return {row["day"]: float(row["kwh"]) for row in rows}
+    counters: dict[int, dict[datetime, float]] = {}
+    for row in rows:
+        counters.setdefault(int(row["inverter_id"]), {})[row["day"]] = float(row["wh"])
+    return counters
+
+
+def daily_yield(counters: Mapping[int, Mapping[datetime, float]]) -> dict[datetime, float]:
+    """What the plant produced per day, in kWh: every inverter's advance
+    from the *previous* day's closing counter, summed. The previous day's
+    close and not the day's own first reading, because an inverter that
+    powers down at night has no reading until it is already producing —
+    measuring from its own first bucket would lose the first daylight hour
+    of every day. A day whose predecessor is missing has no measurable
+    advance and is left out rather than credited with the whole gap, and a
+    counter reset floors at zero rather than inventing a record day.
+    """
+    energy: dict[datetime, float] = defaultdict(float)
+    measured: set[datetime] = set()
+    for series in counters.values():
+        for previous, day in pairwise(sorted(series)):
+            if day - previous != DAY:
+                continue
+            measured.add(day)
+            energy[day] += max(series[day] - series[previous], 0.0) / 1000.0
+    return {day: energy[day] for day in sorted(measured)}
 
 
 def forecast_curve(
@@ -566,7 +586,6 @@ def forecast_curve(
     the best-informed forecast that day itself produced — which is what
     makes the expectation weather-adjusted rather than a week-old guess.
     """
-    source, metric, model = _FORECAST_SOLAR
     rows = conn.execute(
         """
         SELECT forecast_for, forecast_value FROM mcp_forecasts
@@ -574,7 +593,14 @@ def forecast_curve(
           AND forecast_for >= %(start)s AND forecast_value IS NOT NULL
         ORDER BY forecast_for
         """,
-        {"source": source, "metric": metric, "model": model, "start": window_start},
+        {
+            # The identity of these rows belongs to the job that writes
+            # them; naming it here again would let a rename pass silently.
+            "source": forecast_solar.SOURCE,
+            "metric": forecast_solar.METRIC,
+            "model": forecast_solar.MODEL,
+            "start": window_start,
+        },
     ).fetchall()
     return [(row["forecast_for"], float(row["forecast_value"])) for row in rows]
 
@@ -584,12 +610,13 @@ def daily_energy(curve: Sequence[tuple[datetime, float]]) -> dict[datetime, floa
     trapezoidally between consecutive samples and only where they are one
     interval apart. The curve carries daylight points alone, so the stretch
     from one sunset to the next sunrise is not an interval to integrate but
-    the night between two days; anything longer than `MAX_FORECAST_STEP` is
-    read as such. A hole in the forecast therefore lowers the expectation
-    instead of bridging it with a straight line through midday — the
-    conservative direction, since a lower expectation is harder to fall
-    short of. An interval is credited to the day it starts in; at this
-    latitude none of them straddles a UTC midnight.
+    the night between two days. `MAX_FORECAST_STEP` is where one becomes
+    the other: it spans a single missing sample at either resolution the
+    job may have stored, and nothing wider — so a gap of hours lowers the
+    expectation rather than bridging it with a straight line through
+    midday, which is the conservative direction, a lower expectation being
+    harder to fall short of. An interval is credited to the day it starts
+    in; at this latitude none of them straddles a UTC midnight.
     """
     energy: dict[datetime, float] = defaultdict(float)
     for (start, left), (end, right) in pairwise(curve):
@@ -661,23 +688,31 @@ def yield_observations(
 def classify_yield(
     days: Sequence[YieldDay],
     min_shortfall_pct: float,
-    expectation: str,
+    expectation: DeviationExpectation,
     frontier: datetime,
 ) -> YieldState:
-    """The plant's current short stretch, if one reaches the frontier — what
-    the publish payload names alongside the severity."""
-    short = short_days(days, min_shortfall_pct)
-    runs = split_runs((d.day for d in short), DAY)
-    if not runs or runs[-1].end != frontier:
-        return YieldState(expectation=expectation, min_shortfall_pct=min_shortfall_pct)
-    latest = short[-1]
-    return YieldState(
+    """The newest judged day and, if a short stretch still reaches the
+    frontier, when it began — what the publish payload names alongside the
+    severity. The day's numbers are reported either way: an episode stays
+    open across a few quiet days, and a severity published in that window
+    must still say what the last measured day actually did.
+    """
+    runs = split_runs((d.day for d in short_days(days, min_shortfall_pct)), DAY)
+    state = YieldState(
         expectation=expectation,
         min_shortfall_pct=min_shortfall_pct,
-        short_since=runs[-1].start,
-        shortfall_pct=latest.shortfall_pct,
+        short_since=runs[-1].start if runs and runs[-1].end == frontier else None,
+    )
+    if not days:
+        # Nothing judged in the whole window: no day to report on.
+        return state
+    latest = days[-1]
+    return replace(
+        state,
+        day=latest.day,
         actual_kwh=latest.actual_kwh,
         expected_kwh=latest.expected_kwh,
+        shortfall_pct=latest.shortfall_pct,
     )
 
 
@@ -716,11 +751,12 @@ def payload_yield(publish: PlantPublish) -> dict[str, Any]:
     state = publish.state
     return {
         "expectation": state.expectation,
-        "short_since": state.short_since,
-        "shortfall_pct": state.shortfall_pct,
+        "day": state.day,
         "actual_kwh": state.actual_kwh,
         "expected_kwh": state.expected_kwh,
+        "shortfall_pct": state.shortfall_pct,
         "min_shortfall_pct": state.min_shortfall_pct,
+        "short_since": state.short_since,
     }
 
 
@@ -735,33 +771,38 @@ def measure_yield(
     """
     expectation = fault.expectation
     if expectation is None:
+        # The named expectation is what routed the fault here at all; this
+        # is the measurement's side of the same contract.
         raise ValueError(f"fault {fault.name}: the daily-yield shape needs a named expectation")
     expected_kwh = EXPECTATIONS.get(expectation)
     if expected_kwh is None:
+        # A name the schema accepts but nobody wrote a provider for: it
+        # fails its own fault loudly rather than reporting a quiet plant.
         raise ValueError(f"fault {fault.name}: no expectation is wired up for {expectation}")
     min_shortfall = float(fault.parameters["min_shortfall_pct"])
     min_expected = float(fault.parameters["min_expected_kwh"])
 
     days = judged_days(
-        daily_yield(conn, window.start),
+        daily_yield(daily_counters(conn, window.start)),
         expected_kwh(conn, window.start),
         min_expected_kwh=min_expected,
         frontier=window.frontier,
     )
-    state = classify_yield(days, min_shortfall, str(expectation), window.frontier)
+    state = classify_yield(days, min_shortfall, expectation, window.frontier)
     # No judged day near the frontier means nobody could tell a recovery
     # from a dark week or a dead forecast job; the episode must not clear.
-    dataless = frozenset() if window.reaches(days[-1].day if days else None) else {PLANT}
+    reaches = window.reaches(days[-1].day if days else None)
 
     return Measured(
         states={PLANT: state},
         observations=tuple(yield_observations(days, min_shortfall)),
-        dataless=frozenset(dataless),
+        # Nobody could tell a recovery from a dark week or a dead forecast
+        # job, so the episode must not clear itself on the silence.
+        dataless=frozenset() if reaches else frozenset({PLANT}),
         record={
             "expectation": str(expectation),
             "judged_days": len(days),
             "short_days": len(short_days(days, min_shortfall)),
             "short_since": state.short_since.isoformat() if state.short_since else None,
         },
-        labels={PLANT: "Photovoltaik"},
     )

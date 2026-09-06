@@ -247,10 +247,12 @@ class Fault:
     expectation: DeviationExpectation | None = None
 
     def channel_scope(self) -> Scope:
-        """The catalog query this fault measures over. Every kind but volume
-        declares one and the loader enforces it, so a missing scope here is a
-        new kind that arrived without saying what it measures — never an
-        empty query, which would resolve to the whole catalog.
+        """The catalog query this fault measures over. Every fault that
+        measures channels declares one and the loader enforces it, so a
+        missing scope here is a kind that measures channels and arrived
+        without saying which — never an empty query, which would resolve to
+        the whole catalog. The two that measure none (the volume watchdog,
+        and a deviation fault with a named expectation) never ask.
         """
         if self.scope is None:
             raise ValueError(f"fault {self.name}: this kind measures channels and needs a scope")

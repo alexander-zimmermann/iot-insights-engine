@@ -211,8 +211,10 @@ class Kind[S, P: SubjectPublish]:
     Folding defaults to the pure observation pipeline; planning defaults to
     the shared per-subject delivery through `publish_for` — a kind that
     works another way declares `fold` or `plan` instead (one of
-    `publish_for`/`plan` is required). `policy` is the cadence its
-    observations fold in, hourly unless the kind measures in another.
+    `publish_for`/`plan` is required). `policy` is how its observations
+    fold — hourly, like the aggregates every kind so far reads, unless the
+    kind measures in another cadence and declares its own, so that "a few
+    quiet runs" is counted in the unit it actually measures in.
     `delivery` is None for the one kind whose faults declare no target at
     all; `payload` is None for the one kind that publishes nothing;
     `warn_dataless` is off for the one kind whose dataless set is routinely
@@ -234,9 +236,6 @@ class Kind[S, P: SubjectPublish]:
     plan: PlanHook[S, P] | None = None
     warn_dataless: bool = True
     externally_delivered: bool = False
-    # How its observations fold. Hourly, like the aggregates every kind so
-    # far reads; a kind that measures in another cadence declares its own,
-    # so that "a few quiet runs" counts in the unit it actually measures in.
     policy: EpisodePolicy = EpisodePolicy()
 
 

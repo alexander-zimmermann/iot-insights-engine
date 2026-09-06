@@ -47,7 +47,7 @@ and plans.
 ## Subject
 
 The thing a fault's verdict is about: a channel, a device, a room, an
-exchanger, or the house itself. Episodes are stored per fault and subject.
+exchanger, the PV plant, or the house itself. Episodes are stored per fault and subject.
 
 ## Scope
 

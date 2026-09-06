@@ -498,12 +498,13 @@ def _plant_publish(severity: int) -> deviation.PlantPublish:
     return deviation.PlantPublish(
         severity=severity,
         state=deviation.YieldState(
-            expectation="forecast_solar",
+            expectation=DeviationExpectation.FORECAST_SOLAR,
             min_shortfall_pct=35.0,
+            day=_T0,
+            actual_kwh=12.0 if severity else 39.0,
+            expected_kwh=40.0,
+            shortfall_pct=70.0 if severity else 2.5,
             short_since=_T0 if severity else None,
-            shortfall_pct=70.0 if severity else None,
-            actual_kwh=12.0 if severity else None,
-            expected_kwh=40.0 if severity else None,
         ),
     )
 
@@ -525,6 +526,7 @@ def test_publish_plant_carries_the_day_against_its_expectation() -> None:
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
     assert payload["expectation"] == "forecast_solar"
+    assert payload["day"] == _T0
     assert payload["actual_kwh"] == 12.0
     assert payload["expected_kwh"] == 40.0
     assert payload["shortfall_pct"] == 70.0

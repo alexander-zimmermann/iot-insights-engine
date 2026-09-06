@@ -29,6 +29,7 @@ from iot_insights_engine.deviation import (
     classify_yield,
     cold_buckets,
     daily_energy,
+    daily_yield,
     dead_value_gas,
     deviation_observations,
     judged_days,
@@ -40,7 +41,7 @@ from iot_insights_engine.deviation import (
     yield_observations,
 )
 from iot_insights_engine.episodes import EpisodePolicy, fold_observations
-from iot_insights_engine.faults import Roles, RoomRule
+from iot_insights_engine.faults import DeviationExpectation, Roles, RoomRule
 from iot_insights_engine.silence import Channel
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
@@ -411,6 +412,7 @@ def test_three_cold_hours_become_one_episode_with_few_events() -> None:
 
 _DAY0 = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
 _MIN_SHORTFALL = 35.0
+_FORECAST = DeviationExpectation.FORECAST_SOLAR
 
 
 def _day(n: int) -> datetime:
@@ -468,6 +470,39 @@ class TestDailyEnergy:
         assert daily_energy(_curve()) == {}
 
 
+class TestDailyYield:
+    def test_a_day_is_measured_from_the_previous_days_close(self) -> None:
+        # An inverter powers down at night, so its first reading of the day
+        # already includes the first daylight hour; only the previous day's
+        # closing counter puts that hour back in the right day.
+        counters = {1: {_day(0): 1_000.0, _day(1): 31_000.0, _day(2): 55_000.0}}
+        assert daily_yield(counters) == {_day(1): 30.0, _day(2): 24.0}
+
+    def test_the_inverters_sum(self) -> None:
+        counters = {
+            1: {_day(0): 0.0, _day(1): 20_000.0},
+            2: {_day(0): 5_000.0, _day(1): 17_000.0},
+        }
+        assert daily_yield(counters) == {_day(1): 32.0}
+
+    def test_a_day_whose_predecessor_is_missing_is_left_out(self) -> None:
+        # Crediting the gap to the day that followed it would invent a
+        # record day and hide the outage.
+        counters = {1: {_day(0): 1_000.0, _day(2): 61_000.0, _day(3): 81_000.0}}
+        assert daily_yield(counters) == {_day(3): 20.0}
+
+    def test_a_counter_reset_floors_at_zero(self) -> None:
+        counters = {1: {_day(0): 900_000.0, _day(1): 2_000.0, _day(2): 22_000.0}}
+        assert daily_yield(counters) == {_day(1): 0.0, _day(2): 20.0}
+
+    def test_one_inverter_missing_a_day_does_not_drop_the_other(self) -> None:
+        counters = {
+            1: {_day(0): 0.0, _day(1): 20_000.0},
+            2: {_day(1): 5_000.0},
+        }
+        assert daily_yield(counters) == {_day(1): 20.0}
+
+
 class TestJudgedDays:
     def test_only_days_both_sides_know_and_that_expected_enough(self) -> None:
         actual = {_day(0): 30.0, _day(1): 5.0, _day(2): 40.0}
@@ -516,26 +551,36 @@ class TestYieldObservations:
 class TestClassifyYield:
     def test_a_short_stretch_reaching_the_frontier(self) -> None:
         days = _days({0: (38.0, 40.0), 1: (10.0, 40.0), 2: (12.0, 40.0)})
-        state = classify_yield(days, _MIN_SHORTFALL, "forecast_solar", frontier=_day(2))
+        state = classify_yield(days, _MIN_SHORTFALL, _FORECAST, frontier=_day(2))
         assert state.short_since == _day(1)
+        assert state.day == _day(2)
         assert state.actual_kwh == 12.0
         assert state.expected_kwh == 40.0
         assert state.shortfall_pct == pytest.approx(70.0)
-        assert state.expectation == "forecast_solar"
+        assert state.expectation is _FORECAST
         assert state.min_shortfall_pct == _MIN_SHORTFALL
 
-    def test_a_plant_that_recovered_before_the_frontier(self) -> None:
+    def test_a_plant_that_recovered_still_reports_its_last_day(self) -> None:
+        # The episode stays open for a few quiet days; a severity published
+        # in that window must still say what the last measured day did.
         days = _days({0: (10.0, 40.0), 1: (39.0, 40.0)})
-        state = classify_yield(days, _MIN_SHORTFALL, "forecast_solar", frontier=_day(1))
+        state = classify_yield(days, _MIN_SHORTFALL, _FORECAST, frontier=_day(1))
+        assert state.short_since is None
+        assert state.day == _day(1)
+        assert state.actual_kwh == 39.0
+        assert state.shortfall_pct == pytest.approx(2.5)
+
+    def test_a_window_with_nothing_judged_reports_no_day(self) -> None:
+        state = classify_yield([], _MIN_SHORTFALL, _FORECAST, frontier=_day(1))
         assert state == YieldState(
-            expectation="forecast_solar", min_shortfall_pct=_MIN_SHORTFALL
+            expectation=_FORECAST, min_shortfall_pct=_MIN_SHORTFALL
         )
 
 
 class TestPublishForPlant:
     def test_the_payload_names_the_day_and_what_it_was_measured_against(self) -> None:
         state = classify_yield(
-            _days({0: (12.0, 40.0)}), _MIN_SHORTFALL, "forecast_solar", frontier=_day(0)
+            _days({0: (12.0, 40.0)}), _MIN_SHORTFALL, _FORECAST, frontier=_day(0)
         )
         publish = publish_for_plant(PLANT, 2, state)
         assert publish.subject == PLANT
@@ -543,11 +588,12 @@ class TestPublishForPlant:
         assert publish.entity is None
         assert payload_yield(publish) == {
             "expectation": "forecast_solar",
-            "short_since": _day(0),
-            "shortfall_pct": pytest.approx(70.0),
+            "day": _day(0),
             "actual_kwh": 12.0,
             "expected_kwh": 40.0,
+            "shortfall_pct": pytest.approx(70.0),
             "min_shortfall_pct": _MIN_SHORTFALL,
+            "short_since": _day(0),
         }
 
     def test_a_publish_without_a_measured_state_is_a_wiring_error(self) -> None:
