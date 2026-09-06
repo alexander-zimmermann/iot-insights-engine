@@ -1,5 +1,6 @@
-"""Notification-volume tests — seam 2 (the measurement over an invented
-episode stream) plus the runner's single-subject reconcile.
+"""Notification-volume tests — the measurement over an invented episode
+stream, the publish payload, and the chain onto the shared per-subject
+plan. The reconciliation itself is `test_reconcile`'s.
 
 The fixtures are weeks of incidents, not database rows: a week with ten
 episodes must fire and a week with three must stay quiet, and the watchdog's
@@ -10,27 +11,26 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import (
-    Episode,
     EpisodePolicy,
     EventKind,
-    EvidenceRow,
-    NotificationEvent,
     fold_observations,
 )
+from iot_insights_engine.reconcile import Plan, subject_plan
 from iot_insights_engine.volume import (
     SUBJECT,
     WINDOW,
     EpisodeStart,
     FaultCount,
     VolumeBucket,
-    VolumePlan,
     VolumePublish,
     VolumeState,
     classify,
     count_series,
-    plan_run,
+    publish_for,
     volume_observations,
 )
 
@@ -145,123 +145,37 @@ def _state(
     )
 
 
-def _episode(severity: int, *, ended: bool = False, age_hours: int = 6) -> Episode:
-    start = _FRONTIER - age_hours * _HOUR
-    evidence = (
-        EvidenceRow(time=start, score=1.2, severity=severity, value=6.0),
-        EvidenceRow(time=start + _HOUR, score=2.0, severity=severity, value=10.0),
-    )
-    events = [NotificationEvent(EventKind.APPEARED, start, severity)]
-    ended_at = None
-    if ended:
-        ended_at = start + 5 * _HOUR
-        events.append(NotificationEvent(EventKind.ENDED, ended_at, 0))
-    return Episode(
-        fault="notification_volume",
-        subject=SUBJECT,
-        started_at=start,
-        last_seen_at=start + _HOUR,
-        ended_at=ended_at,
-        severity=severity,
-        peak_score=2.0,
-        evidence=evidence,
-        events=tuple(events),
-    )
+def test_publish_for_names_the_house_and_its_state() -> None:
+    publish = publish_for(SUBJECT, 1, _state())
+    assert publish == VolumePublish(severity=1, state=_state())
+    assert publish.subject == SUBJECT
+    # One house-wide address: a 1:1 subject with no entity token.
+    assert publish.entity is None
 
 
-def _plan(
-    episodes: list[Episode],
-    open_row: OpenEpisodeRow | None,
-    state: VolumeState | None = None,
-) -> VolumePlan:
-    return plan_run(
-        episodes=episodes,
-        open_rows=[open_row] if open_row is not None else [],
-        state=state if state is not None else _state(),
-        frontier=_FRONTIER,
-    )
+def test_publish_for_without_a_state_fails_loudly() -> None:
+    # The stream is always countable and the measurement always states the
+    # house — a missing state is a wiring error, never a departed subject.
+    with pytest.raises(ValueError, match="without a measured state"):
+        publish_for(SUBJECT, 0, None)
 
 
-def test_a_fresh_over_volume_is_inserted_and_published() -> None:
-    episode = _episode(severity=1)
-    plan = _plan([episode], open_row=None)
-    assert plan.inserts == (episode,)
-    assert plan.updates == ()
-    assert plan.publish == VolumePublish(severity=1, state=_state())
-
-
-def test_an_unchanged_severity_publishes_nothing() -> None:
-    episode = _episode(severity=1)
-    row = OpenEpisodeRow(id=4, subject=SUBJECT, severity=1)
-    plan = _plan([episode], open_row=row)
-    assert plan.inserts == ()
-    assert plan.updates == ((4, episode),)
-    assert plan.publish is None
-
-
-def test_escalation_publishes_the_new_severity() -> None:
-    row = OpenEpisodeRow(id=4, subject=SUBJECT, severity=1)
-    plan = _plan([_episode(severity=2)], open_row=row)
-    assert plan.publish is not None
-    assert plan.publish.severity == 2
-
-
-def test_stored_severity_is_never_lowered() -> None:
-    # The window slid past the loudest stretch: the recomputed severity is
-    # lower, but the bus keeps the stored tier and nothing is re-published.
-    row = OpenEpisodeRow(id=4, subject=SUBJECT, severity=2)
-    plan = _plan([_episode(severity=1)], open_row=row)
-    assert plan.publish is None
-
-
-def test_recovery_reconciles_the_ended_episode_and_clears() -> None:
-    episode = _episode(severity=2, ended=True)
-    row = OpenEpisodeRow(id=4, subject=SUBJECT, severity=2)
-    plan = _plan([episode], open_row=row, state=_state(episodes=3, over_since=None))
-    assert plan.inserts == ()
-    assert plan.updates == ((4, episode),)
-    assert plan.publish is not None
-    assert plan.publish.severity == 0
-    assert plan.publish.state.episodes == 3
-
-
-def test_an_open_row_without_a_computed_episode_closes_at_the_frontier() -> None:
-    # Unlike the channel kinds there is no dataless case: the episode stream
-    # is always countable, so no episode really means the volume fell back.
-    row = OpenEpisodeRow(id=9, subject=SUBJECT, severity=2)
-    plan = _plan([], open_row=row, state=_state(episodes=2, over_since=None))
-    assert plan.orphan_closes == ((9, _FRONTIER),)
-    assert plan.publish is not None
-    assert plan.publish.severity == 0
-
-
-def test_a_historical_episode_without_an_open_row_is_ignored() -> None:
-    plan = _plan([_episode(severity=1, ended=True)], open_row=None)
-    assert plan == VolumePlan((), (), (), None)
-
-
-def test_only_the_latest_of_several_episodes_reconciles_the_open_row() -> None:
-    # Flicker beyond the quiet window splits the fortnight into two
-    # incidents; the stored open row can only correspond to the newer one.
-    older = _episode(severity=1, ended=True, age_hours=200)
-    newer = _episode(severity=2)
-    row = OpenEpisodeRow(id=4, subject=SUBJECT, severity=1)
-    plan = _plan([older, newer], open_row=row)
-    assert plan.updates == ((4, newer),)
-    assert plan.inserts == ()
-
-
-def _run(starts: list[EpisodeStart], open_row: OpenEpisodeRow | None = None) -> VolumePlan:
-    """The whole chain the runner drives, minus its SQL and NATS edges."""
+def _run(
+    starts: list[EpisodeStart], open_row: OpenEpisodeRow | None = None
+) -> Plan[VolumePublish]:
+    """The whole chain the runner drives, minus its SQL and NATS edges —
+    measurement, fold and the shared per-subject plan."""
     buckets = _series(starts)
     observations = volume_observations(buckets, _LIMIT)
-    return plan_run(
+    state = classify(starts, buckets, _LIMIT, _FRONTIER)
+    return subject_plan(
         episodes=fold_observations(
             "notification_volume", observations, [], EpisodePolicy(), _FRONTIER
         ),
         open_rows=[open_row] if open_row is not None else [],
-        state=classify(starts, buckets, _LIMIT, _FRONTIER),
+        dataless=frozenset(),
         frontier=_FRONTIER,
+        publish_for=lambda subject, severity: publish_for(subject, severity, state),
     )
 
 
@@ -269,15 +183,14 @@ def test_ten_episodes_put_a_severity_on_the_house_wide_address() -> None:
     plan = _run(_week(10))
     (inserted,) = plan.inserts
     assert inserted.ended_at is None
-    assert plan.publish is not None
-    assert plan.publish.severity > 0
-    assert plan.publish.state.episodes == 10
-    assert plan.publish.state.over_since is not None
+    (publish,) = plan.publishes
+    assert publish.severity > 0
+    assert publish.state.episodes == 10
+    assert publish.state.over_since is not None
 
 
 def test_three_episodes_reach_the_bus_as_nothing_at_all() -> None:
-    plan = _run(_week(3))
-    assert plan == VolumePlan((), (), (), None)
+    assert _run(_week(3)) == Plan((), (), (), (), ())
 
 
 def test_its_own_episode_keeps_counting_while_the_week_drains() -> None:
@@ -288,5 +201,6 @@ def test_its_own_episode_keeps_counting_while_the_week_drains() -> None:
     assert _series(starts)[-1].episodes == 5
     plan = _run(starts, open_row=OpenEpisodeRow(id=4, subject=SUBJECT, severity=2))
     assert plan.orphan_closes == ((4, _FRONTIER),)
-    assert plan.publish is not None
-    assert plan.publish.severity == 0
+    (publish,) = plan.publishes
+    assert publish.severity == 0
+    assert publish.state.episodes == 5

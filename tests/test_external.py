@@ -9,16 +9,19 @@ their notification events, or a reconciliation plan against stored rows.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import EventKind, NotificationEvent
+from iot_insights_engine.episodes import Episode, EventKind, NotificationEvent
 from iot_insights_engine.external import (
     SeverityWrite,
     drop_processed,
     fold_severity_writes,
-    plan_run,
+    plan,
 )
+from iot_insights_engine.reconcile import Measured, Plan
 
 _T0 = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
@@ -35,6 +38,25 @@ def _writes(*severities: tuple[float, int], subject: str = _GA) -> list[Severity
 
 def _events(events: tuple[NotificationEvent, ...]) -> list[tuple[EventKind, datetime, int]]:
     return [(e.kind, e.time, e.severity) for e in events]
+
+
+def _plan(
+    *,
+    episodes: Sequence[Episode],
+    open_rows: Sequence[OpenEpisodeRow],
+    in_scope: frozenset[str],
+    now: datetime,
+) -> Plan[Any]:
+    """The kind's plan hook, given the scope the measurement resolved —
+    `labels` names every address the catalog still holds."""
+    measured: Measured[list[SeverityWrite]] = Measured(
+        states={},
+        observations=(),
+        dataless=frozenset(),
+        record={},
+        labels=dict.fromkeys(in_scope, "declared"),
+    )
+    return plan(episodes=episodes, open_rows=open_rows, measured=measured, frontier=now)
 
 
 # ---------------------------------------------------------- fold: lifecycle
@@ -164,7 +186,7 @@ def test_after_a_seeded_end_a_new_write_opens_a_fresh_episode() -> None:
 
 def test_new_open_episode_is_inserted() -> None:
     episodes = fold_severity_writes("f", _writes((0, 2)), {})
-    plan = plan_run(episodes=episodes, open_rows=[], in_scope=frozenset({_GA}), now=_at(6))
+    plan = _plan(episodes=episodes, open_rows=[], in_scope=frozenset({_GA}), now=_at(6))
     assert [e.subject for e in plan.inserts] == [_GA]
     assert plan.updates == ()
     assert plan.orphan_closes == ()
@@ -173,7 +195,7 @@ def test_new_open_episode_is_inserted() -> None:
 def test_continuation_updates_the_stored_row() -> None:
     row = OpenEpisodeRow(id=7, subject=_GA, severity=2)
     episodes = fold_severity_writes("f", _writes((0, 0)), {_GA: 2})
-    plan = plan_run(episodes=episodes, open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
+    plan = _plan(episodes=episodes, open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
     assert plan.inserts == ()
     [(row_id, episode)] = plan.updates
     assert row_id == 7
@@ -183,7 +205,7 @@ def test_continuation_updates_the_stored_row() -> None:
 def test_ended_continuation_plus_new_incident_splits_update_and_insert() -> None:
     row = OpenEpisodeRow(id=7, subject=_GA, severity=2)
     episodes = fold_severity_writes("f", _writes((0, 0), (4, 3)), {_GA: 2})
-    plan = plan_run(episodes=episodes, open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
+    plan = _plan(episodes=episodes, open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
     [(row_id, ended)] = plan.updates
     assert (row_id, ended.ended_at) == (7, _at(0))
     [fresh] = plan.inserts
@@ -192,17 +214,17 @@ def test_ended_continuation_plus_new_incident_splits_update_and_insert() -> None
 
 def test_open_row_without_writes_stays_untouched() -> None:
     row = OpenEpisodeRow(id=7, subject=_GA, severity=2)
-    plan = plan_run(episodes=(), open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
+    plan = _plan(episodes=(), open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
     assert plan.updates == ()
     assert plan.orphan_closes == ()
-    assert plan.still_open == (_GA,)
+    assert plan.stale_opens == (_GA,)
 
 
 def test_open_row_whose_address_left_the_catalog_is_closed() -> None:
     row = OpenEpisodeRow(id=7, subject=_GA, severity=2)
-    plan = plan_run(episodes=(), open_rows=[row], in_scope=frozenset(), now=_at(6))
+    plan = _plan(episodes=(), open_rows=[row], in_scope=frozenset(), now=_at(6))
     assert plan.orphan_closes == ((7, _at(6)),)
-    assert plan.still_open == ()
+    assert plan.stale_opens == ()
 
 
 # ------------------------------------------------- replay safety across runs
@@ -227,7 +249,7 @@ def test_second_run_does_not_replay_a_closed_incident() -> None:
 
     second_run = drop_processed(writes, {_GA: _at(3)})
     episodes = fold_severity_writes("f", second_run, {})
-    plan = plan_run(episodes=episodes, open_rows=[], in_scope=frozenset({_GA}), now=_at(4))
+    plan = _plan(episodes=episodes, open_rows=[], in_scope=frozenset({_GA}), now=_at(4))
     assert plan.inserts == ()
     assert plan.updates == ()
 
@@ -241,6 +263,6 @@ def test_reopened_incident_is_not_closed_by_the_stale_zero() -> None:
     [episode] = fold_severity_writes("f", third_run, {_GA: 2})
     assert episode.ended_at is None
     assert _events(episode.events) == [(EventKind.ESCALATED, _at(5), 3)]
-    plan = plan_run(episodes=[episode], open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
+    plan = _plan(episodes=[episode], open_rows=[row], in_scope=frozenset({_GA}), now=_at(6))
     assert plan.inserts == ()
     assert [row_id for row_id, _ in plan.updates] == [9]

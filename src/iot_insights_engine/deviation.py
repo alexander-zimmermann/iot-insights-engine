@@ -399,7 +399,7 @@ def measure(
         states=states,
         observations=tuple(observations),
         dataless=frozenset(dataless),
-        counts={
+        record={
             "rooms": len(rooms),
             "cold": sum(1 for s in states.values() if s.cold_since is not None),
         },

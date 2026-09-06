@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from iot_insights_engine import (
-    detect_faults,
     deviation,
     drift,
     duration,
@@ -90,7 +89,7 @@ def _plan(
         states=states if states is not None else _states(_FREEZER, _BOILER),
         observations=(),
         dataless=dataless,
-        counts={},
+        record={},
     )
     return plan_run(
         episodes=episodes,
@@ -453,7 +452,12 @@ def _volume_publish(severity: int) -> volume.VolumePublish:
 def test_publish_volume_carries_the_week_on_the_house_wide_subject() -> None:
     settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_volume(settings, "notification_volume", _volume_publish(2))
+        publish_subjects(
+            NatsPublisher(settings),
+            "notification_volume",
+            (_volume_publish(2),),
+            volume.payload,
+        )
     (call,) = pub.call_args_list
     # One house-wide address, so a 1:1 subject with no entity token.
     assert call.args[1] == "anomaly.notification_volume"
@@ -469,7 +473,12 @@ def test_publish_volume_carries_the_week_on_the_house_wide_subject() -> None:
 def test_publish_volume_clear_forces_level_zero() -> None:
     settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_volume(settings, "notification_volume", _volume_publish(0))
+        publish_subjects(
+            NatsPublisher(settings),
+            "notification_volume",
+            (_volume_publish(0),),
+            volume.payload,
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.notification_volume"
     assert call.args[2]["severity_level"] == 0
