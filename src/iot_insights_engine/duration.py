@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
+    from .episode_store import OpenEpisodeRow
     from .faults import DeviceLimit, Fault
     from .silence import Channel
 
@@ -213,7 +214,10 @@ def activity(
 
 
 def measure(
-    conn: psycopg.Connection[DictRow], fault: Fault, window: Window
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
 ) -> Measured[DeviceState]:
     """The kind's whole measurement: the declared limits married to the
     scope, the window's activity, and one run reconstruction per device.
