@@ -8,13 +8,12 @@ leaves the engine is a severity 0–3 per main group on
 `anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
-Every kind that reports per subject runs in one shape: a `runner.Kind`
-declares how its series is measured and how its payload is shaped, and
-the runner module owns the rest — the window, the fold, the
-reconciliation, the log record, the dry run and the publish-then-write
-tail, behind its injected store and publisher ends. This module is the
-job: it loads the fault list, wires each kind's declaration, and keeps
-the loops the runner does not cover yet.
+Every kind runs in one shape: a `runner.Kind` declares how its series is
+measured and how its payload is shaped, and the runner module owns the
+rest — the window, the fold, the reconciliation, the log record, the dry
+run and the publish-then-write tail, behind its injected store and
+publisher ends. This module is the job: it loads the fault list, wires
+each kind's declaration, and runs the list fault by fault.
 
 Channel silence measures per channel but reports per main group, so its
 declaration carries its own plan; the lifecycle around it is the same
@@ -28,9 +27,9 @@ same bus as everything else.
 External faults run the same loop the other way round: Basalte detects,
 writes the severity to the fault address and delivers itself; the engine
 reads those writes back from the bus archive, records episodes marked
-externally delivered, and publishes nothing. The frontier rule below is
-the measured faults': the bus archive has no materialization lag, so
-external runs take wall-clock time where an orphaned row needs closing.
+externally delivered, and publishes nothing. Their declared frontier is
+the wall clock: the bus archive has no materialization lag, so an
+orphaned row closes at wall-clock time.
 
 Time is the aggregate's frontier throughout — episodes also *end* in
 frontier time, so a stalled refresh (or a dead bridge) freezes the picture
@@ -49,7 +48,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,30 +55,24 @@ from . import (
     deviation,
     drift,
     duration,
-    episode_store,
     external,
-    nats_publisher,
     silence,
     volume,
 )
 from .config import Settings
-from .db_write import read_connection, write_connection
-from .episodes import EpisodePolicy, fold_observations
 from .faults import DriftSignal, Fault, FaultList, MeasurementKind
 from .logging_setup import get_logger
 from .runner import (
-    LOOKBACK,
     DbStore,
     Kind,
     NatsPublisher,
     run_subjects,
 )
-from .severity import severity_name
 
 log = get_logger(__name__)
 
 
-_SUBJECT_KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
+_KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
     MeasurementKind.DURATION: Kind(
         event="appliance_runtime_run",
         delivery="per_device",
@@ -111,6 +103,29 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
         # measurement's scope_drops record. The ones actually held open are
         # `stale_opens` in the run record.
         warn_dataless=False,
+    ),
+    MeasurementKind.VOLUME: Kind(
+        event="notification_volume_run",
+        # One house-wide address; declared last in the fault list, so the
+        # count already includes what this run's other faults just wrote.
+        delivery="ga",
+        frontier=silence.frontier,
+        measure=volume.measure,
+        publish_for=volume.publish_for,
+        payload=volume.payload,
+    ),
+    MeasurementKind.EXTERNAL: Kind(
+        event="external_severities_run",
+        # Basalte detects and delivers itself: the fault declares no
+        # target, the fold walks severity writes instead of observations,
+        # the plan keeps rows open until their explicit 0, and nothing
+        # is published — the engine only records.
+        delivery=None,
+        frontier=external.frontier,
+        measure=external.measure,
+        fold=external.fold,
+        plan=external.plan,
+        externally_delivered=True,
     ),
 }
 
@@ -148,150 +163,6 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, Kind[Any, Any]] = {
 }
 
 
-def _publish_volume(
-    settings: Settings, fault_name: str, publish: volume.VolumePublish
-) -> None:
-    firing = publish.severity > 0
-    nats_publisher.publish_anomaly(
-        settings,
-        fault_name,
-        severity_name(publish.severity) if firing else None,
-        volume.payload(publish),
-        firing=firing,
-    )
-
-
-def _run_volume(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    """The volume watchdog: the incident count of the last seven days is
-    itself a fault, measured over the episode stream and delivered on one
-    house-wide address. Declared last in the fault list, so the count
-    already includes what this run's other faults just wrote.
-    """
-    if fault.target is None or fault.target.ga is None:
-        raise ValueError(f"fault {fault.name}: volume delivery needs a house-wide ga target")
-    limit = float(fault.parameters["max_episodes_per_week"])
-
-    with read_connection(settings) as conn:
-        frontier = silence.frontier(conn)
-        if frontier is None:
-            log.warning("no_aggregate_data", fault=fault.name)
-            return
-        window_start = frontier - LOOKBACK
-        # A week of history before the first bucket, so the oldest count in
-        # the window is as complete as the newest.
-        starts = volume.episode_starts(conn, window_start - volume.WINDOW)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        history_scores = episode_store.history_scores(conn, fault.name)
-
-    buckets = volume.count_series(starts, window_start, frontier)
-    observations = volume.volume_observations(buckets, limit)
-    state = volume.classify(starts, buckets, limit, frontier)
-
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, observations, history_scores, EpisodePolicy(), frontier
-    )
-    plan = volume.plan_run(
-        episodes=episodes, open_rows=open_rows, state=state, frontier=frontier
-    )
-
-    log.info(
-        "notification_volume_run",
-        fault=fault.name,
-        frontier=frontier.isoformat(),
-        incidents=state.episodes,
-        limit=limit,
-        over_since=state.over_since.isoformat() if state.over_since else None,
-        by_fault={count.fault: count.episodes for count in state.by_fault},
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        publishes=1 if plan.publish is not None else 0,
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            buckets_over_limit=len(observations),
-            peak_incidents=max(b.episodes for b in buckets),
-            would_publish=(
-                {"severity": plan.publish.severity, "episodes": plan.publish.state.episodes}
-                if plan.publish is not None
-                else None
-            ),
-        )
-        return
-
-    if plan.publish is not None:
-        _publish_volume(settings, fault.name, plan.publish)
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
-
-
-def _run_external(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    """Basalte-written severities become episodes: read the fault's severity
-    writes back off the bus archive, fold, reconcile — and publish nothing.
-    Basalte already delivered; the engine only records.
-    """
-    now = datetime.now(tz=UTC)
-    with read_connection(settings) as conn:
-        channels = silence.resolve_scope(conn, fault.channel_scope())
-        if not channels:
-            # Address not in the catalog yet (ETS work pending) — or a typo.
-            log.warning("external_no_subjects", fault=fault.name)
-        open_rows = episode_store.open_rows(conn, fault.name)
-        processed = episode_store.processed_through(conn, fault.name)
-        writes = external.read_writes(conn, [c.ga for c in channels], now - LOOKBACK)
-
-    prior = {row.subject: row.severity for row in open_rows}
-    fresh = external.drop_processed(writes, processed)
-    episodes = external.fold_severity_writes(fault.name, fresh, prior)
-    plan = external.plan_run(
-        episodes=episodes,
-        open_rows=open_rows,
-        in_scope=frozenset(c.ga for c in channels),
-        now=now,
-    )
-
-    log.info(
-        "external_severities_run",
-        fault=fault.name,
-        subjects=len(channels),
-        writes=len(writes),
-        fresh_writes=len(fresh),
-        episodes=len(episodes),
-        open_episodes=sum(1 for e in episodes if e.ended_at is None),
-        inserts=len(plan.inserts),
-        updates=len(plan.updates),
-        orphan_closes=len(plan.orphan_closes),
-        still_open=list(plan.still_open),
-        dry_run=dry_run,
-    )
-
-    if dry_run:
-        log.info(
-            "dry_run_episodes",
-            fault=fault.name,
-            open_subjects=sorted(e.subject for e in episodes if e.ended_at is None),
-        )
-        return
-
-    with write_connection(settings) as conn, conn.transaction():
-        episode_store.apply(
-            conn,
-            fault.name,
-            plan.inserts,
-            plan.updates,
-            plan.orphan_closes,
-            externally_delivered=True,
-        )
-
-
 def run(settings: Settings, argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="iot-insights-engine detect-faults")
     parser.add_argument("--dry-run", action="store_true")
@@ -318,28 +189,24 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     return 0
 
 
-def _subject_kind(fault: Fault) -> Kind[Any, Any] | None:
-    """The per-subject shape this fault runs in, if it has one. Drift picks
-    it by the signal the file declares — the loader rejects one without, so
-    a fault that got here signalless is a new kind of drift nobody wired up,
-    and it fails rather than reporting nothing.
+def _kind_for(fault: Fault) -> Kind[Any, Any] | None:
+    """The shape this fault runs in, if it has one. Drift picks it by the
+    signal the file declares — the loader rejects one without, so a fault
+    that got here signalless is a new kind of drift nobody wired up, and it
+    fails rather than reporting nothing.
     """
     if fault.kind is MeasurementKind.DRIFT:
         if fault.signal is None:
             raise ValueError(f"fault {fault.name}: a drift fault declares which series it walks")
         return _DRIFT_SIGNALS[fault.signal]
-    return _SUBJECT_KINDS.get(fault.kind)
+    return _KINDS.get(fault.kind)
 
 
 def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    kind = _subject_kind(fault)
-    if kind is not None:
-        run_subjects(DbStore(settings), NatsPublisher(settings), fault, kind, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.VOLUME:
-        _run_volume(settings, fault, dry_run=dry_run)
-    elif fault.kind is MeasurementKind.EXTERNAL:
-        _run_external(settings, fault, dry_run=dry_run)
-    else:
+    kind = _kind_for(fault)
+    if kind is None:
         # Arrives with its own ticket; a declared fault must not fail
         # the ones already running.
         log.warning("fault_kind_not_implemented", fault=fault.name, kind=str(fault.kind))
+        return
+    run_subjects(DbStore(settings), NatsPublisher(settings), fault, kind, dry_run=dry_run)

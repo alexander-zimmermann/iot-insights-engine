@@ -42,6 +42,7 @@ class _Store:
         self.events = events
         self._open_rows = open_rows or []
         self.applied: _Applied | None = None
+        self.externally_delivered = False
 
     @contextmanager
     def read(self) -> Iterator[Any]:
@@ -60,9 +61,12 @@ class _Store:
         inserts: Sequence[Episode],
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
+        *,
+        externally_delivered: bool,
     ) -> None:
         self.events.append("apply")
         self.applied = (tuple(inserts), tuple(updates), tuple(orphan_closes))
+        self.externally_delivered = externally_delivered
 
 
 class _Publisher:
@@ -95,14 +99,19 @@ class _Publish:
         return self.subject
 
 
-def _fault(target: Target | None = None) -> Fault:
+# Frozen, so it is safe as a default; `_fault(target=None)` is the fault a
+# self-delivering kind gets.
+_PER_DEVICE = Target(per_device=True)
+
+
+def _fault(target: Target | None = _PER_DEVICE) -> Fault:
     return Fault(
         name="test_fault",
         sentence="a device runs longer than declared",
         unit="h",
         kind=MeasurementKind.DURATION,
         parameters={},
-        target=target if target is not None else Target(per_device=True),
+        target=target,
     )
 
 
@@ -119,7 +128,7 @@ def _kind(
             seen["window"] = window
             seen["open_rows"] = tuple(open_rows)
         return Measured(
-            states={}, observations=observations, dataless=frozenset(), counts={"subjects": 1}
+            states={}, observations=observations, dataless=frozenset(), record={"subjects": 1}
         )
 
     return Kind(
@@ -228,7 +237,7 @@ def test_a_kind_declaring_its_own_plan_is_planned_by_it() -> None:
         delivery="per_device",
         frontier=lambda _conn: _FRONTIER,
         measure=lambda _conn, _fault, _window, _open_rows: Measured(
-            states={}, observations=(), dataless=frozenset(), counts={}
+            states={}, observations=(), dataless=frozenset(), record={}
         ),
         payload=lambda p: {"subject": p.subject},
         plan=plan,
@@ -242,6 +251,60 @@ def test_a_kind_declaring_its_own_plan_is_planned_by_it() -> None:
     assert firing is True
 
 
+def _empty_fold(
+    *,
+    fault_name: str,
+    measured: Measured[Any],
+    open_rows: Sequence[OpenEpisodeRow],
+) -> tuple[Episode, ...]:
+    return ()
+
+
+def _empty_plan(
+    *,
+    episodes: Sequence[Episode],
+    open_rows: Sequence[OpenEpisodeRow],
+    measured: Measured[Any],
+    frontier: datetime,
+) -> Plan[Any]:
+    return Plan((), (), (), (), ())
+
+
+def _self_delivering_kind(**overrides: Any) -> Kind[Any, Any]:
+    """A kind with no target and nothing to publish — external's shape."""
+    return Kind(
+        event="test_external_run",
+        delivery=None,
+        frontier=lambda _conn: _FRONTIER,
+        measure=lambda _conn, _fault, _window, _open_rows: Measured(
+            states={}, observations=(), dataless=frozenset(), record={}
+        ),
+        plan=_empty_plan,
+        **overrides,
+    )
+
+
+def test_a_self_delivering_kind_publishes_nothing_and_marks_its_rows() -> None:
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+    kind = _self_delivering_kind(fold=_empty_fold, externally_delivered=True)
+
+    run_subjects(store, publisher, _fault(target=None), kind, dry_run=False)
+
+    assert events == ["read", "apply"]
+    assert publisher.published == []
+    assert store.externally_delivered is True
+
+
+def test_a_self_delivering_kind_rejects_a_fault_declaring_a_target() -> None:
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+
+    with pytest.raises(ValueError, match="delivers itself, no target"):
+        run_subjects(store, publisher, _fault(), _self_delivering_kind(), dry_run=False)
+    assert events == []
+
+
 def test_a_kind_declaring_neither_publish_for_nor_plan_fails_loudly() -> None:
     events: list[str] = []
     store, publisher = _Store(events), _Publisher(events)
@@ -251,7 +314,7 @@ def test_a_kind_declaring_neither_publish_for_nor_plan_fails_loudly() -> None:
         delivery="per_device",
         frontier=lambda _conn: _FRONTIER,
         measure=lambda _conn, _fault, _window, _open_rows: Measured(
-            states={}, observations=(), dataless=frozenset(), counts={}
+            states={}, observations=(), dataless=frozenset(), record={}
         ),
         payload=lambda p: {"subject": p.subject},
     )

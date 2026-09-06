@@ -24,20 +24,25 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import groupby
 from operator import attrgetter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from . import episode_store
 from .episodes import Episode, EventKind, EvidenceRow, NotificationEvent
 from .logging_setup import get_logger
+from .reconcile import Measured, Plan
 from .severity import CLEAR, CRITICAL
+from .silence import resolve_scope
 
 if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
     from .episode_store import OpenEpisodeRow
+    from .faults import Fault
+    from .reconcile import Window
 
 log = get_logger(__name__)
 
@@ -51,17 +56,62 @@ class SeverityWrite:
     severity: int
 
 
-@dataclass(frozen=True, slots=True)
-class ExternalPlan:
-    """What one run changes: new episodes, reconciled open rows, orphaned
-    rows whose address left the catalog, and rows kept open because no
-    write arrived — an external fault stays open until its explicit 0.
+def frontier(_conn: psycopg.Connection[DictRow]) -> datetime | None:
+    """Wall-clock now: the bus archive has no materialization lag, so
+    external runs take wall-clock time where an orphaned row needs closing.
     """
+    return datetime.now(tz=UTC)
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    still_open: tuple[str, ...]
+
+def measure(
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
+) -> Measured[list[SeverityWrite]]:
+    """The kind's whole measurement: the declared addresses' severity writes
+    off the bus archive, minus everything the stored episodes have already
+    folded. What leaves per subject is its fresh writes — the fold's input,
+    not observations.
+    """
+    channels = resolve_scope(conn, fault.channel_scope())
+    if not channels:
+        # Address not in the catalog yet (ETS work pending) — or a typo.
+        log.warning("external_no_subjects", fault=fault.name)
+    processed = episode_store.processed_through(conn, fault.name)
+    writes = read_writes(conn, [c.ga for c in channels], window.start)
+    fresh = drop_processed(writes, processed)
+    by_subject: dict[str, list[SeverityWrite]] = {}
+    for write in fresh:
+        by_subject.setdefault(write.subject, []).append(write)
+    return Measured(
+        states=by_subject,
+        observations=(),
+        # Absence of writes means "unchanged", never "no data" — the plan
+        # below owns keeping those rows open.
+        dataless=frozenset(),
+        record={
+            "subjects": len(channels),
+            "writes": len(writes),
+            "fresh_writes": len(fresh),
+        },
+        labels={c.ga: c.name for c in channels},
+    )
+
+
+def fold(
+    *,
+    fault_name: str,
+    measured: Measured[list[SeverityWrite]],
+    open_rows: Sequence[OpenEpisodeRow],
+) -> tuple[Episode, ...]:
+    """The runner's fold hook: severity writes in, episodes out — seeded
+    with the severities the stored open rows carry, so a write continues
+    the recorded episode instead of re-opening it.
+    """
+    prior = {row.subject: row.severity for row in open_rows}
+    fresh = [write for per_subject in measured.states.values() for write in per_subject]
+    return fold_severity_writes(fault_name, fresh, prior)
 
 
 @dataclass(slots=True)
@@ -167,20 +217,25 @@ def _build_episode(
     )
 
 
-def plan_run(
+def plan(
     *,
     episodes: Sequence[Episode],
     open_rows: Sequence[OpenEpisodeRow],
-    in_scope: frozenset[str],
-    now: datetime,
-) -> ExternalPlan:
+    measured: Measured[list[SeverityWrite]],
+    frontier: datetime,
+) -> Plan[Any]:
     """Pure reconciliation: computed episodes against the stored open rows.
 
     A subject's first computed episode continues its stored open row; any
-    later ones are fresh incidents. A row without writes stays open — only
-    the explicit 0 ends an external episode — unless its address no longer
-    resolves in the catalog, which orphans the row at `now`.
+    later ones are fresh incidents — a full open-and-closed cycle inside
+    the window is recorded whole, which is why this kind cannot ride the
+    shared reconcile (that one materializes only open episodes). A row
+    without writes stays open (`stale_opens`) — only the explicit 0 ends an
+    external episode — unless its address no longer resolves in the
+    catalog, which orphans the row at the frontier. Publishes nothing:
+    Basalte already delivered.
     """
+    in_scope = frozenset(measured.labels)
     open_by_subject = {row.subject: row for row in open_rows}
 
     inserts: list[Episode] = []
@@ -205,13 +260,14 @@ def plan_run(
         if row.subject in in_scope:
             still_open.append(row.subject)
         else:
-            orphan_closes.append((row.id, now))
+            orphan_closes.append((row.id, frontier))
 
-    return ExternalPlan(
+    return Plan(
         inserts=tuple(inserts),
         updates=tuple(updates),
         orphan_closes=tuple(orphan_closes),
-        still_open=tuple(still_open),
+        stale_opens=tuple(still_open),
+        publishes=(),
     )
 
 

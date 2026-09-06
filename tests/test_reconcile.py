@@ -7,7 +7,7 @@ plan a moved subject turns into. No cluster, no live database.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from iot_insights_engine.episode_store import OpenEpisodeRow
@@ -102,6 +102,20 @@ class TestAfter:
         )
         assert dict(result.after) == {}
         assert result.moved == (("2/2/227", 0),)
+
+    def test_only_the_latest_episode_reconciles_the_open_row(self) -> None:
+        # Flicker beyond the quiet window leaves several episodes in the
+        # window; the stored open row can only correspond to the latest one.
+        older = replace(_episode("2/2/227", 1, ended=True), started_at=_T0 - 10 * _HOUR)
+        newer = _episode("2/2/227", 2)
+        result = reconcile(
+            episodes=[older, newer],
+            open_rows=[OpenEpisodeRow(id=7, subject="2/2/227", severity=1)],
+            dataless=frozenset(),
+            frontier=_FRONTIER,
+        )
+        assert result.updates == ((7, newer),)
+        assert result.inserts == ()
 
     def test_moved_is_the_part_of_after_that_changed(self) -> None:
         result = reconcile(

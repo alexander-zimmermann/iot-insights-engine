@@ -477,7 +477,7 @@ def measure(
         states=states,
         observations=tuple(observations),
         dataless=dataless,
-        counts={
+        record={
             "channels": len(kept),
             "candidates": len(candidates),
             "silent": sum(1 for s in states.values() if s.state is ChannelState.SILENT),

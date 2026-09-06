@@ -243,7 +243,7 @@ def measure(
         states=states,
         observations=tuple(observations),
         dataless=frozenset(dataless),
-        counts={
+        record={
             "devices": len(devices),
             "running": sum(1 for s in states.values() if s.running_since is not None),
             "over_limit": sum(

@@ -552,7 +552,7 @@ def _walk(
     window: Window,
     rise: float,
     budget: float,
-    counts: Mapping[str, int],
+    record: Mapping[str, Any],
 ) -> Measured[DeviceState]:
     """The part both signals share: CUSUM walk, state and observations per
     device, once the levels are read."""
@@ -573,10 +573,10 @@ def _walk(
         states=states,
         observations=tuple(observations),
         dataless=frozenset(dataless),
-        counts={
+        record={
             "devices": len(devices),
             "high": sum(1 for s in states.values() if s.excess is not None and s.excess > rise),
-            **counts,
+            **record,
         },
         labels={d.ga: d.label for d in devices},
     )
@@ -606,7 +606,7 @@ def measure_standby(
         window=window,
         rise=float(fault.parameters["rise_ma"]),
         budget=float(fault.parameters["budget_ma_h"]),
-        counts={},
+        record={},
     )
 
 
@@ -650,7 +650,7 @@ def measure_duty_cycle(
         # compressor running through days on end belongs: at this
         # resolution it is indistinguishable from a door standing open,
         # and Basalte owns that one.
-        counts={"door_hours": sum(len(hours) for hours in doors.values())},
+        record={"door_hours": sum(len(hours) for hours in doors.values())},
     )
 
 
@@ -957,7 +957,7 @@ def measure_recovery(
             drift_observations(exchanger.slug, trace, rise=fall, budget=budget)
         ),
         dataless=frozenset(dataless),
-        counts={
+        record={
             "valid_hours": len(etas),
             "measured_hours": len(levels),
             "falling": int(state.deficit is not None and state.deficit > fall),

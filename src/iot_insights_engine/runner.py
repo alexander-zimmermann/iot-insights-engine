@@ -83,6 +83,8 @@ class Store(Protocol):
         inserts: Sequence[Episode],
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
+        *,
+        externally_delivered: bool,
     ) -> None:
         """One plan's row changes, in one transaction."""
         ...
@@ -128,9 +130,18 @@ class DbStore:
         inserts: Sequence[Episode],
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
+        *,
+        externally_delivered: bool,
     ) -> None:
         with write_connection(self.settings) as conn, conn.transaction():
-            episode_store.apply(conn, fault_name, inserts, updates, orphan_closes)
+            episode_store.apply(
+                conn,
+                fault_name,
+                inserts,
+                updates,
+                orphan_closes,
+                externally_delivered=externally_delivered,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +162,20 @@ class NatsPublisher:
         nats_publisher.publish_anomaly(
             self.settings, fault_name, severity, payload, entity=entity, firing=firing
         )
+
+
+class FoldHook[S](Protocol):
+    """A kind's own fold: the measurement to episodes, where the default
+    observation pipeline does not fit (external folds severity writes,
+    seeded by the stored open severities)."""
+
+    def __call__(
+        self,
+        *,
+        fault_name: str,
+        measured: Measured[S],
+        open_rows: Sequence[OpenEpisodeRow],
+    ) -> tuple[Episode, ...]: ...
 
 
 class PlanHook[S, P](Protocol):
@@ -183,23 +208,30 @@ class Kind[S, P: SubjectPublish]:
     seeds its fold with stored severities) reads them instead of re-asking
     the store.
 
-    Planning defaults to the shared per-subject delivery through
-    `publish_for`; a kind delivered another way declares `plan` instead —
-    one of the two is required. `warn_dataless` is off for the one kind
-    whose dataless set is routinely huge and already accounted for.
+    Folding defaults to the pure observation pipeline; planning defaults to
+    the shared per-subject delivery through `publish_for` — a kind that
+    works another way declares `fold` or `plan` instead (one of
+    `publish_for`/`plan` is required). `delivery` is None for the one kind
+    whose faults declare no target at all; `payload` is None for the one
+    kind that publishes nothing; `warn_dataless` is off for the one kind
+    whose dataless set is routinely huge and already accounted for; and
+    `externally_delivered` marks episodes someone else already notified
+    about, so nothing downstream notifies a second time.
     """
 
     event: str
-    delivery: str
+    delivery: str | None
     frontier: Callable[[psycopg.Connection[DictRow]], datetime | None]
     measure: Callable[
         [psycopg.Connection[DictRow], Fault, Window, Sequence[OpenEpisodeRow]],
         Measured[S],
     ]
-    payload: Callable[[P], dict[str, Any]]
+    payload: Callable[[P], dict[str, Any]] | None = None
     publish_for: Callable[[str, int, S | None], P] | None = None
+    fold: FoldHook[S] | None = None
     plan: PlanHook[S, P] | None = None
     warn_dataless: bool = True
+    externally_delivered: bool = False
 
 
 def publish_subjects[P: SubjectPublish](
@@ -229,7 +261,12 @@ def run_subjects[S, P: SubjectPublish](
     the window off the aggregate, measure, fold, reconcile, log — then
     publish before writing.
     """
-    if fault.target is None or fault.target.form != kind.delivery:
+    if kind.delivery is None:
+        # The loader already forbids a target on such a fault; this is the
+        # runner's side of the same contract.
+        if fault.target is not None:
+            raise ValueError(f"fault {fault.name}: {fault.kind} delivers itself, no target")
+    elif fault.target is None or fault.target.form != kind.delivery:
         raise ValueError(
             f"fault {fault.name}: {fault.kind} delivery needs a {kind.delivery} target"
         )
@@ -252,11 +289,15 @@ def run_subjects[S, P: SubjectPublish](
             "subjects_dataless", fault=fault.name, subjects=sorted(measured.dataless)
         )
 
-    # `now` is the frontier: episode ends are decided by aggregate progress,
-    # never by wall time racing ahead of a stalled materialization.
-    episodes = fold_observations(
-        fault.name, measured.observations, history_scores, policy, frontier
-    )
+    if kind.fold is not None:
+        episodes = kind.fold(fault_name=fault.name, measured=measured, open_rows=open_rows)
+    else:
+        # `now` is the frontier: episode ends are decided by aggregate
+        # progress, never by wall time racing ahead of a stalled
+        # materialization.
+        episodes = fold_observations(
+            fault.name, measured.observations, history_scores, policy, frontier
+        )
 
     plan = _plan_for(kind, episodes, open_rows, measured, frontier)
 
@@ -264,7 +305,7 @@ def run_subjects[S, P: SubjectPublish](
         kind.event,
         fault=fault.name,
         frontier=frontier.isoformat(),
-        **measured.counts,
+        **measured.record,
         episodes=len(episodes),
         open_episodes=sum(1 for e in episodes if e.ended_at is None),
         inserts=len(plan.inserts),
@@ -279,8 +320,17 @@ def run_subjects[S, P: SubjectPublish](
         log_dry_run(fault, episodes, plan, measured.labels)
         return
 
-    publish_subjects(publisher, fault.name, plan.publishes, kind.payload)
-    store.apply(fault.name, plan.inserts, plan.updates, plan.orphan_closes)
+    if plan.publishes:
+        if kind.payload is None:
+            raise ValueError(f"kind {kind.event}: publishes without a payload declaration")
+        publish_subjects(publisher, fault.name, plan.publishes, kind.payload)
+    store.apply(
+        fault.name,
+        plan.inserts,
+        plan.updates,
+        plan.orphan_closes,
+        externally_delivered=kind.externally_delivered,
+    )
 
 
 def _plan_for[S, P: SubjectPublish](

@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .episodes import Episode
 
@@ -110,27 +110,28 @@ class Measured[S]:
     """What a kind's measurement saw over its whole scope: the state per
     subject its payload is shaped from, the observations they produced, the
     subjects whose measurement did not reach the frontier, what a human
-    calls each subject, and the counts its log record names.
+    calls each subject, and the fields its run record names.
     """
 
     states: Mapping[str, S]
     observations: tuple[Observation, ...]
     dataless: frozenset[str]
-    counts: Mapping[str, int]
+    record: Mapping[str, Any]
     labels: Mapping[str, str] = _NO_LABELS
 
 
 class SubjectPublish(Protocol):
     """What the runner needs of any per-subject payload: the subject it
-    speaks for, the address token it is delivered on, and the severity that
-    decides firing. Everything else in the payload is the kind's own.
+    speaks for, the address token it is delivered on (None for the one
+    house-wide 1:1 subject), and the severity that decides firing.
+    Everything else in the payload is the kind's own.
     """
 
     @property
     def subject(self) -> str: ...
 
     @property
-    def entity(self) -> str: ...
+    def entity(self) -> str | None: ...
 
     @property
     def severity(self) -> int: ...

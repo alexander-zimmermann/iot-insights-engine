@@ -40,7 +40,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from .episodes import Episode, Observation
+from .episodes import Observation
+from .reconcile import Measured
 from .runs import split_runs
 from .silence import BUCKET
 
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from psycopg.rows import DictRow
 
     from .episode_store import OpenEpisodeRow
+    from .faults import Fault
+    from .reconcile import Window
 
 # "This week": the rolling window the incidents are counted over.
 WINDOW = timedelta(days=7)
@@ -106,6 +109,15 @@ class VolumePublish:
     severity: int
     state: VolumeState
 
+    @property
+    def subject(self) -> str:
+        return SUBJECT
+
+    @property
+    def entity(self) -> None:
+        # One house-wide address: a 1:1 subject with no entity token.
+        return None
+
 
 def payload(publish: VolumePublish) -> dict[str, Any]:
     """What this kind says on the bus: the week that earned the severity —
@@ -123,16 +135,43 @@ def payload(publish: VolumePublish) -> dict[str, Any]:
     }
 
 
-@dataclass(frozen=True, slots=True)
-class VolumePlan:
-    """What one run changes: the new episode, the reconciled open row, the
-    orphaned row to close, and the house-wide publish if the severity moved.
-    """
+def publish_for(_subject: str, severity: int, state: VolumeState | None) -> VolumePublish:
+    if state is None:
+        # The episode stream is always countable and the measurement always
+        # states the house, so a publish without a state is a wiring error,
+        # never a subject that left the scope.
+        raise ValueError("volume publish without a measured state")
+    return VolumePublish(severity=severity, state=state)
 
-    inserts: tuple[Episode, ...]
-    updates: tuple[tuple[int, Episode], ...]
-    orphan_closes: tuple[tuple[int, datetime], ...]
-    publish: VolumePublish | None
+
+def measure(
+    conn: psycopg.Connection[DictRow],
+    fault: Fault,
+    window: Window,
+    _open_rows: Sequence[OpenEpisodeRow],
+) -> Measured[VolumeState]:
+    """The kind's whole measurement: the incidents of the episode stream,
+    counted per hourly bucket over the rolling week. Reads a week of
+    history before the first bucket, so the oldest count in the window is
+    as complete as the newest.
+    """
+    limit = float(fault.parameters["max_episodes_per_week"])
+    starts = episode_starts(conn, window.start - WINDOW)
+    buckets = count_series(starts, window.start, window.frontier)
+    state = classify(starts, buckets, limit, window.frontier)
+    return Measured(
+        states={SUBJECT: state},
+        observations=tuple(volume_observations(buckets, limit)),
+        # No dataless case: the stream is always countable, so no computed
+        # episode really does mean the volume fell back — never "no data".
+        dataless=frozenset(),
+        record={
+            "incidents": state.episodes,
+            "limit": limit,
+            "over_since": state.over_since.isoformat() if state.over_since else None,
+            "by_fault": {count.fault: count.episodes for count in state.by_fault},
+        },
+    )
 
 
 def count_series(
@@ -191,53 +230,6 @@ def classify(
             for fault, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
         ),
     )
-
-
-def plan_run(
-    *,
-    episodes: Sequence[Episode],
-    open_rows: Sequence[OpenEpisodeRow],
-    state: VolumeState,
-    frontier: datetime,
-) -> VolumePlan:
-    """Pure reconciliation: the computed episodes against the stored open
-    row. One subject, so this is the other kinds' reconcile without the
-    fan-out — and without their `dataless` case: the episode stream is
-    always countable, so no computed episode really does mean the volume
-    fell back, never "no data to tell".
-
-    A stored severity is never lowered — the recompute window may have slid
-    past the loudest stretch — and only a change publishes, including the 0
-    when the week goes quiet again.
-    """
-    # One subject, so one row can be open for this fault at a time.
-    open_row = next((row for row in open_rows if row.subject == SUBJECT), None)
-    # Flicker beyond the quiet window can leave several episodes in the
-    # window; that row can only correspond to the latest one.
-    latest = max(episodes, key=lambda e: e.started_at, default=None)
-
-    inserts: list[Episode] = []
-    updates: list[tuple[int, Episode]] = []
-    orphan_closes: list[tuple[int, datetime]] = []
-    after = 0
-
-    if latest is not None and latest.ended_at is None:
-        after = max(latest.severity, open_row.severity if open_row else 0)
-        if open_row is not None:
-            updates.append((open_row.id, latest))
-        else:
-            inserts.append(latest)
-    elif open_row is not None:
-        # The row's incident is over: the computed episode closes it, or —
-        # with nothing computed at all — the frontier does.
-        if latest is not None:
-            updates.append((open_row.id, latest))
-        else:
-            orphan_closes.append((open_row.id, frontier))
-
-    before = open_row.severity if open_row else 0
-    publish = VolumePublish(severity=after, state=state) if after != before else None
-    return VolumePlan(tuple(inserts), tuple(updates), tuple(orphan_closes), publish)
 
 
 def episode_starts(
