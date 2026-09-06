@@ -104,8 +104,10 @@ LOOKBACK = timedelta(days=30)
 class SubjectKind[S, P: SubjectPublish]:
     """One per-subject fault kind, reduced to what actually differs between
     them: how its series is measured (`frontier`, `measure`) and how its
-    payload is shaped (`publish_for`, `publish`). `event` names its log
-    record, `delivery` the target form the fault must declare for it.
+    payload is shaped (`publish_for`, `payload`) — both live in the kind's
+    own module, so the whole wire story of a kind is read in one place.
+    `event` names its log record, `delivery` the target form the fault must
+    declare for it.
     """
 
     event: str
@@ -113,7 +115,7 @@ class SubjectKind[S, P: SubjectPublish]:
     frontier: Callable[[psycopg.Connection[DictRow]], datetime | None]
     measure: Callable[[psycopg.Connection[DictRow], Fault, Window], Measured[S]]
     publish_for: Callable[[str, int, S | None], P]
-    publish: Callable[[Settings, str, Iterable[P]], None]
+    payload: Callable[[P], dict[str, Any]]
 
 
 def _publish_subjects[P: SubjectPublish](
@@ -135,105 +137,6 @@ def _publish_subjects[P: SubjectPublish](
             entity=publish.entity,
             firing=firing,
         )
-
-
-def _publish_devices(
-    settings: Settings, fault_name: str, publishes: Iterable[duration.DevicePublish]
-) -> None:
-    """Appliance runtime: the run so far against the device's own limit."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "device": p.device,
-            "ga": p.ga,
-            "name": p.name,
-            "running_since": p.running_since,
-            "run_hours": p.run_hours,
-            "limit_hours": p.limit_hours,
-        },
-    )
-
-
-def _publish_standby(
-    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
-) -> None:
-    """Standby drift: what the device idles at against what it should."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "device": p.device,
-            "ga": p.ga,
-            "name": p.name,
-            "standby_ma": p.level,
-            "healthy_ma": p.healthy,
-            "excess_ma": p.excess,
-            "rising_since": p.rising_since,
-        },
-    )
-
-
-def _publish_duty_cycle(
-    settings: Settings, fault_name: str, publishes: Iterable[drift.DevicePublish]
-) -> None:
-    """Duty-cycle drift: how much of the day the compressor runs against how
-    much it should — the mail's number for "the freezer is icing up"."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "device": p.device,
-            "ga": p.ga,
-            "name": p.name,
-            "duty_pct": p.level,
-            "healthy_pct": p.healthy,
-            "excess_pct": p.excess,
-            "rising_since": p.rising_since,
-        },
-    )
-
-
-def _publish_recovery(
-    settings: Settings, fault_name: str, publishes: Iterable[drift.ExchangerPublish]
-) -> None:
-    """Recovery drift: what the exchanger recovers against what it should —
-    the number behind "the supply air is approaching the outdoor air"."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "exchanger": p.exchanger,
-            "efficiency_pct": p.efficiency,
-            "healthy_pct": p.healthy,
-            "deficit_pct": p.deficit,
-            "falling_since": p.falling_since,
-        },
-    )
-
-
-def _publish_rooms(
-    settings: Settings, fault_name: str, publishes: Iterable[deviation.RoomPublish]
-) -> None:
-    """Room deviation: the gap, and the reference and gate behind it."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "room": p.room,
-            "cold_since": p.cold_since,
-            "gap": p.gap,
-            "value": p.value,
-            "reference": p.reference,
-            "gate": p.gate,
-            "min_gap": p.min_gap,
-        },
-    )
 
 
 def _run_subjects[S, P: SubjectPublish](
@@ -302,7 +205,7 @@ def _run_subjects[S, P: SubjectPublish](
         _log_dry_run(fault, episodes, plan, measured.labels)
         return
 
-    kind.publish(settings, fault.name, plan.publishes)
+    _publish_subjects(settings, fault.name, plan.publishes, kind.payload)
     with write_connection(settings) as conn, conn.transaction():
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
@@ -338,7 +241,7 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
         frontier=duration.frontier,
         measure=duration.measure,
         publish_for=duration.publish_for,
-        publish=_publish_devices,
+        payload=duration.payload,
     ),
     MeasurementKind.DEVIATION: SubjectKind(
         event="room_deviation_run",
@@ -346,7 +249,7 @@ _SUBJECT_KINDS: Mapping[MeasurementKind, SubjectKind[Any, Any]] = {
         frontier=silence.frontier,
         measure=deviation.measure,
         publish_for=deviation.publish_for,
-        publish=_publish_rooms,
+        payload=deviation.payload,
     ),
 }
 
@@ -361,7 +264,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         frontier=duration.frontier,
         measure=drift.measure_standby,
         publish_for=drift.publish_for,
-        publish=_publish_standby,
+        payload=drift.payload_standby,
     ),
     DriftSignal.DUTY_CYCLE: SubjectKind(
         event="duty_cycle_drift_run",
@@ -369,7 +272,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         frontier=duration.frontier,
         measure=drift.measure_duty_cycle,
         publish_for=drift.publish_for,
-        publish=_publish_duty_cycle,
+        payload=drift.payload_duty_cycle,
     ),
     DriftSignal.RECOVERY: SubjectKind(
         event="heat_recovery_run",
@@ -379,7 +282,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, SubjectKind[Any, Any]] = {
         frontier=silence.frontier,
         measure=drift.measure_recovery,
         publish_for=drift.publish_for_exchanger,
-        publish=_publish_recovery,
+        payload=drift.payload_recovery,
     ),
 }
 
@@ -487,28 +390,21 @@ def _group_state(
     return {g: (severities[g], frozenset(subjects[g])) for g in severities}
 
 
-def _publish_groups(
-    settings: Settings, fault_name: str, publishes: Iterable[GroupPublish]
-) -> None:
+def _group_payload(publish: GroupPublish) -> dict[str, Any]:
     """Channel silence: how many channels in the group are open, and which."""
-    _publish_subjects(
-        settings,
-        fault_name,
-        publishes,
-        lambda p: {
-            "open_channels": len(p.channels),
-            "channels": [
-                {
-                    "ga": report.ga,
-                    "name": report.name,
-                    "silent_since": report.silent_since,
-                    "severity": report.severity,
-                    "gap_hours": report.gap_hours,
-                }
-                for report in p.channels
-            ],
-        },
-    )
+    return {
+        "open_channels": len(publish.channels),
+        "channels": [
+            {
+                "ga": report.ga,
+                "name": report.name,
+                "silent_since": report.silent_since,
+                "severity": report.severity,
+                "gap_hours": report.gap_hours,
+            }
+            for report in publish.channels
+        ],
+    }
 
 
 def _candidates(
@@ -651,7 +547,7 @@ def _run_silence(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
         _log_dry_run(fault, episodes, plan, {c.ga: c.name for c in channels})
         return
 
-    _publish_groups(settings, fault.name, plan.publishes)
+    _publish_subjects(settings, fault.name, plan.publishes, _group_payload)
     with write_connection(settings) as conn, conn.transaction():
         episode_store.apply(conn, fault.name, plan.inserts, plan.updates, plan.orphan_closes)
 
@@ -664,17 +560,7 @@ def _publish_volume(
         settings,
         fault_name,
         severity_name(publish.severity) if firing else None,
-        {
-            "episodes": publish.state.episodes,
-            "limit": publish.state.limit,
-            "window_days": volume.WINDOW.days,
-            "over_since": publish.state.over_since,
-            # Which fault is making the noise — the thing a human acts on.
-            "by_fault": [
-                {"fault": count.fault, "episodes": count.episodes}
-                for count in publish.state.by_fault
-            ],
-        },
+        volume.payload(publish),
         firing=firing,
     )
 

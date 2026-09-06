@@ -7,7 +7,11 @@ refactor can't silently re-route anomalies to the wrong KNX-GA.
 
 from __future__ import annotations
 
-from iot_insights_engine.nats_publisher import entity_slug, slugify
+from unittest.mock import patch
+
+from iot_insights_engine import nats_publisher
+from iot_insights_engine.config import Settings
+from iot_insights_engine.nats_publisher import entity_slug, publish_anomaly, slugify
 
 
 def test_slugify_deterministic() -> None:
@@ -41,3 +45,21 @@ def test_entity_slug_inverter_and_meter() -> None:
 
 def test_entity_slug_falls_back_to_values() -> None:
     assert entity_slug({"room": "Küche"}) == "kueche"
+
+
+def test_publish_anomaly_slugs_the_raw_entity_once() -> None:
+    # Kinds hand the entity over raw (a GA, a room label); this adapter is
+    # the one place that speaks NATS dialect — subject token and payload
+    # `entity` carry the same slug.
+    settings = Settings(
+        db_host="localhost",
+        db_name="x",
+        db_username="x",
+        db_password="x",  # noqa: S106 — test stub
+        nats_servers="nats://localhost:4222",
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_anomaly(settings, "appliance_runtime", "warning", {}, entity="2/1/197")
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    assert call.args[2]["entity"] == "2-1-197"

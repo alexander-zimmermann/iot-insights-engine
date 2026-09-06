@@ -101,16 +101,21 @@ def publish_anomaly(
     `anomaly.<uc>` for a 1:1 UC, `anomaly.<uc>.<entity>` for a grouped one —
     so the knx-nats-bridge writer-rules map exactly one rule per KNX-GA.
 
+    The entity arrives raw (a GA, a room slug, a main group); this adapter
+    owns the NATS dialect and slugs it once, for the subject token and the
+    payload's `entity` alike.
+
     The severity travels as a numeric `severity_level` in the payload (the
     writer-rule reads `$.severity_level`); `firing=False` forces level 0
     (auto-clear → GA falls back to 0), with `severity=None` as the matching
     name-side value.
     """
-    subject = f"anomaly.{uc}.{entity}" if entity else f"anomaly.{uc}"
+    token = slugify(entity) if entity else None
+    subject = f"anomaly.{uc}.{token}" if token else f"anomaly.{uc}"
     body = {
         "firing": firing,
         "uc": uc,
-        "entity": entity,
+        "entity": token,
         "severity": severity,
         "severity_level": severity_level(severity) if firing else 0,
         **payload,

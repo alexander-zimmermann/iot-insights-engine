@@ -38,7 +38,7 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .episodes import Episode, Observation
 from .runs import split_runs
@@ -105,6 +105,22 @@ class VolumePublish:
 
     severity: int
     state: VolumeState
+
+
+def payload(publish: VolumePublish) -> dict[str, Any]:
+    """What this kind says on the bus: the week that earned the severity —
+    the writer rule carries only the severity, the payload carries the
+    state for Basalte's e-mail, naming which fault is making the noise."""
+    return {
+        "episodes": publish.state.episodes,
+        "limit": publish.state.limit,
+        "window_days": WINDOW.days,
+        "over_since": publish.state.over_since,
+        "by_fault": [
+            {"fault": count.fault, "episodes": count.episodes}
+            for count in publish.state.by_fault
+        ],
+    }
 
 
 @dataclass(frozen=True, slots=True)
