@@ -150,7 +150,8 @@ class TestPublishFor:
             limit_hours=4.0,
         )
         assert publish.subject == "2/1/197"
-        assert publish.entity == "2-1-197"
+        # Raw GA — the NATS adapter slugs it into the subject token.
+        assert publish.entity == "2/1/197"
 
     def test_a_device_that_left_the_scope_still_gets_its_clear(self) -> None:
         publish = publish_for("2/1/197", 0, None)

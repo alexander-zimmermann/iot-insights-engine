@@ -481,7 +481,8 @@ class TestPublishFor:
             rising_since=_T0,
         )
         assert publish.subject == _FREEZER.ga
-        assert publish.entity == "2-2-227"
+        # Raw GA — the NATS adapter slugs it into the subject token.
+        assert publish.entity == _FREEZER.ga
 
     def test_a_device_that_left_the_scope_still_gets_its_clear(self) -> None:
         publish = publish_for(_FREEZER.ga, 0, None)

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .episodes import Observation
 from .faults import Roles
@@ -338,6 +338,20 @@ def publish_for(subject: str, severity: int, state: RoomState | None) -> RoomPub
         gate=state.gate,
         min_gap=state.room.min_gap,
     )
+
+
+def payload(publish: RoomPublish) -> dict[str, Any]:
+    """What this kind says on the bus: the gap, and the reference and gate
+    behind it — fields and wire names in one place."""
+    return {
+        "room": publish.room,
+        "cold_since": publish.cold_since,
+        "gap": publish.gap,
+        "value": publish.value,
+        "reference": publish.reference,
+        "gate": publish.gate,
+        "min_gap": publish.min_gap,
+    }
 
 
 def measure(

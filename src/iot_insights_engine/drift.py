@@ -55,7 +55,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from math import ceil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .episodes import Observation
 from .faults import ExchangerRoles
@@ -392,7 +392,8 @@ class DevicePublish:
 
     @property
     def entity(self) -> str:
-        return slugify(self.ga)
+        # Raw GA; the NATS adapter owns the dialect and slugs it there.
+        return self.ga
 
 
 def publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
@@ -419,6 +420,35 @@ def publish_for(subject: str, severity: int, state: DeviceState | None) -> Devic
         excess=state.excess,
         rising_since=state.rising_since,
     )
+
+
+def payload_standby(publish: DevicePublish) -> dict[str, Any]:
+    """What the standby signal says on the bus: what the device idles at
+    against what it should — fields and wire names in one place."""
+    return {
+        "device": publish.device,
+        "ga": publish.ga,
+        "name": publish.name,
+        "standby_ma": publish.level,
+        "healthy_ma": publish.healthy,
+        "excess_ma": publish.excess,
+        "rising_since": publish.rising_since,
+    }
+
+
+def payload_duty_cycle(publish: DevicePublish) -> dict[str, Any]:
+    """What the duty-cycle signal says on the bus: how much of the day the
+    compressor runs against how much it should — the mail's number for
+    "the freezer is icing up"."""
+    return {
+        "device": publish.device,
+        "ga": publish.ga,
+        "name": publish.name,
+        "duty_pct": publish.level,
+        "healthy_pct": publish.healthy,
+        "excess_pct": publish.excess,
+        "rising_since": publish.rising_since,
+    }
 
 
 def hourly_floors(
@@ -858,6 +888,19 @@ def publish_for_exchanger(
         deficit=state.deficit,
         falling_since=state.falling_since,
     )
+
+
+def payload_recovery(publish: ExchangerPublish) -> dict[str, Any]:
+    """What the recovery signal says on the bus: what the exchanger recovers
+    against what it should — the number behind "the supply air is
+    approaching the outdoor air"."""
+    return {
+        "exchanger": publish.exchanger,
+        "efficiency_pct": publish.efficiency,
+        "healthy_pct": publish.healthy,
+        "deficit_pct": publish.deficit,
+        "falling_since": publish.falling_since,
+    }
 
 
 def measure_recovery(

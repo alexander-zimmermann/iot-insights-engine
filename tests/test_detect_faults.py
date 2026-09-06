@@ -189,7 +189,9 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
     episode = _episode("2/2/227", severity=2)
     plan = _plan([episode], open_rows=[])
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_groups(settings, "channel_silence", plan.publishes)
+        detect_faults._publish_subjects(
+            settings, "channel_silence", plan.publishes, detect_faults._group_payload
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.2"
     payload = call.args[2]
@@ -201,10 +203,11 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
 def test_publish_clear_forces_level_zero() -> None:
     settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_groups(
+        detect_faults._publish_subjects(
             settings,
             "channel_silence",
             (GroupPublish(main_group=15, severity=0, channels=()),),
+            detect_faults._group_payload,
         )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.channel_silence.15"
@@ -225,7 +228,9 @@ def test_publish_device_carries_run_details_on_the_slug_subject() -> None:
         limit_hours=4.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_devices(settings, "appliance_runtime", (publish,))
+        detect_faults._publish_subjects(
+            settings, "appliance_runtime", (publish,), duration.payload
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
     payload = call.args[2]
@@ -248,12 +253,68 @@ def test_publish_device_clear_forces_level_zero() -> None:
         limit_hours=4.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_devices(settings, "appliance_runtime", (publish,))
+        detect_faults._publish_subjects(
+            settings, "appliance_runtime", (publish,), duration.payload
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
+
+
+def test_publish_standby_carries_drift_details_on_the_slug_subject() -> None:
+    settings = _settings()
+    publish = drift.DevicePublish(
+        ga="2/2/227",
+        severity=2,
+        device="Küche.K15-L1.Gefrierschrank",
+        name="Schalten.EG.Küche.K15-L1.Gefrierschrank.Stromwert",
+        level=500.0,
+        healthy=48.0,
+        excess=452.0,
+        rising_since=_T0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_subjects(
+            settings, "appliance_standby", (publish,), drift.payload_standby
+        )
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.appliance_standby.2-2-227"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["standby_ma"] == 500.0
+    assert payload["healthy_ma"] == 48.0
+    assert payload["excess_ma"] == 452.0
+    assert payload["rising_since"] == _T0
+
+
+def test_publish_duty_cycle_carries_drift_details_on_the_slug_subject() -> None:
+    settings = _settings()
+    publish = drift.DevicePublish(
+        ga="2/2/227",
+        severity=1,
+        device="Küche.K15-L1.Gefrierschrank",
+        name="Schalten.EG.Küche.K15-L1.Gefrierschrank.Stromwert",
+        level=71.0,
+        healthy=50.0,
+        excess=21.0,
+        rising_since=_T0,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        detect_faults._publish_subjects(
+            settings, "freezer_icing", (publish,), drift.payload_duty_cycle
+        )
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.freezer_icing.2-2-227"
+    payload = call.args[2]
+    assert payload["severity_level"] == 1
+    assert payload["firing"] is True
+    assert payload["duty_pct"] == 71.0
+    assert payload["healthy_pct"] == 50.0
+    assert payload["excess_pct"] == 21.0
+    assert payload["rising_since"] == _T0
 
 
 def test_publish_room_carries_cold_details_on_the_slug_subject() -> None:
@@ -270,7 +331,7 @@ def test_publish_room_carries_cold_details_on_the_slug_subject() -> None:
         min_gap=1.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
+        detect_faults._publish_subjects(settings, "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
     payload = call.args[2]
@@ -295,7 +356,7 @@ def test_publish_room_clear_forces_level_zero() -> None:
         min_gap=1.0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_rooms(settings, "fbh_cold", (publish,))
+        detect_faults._publish_subjects(settings, "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.fbh_cold.eg-buero"
     assert call.args[2]["severity_level"] == 0
@@ -315,7 +376,9 @@ def test_publish_exchanger_carries_recovery_details_on_the_slug_subject() -> Non
         falling_since=_T0,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_recovery(settings, "heat_recovery_decay", (publish,))
+        detect_faults._publish_subjects(
+            settings, "heat_recovery_decay", (publish,), drift.payload_recovery
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
     payload = call.args[2]
@@ -340,7 +403,9 @@ def test_publish_exchanger_clear_forces_level_zero() -> None:
         falling_since=None,
     )
     with patch.object(nats_publisher, "publish") as pub:
-        detect_faults._publish_recovery(settings, "heat_recovery_decay", (publish,))
+        detect_faults._publish_subjects(
+            settings, "heat_recovery_decay", (publish,), drift.payload_recovery
+        )
     (call,) = pub.call_args_list
     assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
     assert call.args[2]["severity_level"] == 0

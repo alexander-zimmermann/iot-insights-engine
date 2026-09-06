@@ -23,10 +23,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .episodes import Observation
-from .nats_publisher import slugify
 from .reconcile import Measured, Window
 from .runs import split_runs
 from .silence import BUCKET, pair_by_match, resolve_scope
@@ -139,7 +138,8 @@ class DevicePublish:
 
     @property
     def entity(self) -> str:
-        return slugify(self.ga)
+        # Raw GA; the NATS adapter owns the dialect and slugs it there.
+        return self.ga
 
 
 def publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:
@@ -164,6 +164,19 @@ def publish_for(subject: str, severity: int, state: DeviceState | None) -> Devic
         run_hours=state.run_hours,
         limit_hours=state.device.max_run / BUCKET,
     )
+
+
+def payload(publish: DevicePublish) -> dict[str, Any]:
+    """What this kind says on the bus: the run so far against the device's
+    own limit — fields and wire names in one place."""
+    return {
+        "device": publish.device,
+        "ga": publish.ga,
+        "name": publish.name,
+        "running_since": publish.running_since,
+        "run_hours": publish.run_hours,
+        "limit_hours": publish.limit_hours,
+    }
 
 
 def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
