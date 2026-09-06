@@ -3,8 +3,8 @@
 Every test feeds invented hourly values for a room's channel triple (value,
 reference, gate) and asserts only what comes out: the dense room series,
 which buckets count as cold, observations with their scores, the current
-state, a reconciliation plan, or a resolution error naming the room. No
-cluster, no live database.
+state, the published payload, or a resolution error naming the room. The
+shared reconciliation is `test_reconcile`'s; no cluster, no live database.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from iot_insights_engine.deviation import (
-    DeviationPlan,
     Room,
     RoomBucket,
     RoomPublish,
@@ -23,19 +22,11 @@ from iot_insights_engine.deviation import (
     cold_buckets,
     dead_value_gas,
     deviation_observations,
-    plan_run,
+    publish_for,
     resolve_rooms,
     room_series,
 )
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import (
-    Episode,
-    EpisodePolicy,
-    EventKind,
-    EvidenceRow,
-    NotificationEvent,
-    fold_observations,
-)
+from iot_insights_engine.episodes import EpisodePolicy, fold_observations
 from iot_insights_engine.faults import Roles, RoomRule
 from iot_insights_engine.silence import Channel
 
@@ -341,61 +332,15 @@ class TestState:
         assert classify(_BUERO, [], frontier=_T0) == RoomState(room=_BUERO)
 
 
-_FRONTIER = _T0 + 8 * _HOUR
-
-
-def _episode(subject: str, severity: int, *, ended: bool = False) -> Episode:
-    start = _T0 + 6 * _HOUR
-    evidence = (
-        EvidenceRow(time=start, score=1.5, severity=severity, value=1.5),
-        EvidenceRow(time=start + _HOUR, score=1.8, severity=severity, value=1.8),
-    )
-    events = [NotificationEvent(EventKind.APPEARED, start, severity)]
-    ended_at = None
-    if ended:
-        ended_at = start + 5 * _HOUR
-        events.append(NotificationEvent(EventKind.ENDED, ended_at, 0))
-    return Episode(
-        fault="fbh_cold",
-        subject=subject,
-        started_at=start,
-        last_seen_at=start + _HOUR,
-        ended_at=ended_at,
-        severity=severity,
-        peak_score=1.8,
-        evidence=evidence,
-        events=tuple(events),
-    )
-
-
 def _cold_state(room: Room) -> RoomState:
     return RoomState(
         room=room, cold_since=_T0, gap=1.8, value=20.2, reference=22.0, gate=85.0
     )
 
 
-class TestPlanRun:
-    def _plan(
-        self,
-        episodes: list[Episode],
-        open_rows: list[OpenEpisodeRow],
-        states: dict[str, RoomState] | None = None,
-        dataless: frozenset[str] = frozenset(),
-    ) -> DeviationPlan:
-        return plan_run(
-            episodes=episodes,
-            open_rows=open_rows,
-            states_by_slug=states if states is not None else {"eg-buero": _cold_state(_BUERO)},
-            dataless=dataless,
-            frontier=_FRONTIER,
-        )
-
-    def test_new_cold_room_is_inserted_and_published(self) -> None:
-        episode = _episode("eg-buero", severity=1)
-        plan = self._plan([episode], open_rows=[])
-        assert plan.inserts == (episode,)
-        assert plan.updates == ()
-        (publish,) = plan.publishes
+class TestPublishFor:
+    def test_the_payload_names_the_room_and_its_numbers(self) -> None:
+        publish = publish_for("eg-buero", 1, _cold_state(_BUERO))
         assert publish == RoomPublish(
             slug="eg-buero",
             severity=1,
@@ -407,56 +352,12 @@ class TestPlanRun:
             gate=85.0,
             min_gap=1.0,
         )
+        assert publish.subject == "eg-buero"
+        assert publish.entity == "eg-buero"
 
-    def test_ongoing_episode_with_unchanged_severity_publishes_nothing(self) -> None:
-        episode = _episode("eg-buero", severity=1)
-        row = OpenEpisodeRow(id=7, subject="eg-buero", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.inserts == ()
-        assert plan.updates == ((7, episode),)
-        assert plan.publishes == ()
-
-    def test_escalation_publishes_the_new_severity(self) -> None:
-        episode = _episode("eg-buero", severity=2)
-        row = OpenEpisodeRow(id=7, subject="eg-buero", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        (publish,) = plan.publishes
-        assert publish.severity == 2
-
-    def test_stored_severity_is_never_lowered(self) -> None:
-        episode = _episode("eg-buero", severity=1)
-        row = OpenEpisodeRow(id=7, subject="eg-buero", severity=2)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.publishes == ()
-
-    def test_recovery_publishes_zero_and_reconciles_the_ended_episode(self) -> None:
-        episode = _episode("eg-buero", severity=1, ended=True)
-        row = OpenEpisodeRow(id=7, subject="eg-buero", severity=1)
-        plan = self._plan([episode], open_rows=[row])
-        assert plan.updates == ((7, episode),)
-        (publish,) = plan.publishes
-        assert publish.severity == 0
-        assert publish.slug == "eg-buero"
-
-    def test_open_row_without_computed_counterpart_is_closed_at_frontier(self) -> None:
-        row = OpenEpisodeRow(id=9, subject="eg-buero", severity=1)
-        plan = self._plan([], open_rows=[row])
-        assert plan.orphan_closes == ((9, _FRONTIER),)
-        (publish,) = plan.publishes
-        assert publish.severity == 0
-
-    def test_room_outliving_the_window_stays_open(self) -> None:
-        row = OpenEpisodeRow(id=9, subject="eg-buero", severity=2)
-        plan = self._plan([], open_rows=[row], dataless=frozenset({"eg-buero"}))
-        assert plan.orphan_closes == ()
-        assert plan.stale_opens == ("eg-buero",)
-        assert plan.publishes == ()
-
-    def test_historical_ended_episode_without_open_row_is_ignored(self) -> None:
-        plan = self._plan([_episode("eg-buero", severity=1, ended=True)], open_rows=[])
-        assert plan.inserts == ()
-        assert plan.updates == ()
-        assert plan.publishes == ()
+    def test_a_room_that_left_the_scope_still_gets_its_clear(self) -> None:
+        publish = publish_for("eg-buero", 0, None)
+        assert publish == RoomPublish(slug="eg-buero", severity=0, room="eg-buero")
 
 
 def test_three_cold_hours_become_one_episode_with_few_events() -> None:

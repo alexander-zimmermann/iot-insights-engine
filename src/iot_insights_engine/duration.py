@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from .episodes import Observation
 from .nats_publisher import slugify
-from .reconcile import Measured, Plan, Window, subject_plan
+from .reconcile import Measured, Window
 from .runs import split_runs
 from .silence import BUCKET, pair_by_match, resolve_scope
 
@@ -37,8 +37,6 @@ if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
-    from .episode_store import OpenEpisodeRow
-    from .episodes import Episode
     from .faults import DeviceLimit, Fault
     from .silence import Channel
 
@@ -142,31 +140,6 @@ class DevicePublish:
     @property
     def entity(self) -> str:
         return slugify(self.ga)
-
-
-DurationPlan = Plan[DevicePublish]
-
-
-def plan_run(
-    *,
-    episodes: Sequence[Episode],
-    open_rows: Sequence[OpenEpisodeRow],
-    states_by_ga: Mapping[str, DeviceState],
-    dataless: frozenset[str],
-    frontier: datetime,
-) -> DurationPlan:
-    """The shared reconciliation, delivered per device."""
-
-    def payload(subject: str, severity: int) -> DevicePublish:
-        return publish_for(subject, severity, states_by_ga.get(subject))
-
-    return subject_plan(
-        episodes=episodes,
-        open_rows=open_rows,
-        dataless=dataless,
-        frontier=frontier,
-        publish_for=payload,
-    )
 
 
 def publish_for(subject: str, severity: int, state: DeviceState | None) -> DevicePublish:

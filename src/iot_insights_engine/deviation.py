@@ -37,7 +37,7 @@ from .episodes import Observation
 from .faults import Roles
 from .logging_setup import get_logger
 from .nats_publisher import slugify
-from .reconcile import Measured, Plan, Window, subject_plan
+from .reconcile import Measured, Window
 from .runs import split_runs
 from .silence import BUCKET, DEAD_MIN_BUCKETS, hourly_averages, like_match, resolve_scope
 
@@ -47,8 +47,6 @@ if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import DictRow
 
-    from .episode_store import OpenEpisodeRow
-    from .episodes import Episode
     from .faults import Fault, RoomRule
     from .silence import Channel
 
@@ -322,31 +320,6 @@ class RoomPublish:
         # The slug is already a NATS-safe token — the room's identity here,
         # in the episode subject and on the bus is one string.
         return self.slug
-
-
-DeviationPlan = Plan[RoomPublish]
-
-
-def plan_run(
-    *,
-    episodes: Sequence[Episode],
-    open_rows: Sequence[OpenEpisodeRow],
-    states_by_slug: Mapping[str, RoomState],
-    dataless: frozenset[str],
-    frontier: datetime,
-) -> DeviationPlan:
-    """The shared reconciliation, delivered per room."""
-
-    def payload(subject: str, severity: int) -> RoomPublish:
-        return publish_for(subject, severity, states_by_slug.get(subject))
-
-    return subject_plan(
-        episodes=episodes,
-        open_rows=open_rows,
-        dataless=dataless,
-        frontier=frontier,
-        publish_for=payload,
-    )
 
 
 def publish_for(subject: str, severity: int, state: RoomState | None) -> RoomPublish:
