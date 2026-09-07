@@ -69,6 +69,20 @@
           }
         },
         {
+          "if":   { "properties": { "kind": { "const": "constancy" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["constant_hours", "same_within"],
+                "properties": {
+                  "constant_hours": { "type": "number", "exclusiveMinimum": 0 },
+                  "same_within":    { "type": "number", "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        {
           "if":   { "properties": { "kind": { "const": "external" } }, "required": ["kind"] },
           "else": { "required": ["parameters", "target"] }
         },

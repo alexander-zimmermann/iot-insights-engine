@@ -15,9 +15,11 @@ run and the publish-then-write tail, behind its injected store and
 publisher ends. This module is the job: it loads the fault list, wires
 each kind's declaration, and runs the list fault by fault.
 
-Channel silence measures per channel but reports per main group, so its
-declaration carries its own plan; the lifecycle around it is the same
-runner as everything else's.
+Channel silence and constancy measure per channel but report per main
+group, so their declarations carry their own plan; the lifecycle around
+them is the same runner as everything else's. What silence drops as a dead
+register is what constancy reports: the producer still sends, the register
+behind it no longer moves.
 
 A deviation fault that names an expectation runs the loop in days rather
 than hours: the plant's whole-day yield against the kWh its named model
@@ -56,6 +58,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    constancy,
     deviation,
     drift,
     duration,
@@ -106,6 +109,21 @@ _KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
         # catalog — a thousand of them, normal, and already counted by the
         # measurement's scope_drops record. The ones actually held open are
         # `stale_opens` in the run record.
+        warn_dataless=False,
+    ),
+    MeasurementKind.CONSTANCY: Kind(
+        event="channel_constancy_run",
+        delivery="per_main_group",
+        # Same aggregate as silence, and the same address per main group:
+        # both faults say "a channel of this group is not reporting".
+        frontier=silence.frontier,
+        measure=constancy.measure,
+        plan=constancy.plan_run,
+        payload=constancy.group_payload,
+        # Every never-sent symmetry address in the scope lands in the
+        # dataless set, exactly as it does for silence, and the run record
+        # already counts them. The ones actually held open are
+        # `stale_opens`.
         warn_dataless=False,
     ),
     MeasurementKind.VOLUME: Kind(
