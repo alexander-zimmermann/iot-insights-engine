@@ -115,8 +115,9 @@ owns the text. The subject shape is pinned by those writer rules. A fault
 declares its **target** — one address, one per main group, one per device,
 one per room — and the kind's declaration says which form it expects. The
 two channel-scoped kinds, silence and constancy, share the per-main-group
-form and the addresses behind it: the address says roughly where, the
-payload names the channels exactly.
+form but not the addresses behind it — one per fault per group, because two
+writers on one address overwrite each other's clears. The address says
+which fault and roughly where, the payload names the channels exactly.
 
 ## Runner
 

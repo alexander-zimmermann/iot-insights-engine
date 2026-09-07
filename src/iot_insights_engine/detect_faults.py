@@ -16,10 +16,10 @@ publisher ends. This module is the job: it loads the fault list, wires
 each kind's declaration, and runs the list fault by fault.
 
 Channel silence and constancy measure per channel but report per main
-group, so their declarations carry their own plan; the lifecycle around
-them is the same runner as everything else's. What silence drops as a dead
-register is what constancy reports: the producer still sends, the register
-behind it no longer moves.
+group — each on its own address there — so their declarations carry their
+own plan; the lifecycle around them is the same runner as everything
+else's. What silence drops as a dead register is what constancy reports:
+the producer still sends, the register behind it no longer moves.
 
 A deviation fault that names an expectation runs the loop in days rather
 than hours: the plant's whole-day yield against the kWh its named model
@@ -114,8 +114,9 @@ _KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
     MeasurementKind.CONSTANCY: Kind(
         event="channel_constancy_run",
         delivery="per_main_group",
-        # Same aggregate as silence, and the same address per main group:
-        # both faults say "a channel of this group is not reporting".
+        # Same aggregate as silence, and the same delivery form — but its
+        # own address per main group: two writers on one would overwrite
+        # each other's clears.
         frontier=silence.frontier,
         measure=constancy.measure,
         plan=constancy.plan_run,

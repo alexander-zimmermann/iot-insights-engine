@@ -26,9 +26,9 @@ observation whose score is the run length in units of that limit — the
 fault's declared unit.
 
 Like silence, time is the aggregate's own frontier, and the delivery is per
-main group: the address says roughly where, the payload names the exact
-channels and what each is stuck at. The per-group rule itself is shared
-with silence in `groups`.
+main group — on this fault's own address there, not silence's: the address
+says roughly where, the payload names the exact channels and what each is
+stuck at. The per-group rule itself is shared with silence in `groups`.
 """
 
 from __future__ import annotations

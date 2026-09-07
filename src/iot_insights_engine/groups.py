@@ -2,9 +2,9 @@
 
 Two kinds measure per channel and report per main group — silence and
 constancy. Per-channel addresses are impossible (roughly 500 channels carry
-data), so the address plan gives every main group one Diagnose address
-instead: the address says roughly where, the payload names the channels
-exactly.
+data), so the address plan gives every main group a Diagnose address per
+fault instead: the address says which fault and roughly where, the payload
+names the channels exactly.
 
 Beyond the shared reconciliation both need one rule, and it lives here
 once: **a group publishes when its severity moved or its set of open
