@@ -251,9 +251,7 @@ def test_publish_constancy_group_names_what_each_channel_is_stuck_at() -> None:
     settings = _settings()
     state = constancy.ConstancyState(
         _VOLTAGE_L2,
-        run=constancy.ConstantRun(
-            start=_T0, end=_FRONTIER, duration=9 * _HOUR, value=0.0
-        ),
+        run=constancy.ConstantRun(start=_T0, end=_FRONTIER, low=0.0, high=0.0),
     )
     measured: Measured[constancy.ConstancyState] = Measured(
         states={_VOLTAGE_L2.ga: state}, observations=(), dataless=frozenset(), record={}

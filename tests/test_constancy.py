@@ -55,9 +55,9 @@ def _window(frontier: datetime) -> Window:
 class TestConstantRuns:
     def test_one_held_value_is_one_run(self) -> None:
         runs = constant_runs(_flat(230.1, 5), same_within=0.0)
-        assert runs == (
-            ConstantRun(start=_at(0), end=_at(4), duration=5 * _HOUR, value=230.1),
-        )
+        assert runs == (ConstantRun(start=_at(0), end=_at(4), low=230.1, high=230.1),)
+        assert runs[0].duration == 5 * _HOUR
+        assert runs[0].value == 230.1
 
     def test_a_new_value_starts_a_new_run(self) -> None:
         readings = _flat(230.1, 3) + _flat(231.4, 2, start=3)

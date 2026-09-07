@@ -79,11 +79,12 @@ class ReportFor[S, R](Protocol):
     """A kind's channel-report factory. The state is None where the subject
     was not measured this run, the episode where it is held open for want of
     data — a report then names the address and the tier it still carries,
-    and nothing it cannot know.
+    and nothing it cannot know. Positional, so a kind that reads only one of
+    the two is free to say so in the parameter's name.
     """
 
     def __call__(
-        self, subject: str, severity: int, state: S | None, episode: Episode | None
+        self, subject: str, severity: int, state: S | None, episode: Episode | None, /
     ) -> R: ...
 
 

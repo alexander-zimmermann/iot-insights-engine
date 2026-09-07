@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any
 
 from .episodes import Observation
@@ -56,8 +57,9 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# One reading is a value, not a constancy: the least a run can be read off.
-MIN_CONSTANT_BUCKETS = 2
+# One reading in the tail is a value, not a constancy: the least the
+# candidate filter can read a standing run off.
+MIN_TAIL_BUCKETS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,16 +79,39 @@ class Reading:
 
 @dataclass(frozen=True, slots=True)
 class ConstantRun:
-    """One stretch a channel held its value: first and last bucket, the
-    duration that covers (a bucket covers its full hour), and the value it
-    settled on — the floor of the band, which with the usual `same_within`
-    of zero is the value itself.
+    """One stretch a channel held its value: first and last bucket, and the
+    band it stayed inside. A bucket covers its full hour, so a run of one
+    bucket is already an hour long.
     """
 
     start: datetime
     end: datetime
-    duration: timedelta
-    value: float
+    low: float
+    high: float
+
+    @property
+    def duration(self) -> timedelta:
+        return self.end - self.start + BUCKET
+
+    @property
+    def value(self) -> float:
+        """The value it settled on — the floor of the band it held, which
+        with the usual `same_within` of zero is the value itself."""
+        return self.low
+
+    def extended_by(self, reading: Reading, same_within: float) -> ConstantRun | None:
+        """This run with the reading added, or None where the reading ends
+        it instead: a bucket missing in between, or a value that takes the
+        run's whole spread outside the band. The band is measured over the
+        run rather than against the predecessor, so half a degree an hour is
+        a walk the drift kind owns, not a stuck register.
+        """
+        if reading.bucket - self.end > BUCKET:
+            return None
+        low, high = min(self.low, reading.low), max(self.high, reading.high)
+        if high - low > same_within:
+            return None
+        return ConstantRun(start=self.start, end=reading.bucket, low=low, high=high)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,54 +145,47 @@ class WindowStats:
     tail_low: float | None
     tail_high: float | None
 
-    def moved(self, same_within: float) -> bool:
-        """Whether the tail shows the channel leaving the declared band —
-        which no channel standing on one value at the frontier can do."""
+    def held_the_band(self, same_within: float) -> bool:
+        """Whether the tail shows the channel standing on one value: enough
+        readings to say so at all, and none of them outside the band. No
+        tail is not constancy — nothing measured it.
+        """
+        if self.tail_buckets < MIN_TAIL_BUCKETS:
+            return False
         if self.tail_low is None or self.tail_high is None:
-            return True
-        return self.tail_high - self.tail_low > same_within
+            return False
+        return self.tail_high - self.tail_low <= same_within
 
 
 def constant_runs(readings: Sequence[Reading], *, same_within: float) -> tuple[ConstantRun, ...]:
     """The stretches the channel held one value, in time order.
 
-    A run continues while the buckets stay contiguous and the whole run's
-    spread stays inside `same_within` — measured over the run rather than
-    step by step, so half a degree an hour is a drift the drift kind owns,
-    not a stuck register. A bucket whose own extremes already leave the band
-    belongs to no run: the register moved inside that hour, which is life.
+    A bucket whose own extremes already leave the band belongs to no run at
+    all — the register moved inside that hour, which is life — and it
+    separates the runs on either side. Where a run ends is
+    `ConstantRun.extended_by`.
     """
     runs: list[ConstantRun] = []
-    start: datetime | None = None
-    previous: datetime | None = None
-    low = high = 0.0
-
-    def close() -> None:
-        if start is not None and previous is not None:
-            runs.append(
-                ConstantRun(
-                    start=start, end=previous, duration=previous - start + BUCKET, value=low
-                )
-            )
-
-    for reading in sorted(readings, key=lambda r: r.bucket):
-        if reading.swing > same_within:
-            close()
-            start = previous = None
-            continue
-        broken = (
-            start is None
-            or previous is None
-            or reading.bucket - previous > BUCKET
-            or max(high, reading.high) - min(low, reading.low) > same_within
+    open_run: ConstantRun | None = None
+    for reading in sorted(readings, key=attrgetter("bucket")):
+        moved = reading.swing > same_within
+        extended = (
+            None if moved or open_run is None else open_run.extended_by(reading, same_within)
         )
-        if broken:
-            close()
-            start, low, high = reading.bucket, reading.low, reading.high
-        else:
-            low, high = min(low, reading.low), max(high, reading.high)
-        previous = reading.bucket
-    close()
+        if extended is not None:
+            open_run = extended
+            continue
+        if open_run is not None:
+            runs.append(open_run)
+        open_run = (
+            None
+            if moved
+            else ConstantRun(
+                start=reading.bucket, end=reading.bucket, low=reading.low, high=reading.high
+            )
+        )
+    if open_run is not None:
+        runs.append(open_run)
     return tuple(runs)
 
 
@@ -225,9 +243,7 @@ def candidates(
         stats = stats_by_ga.get(channel.ga)
         if stats is None:
             continue
-        if channel.ga in open_subjects or (
-            stats.tail_buckets >= MIN_CONSTANT_BUCKETS and not stats.moved(same_within)
-        ):
+        if channel.ga in open_subjects or stats.held_the_band(same_within):
             kept.append(channel)
     return kept
 
@@ -329,13 +345,6 @@ def measure(
         if channel.ga not in stats_by_ga
         or not window.reaches(stats_by_ga[channel.ga].last_bucket)
     )
-    log.info(
-        "constancy_scope",
-        fault=fault.name,
-        channels=len(channels),
-        without_data=sum(1 for c in channels if c.ga not in stats_by_ga),
-    )
-
     return Measured(
         states=states,
         observations=tuple(observations),
@@ -375,13 +384,14 @@ class ChannelReport:
 
 
 def report_for(
-    subject: str, severity: int, state: ConstancyState | None, episode: Episode | None
+    subject: str, severity: int, state: ConstancyState | None, _episode: Episode | None
 ) -> ChannelReport:
     """One channel's line in the group publish. A subject held open for want
     of data has no state this run, so its report names the address and the
-    tier it still carries, and nothing it cannot know.
+    tier it still carries, and nothing it cannot know. The episode the
+    protocol offers says nothing this state does not: the run carries how
+    long the channel has stood.
     """
-    del episode  # The state carries the run; the episode adds nothing here.
     if state is None:
         return ChannelReport(
             ga=subject,
