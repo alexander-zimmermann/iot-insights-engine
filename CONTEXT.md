@@ -24,6 +24,9 @@ How a fault is measured. Every fault has exactly one:
 
 - **silence** — a channel that used to send has gone quiet, longer than a
   multiple of its own normal pause;
+- **constancy** — a channel keeps sending and keeps delivering the same
+  value: the producer works, the register behind it is dead. What silence
+  drops as unmeasurable is what this kind reports;
 - **duration** — a device draws current for longer than its declared
   limit;
 - **drift** — something a device does sits persistently above (or, for
@@ -110,7 +113,11 @@ How a verdict leaves the engine: one publish per moved subject on
 knx-nats-bridge writer rules route to a KNX group address, where Basalte
 owns the text. The subject shape is pinned by those writer rules. A fault
 declares its **target** — one address, one per main group, one per device,
-one per room — and the kind's declaration says which form it expects.
+one per room — and the kind's declaration says which form it expects. The
+two channel-scoped kinds, silence and constancy, share the per-main-group
+form but not the addresses behind it — one per fault per group, because two
+writers on one address overwrite each other's clears. The address says
+which fault and roughly where, the payload names the channels exactly.
 
 ## Runner
 

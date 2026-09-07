@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from iot_insights_engine import (
+    constancy,
     deviation,
     drift,
     duration,
@@ -34,12 +35,12 @@ from iot_insights_engine.faults import (
     MeasurementKind,
     Target,
 )
+from iot_insights_engine.groups import GroupPublish
 from iot_insights_engine.reconcile import Measured, Plan
 from iot_insights_engine.runner import NatsPublisher, publish_subjects
 from iot_insights_engine.silence import (
     Channel,
     ChannelState,
-    GroupPublish,
     SilenceState,
     plan_run,
 )
@@ -50,6 +51,9 @@ _FRONTIER = _T0 + 8 * _HOUR
 
 _FREEZER = Channel(ga="2/2/227", name="Schalten.Gefrierschrank.Stromwert", dpt="9.021")
 _BOILER = Channel(ga="2/2/224", name="Schalten.Geschirrspueler.Stromwert", dpt="9.021")
+_VOLTAGE_L2 = Channel(
+    ga="15/1/22", name="Versorgungstechnik.Energiezähler.Strom.Spannung-L2", dpt="14.027"
+)
 
 
 def _episode(subject: str, severity: int, *, ended: bool = False) -> Episode:
@@ -241,6 +245,58 @@ def test_publish_clear_forces_level_zero() -> None:
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
+
+
+def test_publish_constancy_group_names_what_each_channel_is_stuck_at() -> None:
+    settings = _settings()
+    state = constancy.ConstancyState(
+        _VOLTAGE_L2,
+        run=constancy.ConstantRun(start=_T0, end=_FRONTIER, low=0.0, high=0.0),
+    )
+    measured: Measured[constancy.ConstancyState] = Measured(
+        states={_VOLTAGE_L2.ga: state}, observations=(), dataless=frozenset(), record={}
+    )
+    plan = constancy.plan_run(
+        episodes=[_episode(_VOLTAGE_L2.ga, severity=2)],
+        open_rows=[],
+        measured=measured,
+        frontier=_FRONTIER,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_subjects(
+            NatsPublisher(settings),
+            "channel_constancy",
+            plan.publishes,
+            constancy.group_payload,
+        )
+    (call,) = pub.call_args_list
+    # The same per-main-group shape silence delivers in.
+    assert call.args[1] == "anomaly.channel_constancy.15"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["stuck_channels"] == 1
+    (channel,) = payload["channels"]
+    assert channel["ga"] == "15/1/22"
+    assert channel["name"] == _VOLTAGE_L2.name
+    assert channel["stuck_since"] == _T0
+    assert channel["stuck_hours"] == 9.0
+    assert channel["value"] == 0.0
+
+
+def test_publish_constancy_clear_forces_level_zero() -> None:
+    settings = _settings()
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_subjects(
+            NatsPublisher(settings),
+            "channel_constancy",
+            (GroupPublish(main_group=15, severity=0, channels=()),),
+            constancy.group_payload,
+        )
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.channel_constancy.15"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["firing"] is False
+    assert call.args[2]["stuck_channels"] == 0
 
 
 def test_publish_device_carries_run_details_on_the_slug_subject() -> None:
@@ -575,3 +631,21 @@ def test_a_deviation_without_an_expectation_stays_the_room_shape() -> None:
     assert kind is not None
     assert kind.measure is deviation.measure
     assert kind.policy.bucket == timedelta(hours=1)
+
+
+def test_a_constancy_fault_runs_the_per_main_group_shape() -> None:
+    kind = _kind_for(
+        Fault(
+            name="channel_constancy",
+            sentence="ein Kanal liefert denselben Wert",
+            unit="× der erlaubten Konstanz",
+            kind=MeasurementKind.CONSTANCY,
+            parameters={"constant_hours": 48, "same_within": 0},
+            target=Target(per_main_group=True),
+        )
+    )
+    assert kind is not None
+    assert kind.measure is constancy.measure
+    assert kind.plan is constancy.plan_run
+    # The same address form silence delivers on.
+    assert kind.delivery == "per_main_group"

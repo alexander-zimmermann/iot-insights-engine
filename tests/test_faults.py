@@ -122,7 +122,8 @@ def test_scope_accepts_lists(tmp_path: Path) -> None:
             unit: "K"
             kind: constancy
             parameters:
-              window_hours: 72
+              constant_hours: 72
+              same_within: 0
             scope:
               dpt: ["9.001", "9.007"]
               exclude_name_like: "%.Alarm%"
@@ -199,6 +200,49 @@ def test_missing_parameter_names_fault_and_field(tmp_path: Path) -> None:
         FaultList.load(path)
 
 
+_CONSTANCY = """
+faults:
+  - name: channel_constancy
+    sentence: "Ein Kanal liefert seit über 48 h denselben Wert (V)."
+    unit: "× der erlaubten Konstanz"
+    kind: constancy
+    parameters:
+      constant_hours: 48
+      same_within: 0
+    scope:
+      dpt: "14.027"
+    target:
+      per_main_group: true
+"""
+
+
+def test_constancy_fault_loads_with_its_two_parameters(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _CONSTANCY))
+    assert fault.kind is MeasurementKind.CONSTANCY
+    assert fault.parameters == {"constant_hours": 48, "same_within": 0}
+    assert fault.target == Target(per_main_group=True)
+
+
+def test_constancy_without_its_duration_rejected(tmp_path: Path) -> None:
+    # Without it nothing says how long one value may stand.
+    body = _CONSTANCY.replace("      constant_hours: 48\n", "")
+    with pytest.raises(ValueError, match=r"channel_constancy.*constant_hours"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_constancy_without_its_band_rejected(tmp_path: Path) -> None:
+    # Without it nothing says what counts as the same value.
+    body = _CONSTANCY.replace("      same_within: 0\n", "")
+    with pytest.raises(ValueError, match=r"channel_constancy.*same_within"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_constancy_band_cannot_be_negative(tmp_path: Path) -> None:
+    body = _CONSTANCY.replace("same_within: 0", "same_within: -1")
+    with pytest.raises(ValueError, match=r"channel_constancy.*same_within"):
+        FaultList.load(_write(tmp_path, body))
+
+
 def test_quantile_outside_its_range_names_fault_and_field(tmp_path: Path) -> None:
     # A quantile is a fraction of the channel's own gaps; 90 is the typo for
     # 0.9 that would otherwise silently read the longest gap ever seen.
@@ -253,6 +297,8 @@ def test_non_numeric_parameter_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
+              constant_hours: 48
+              same_within: 0
               healthy: "high"
             scope:
               name_like: "%.Stromwert"
@@ -295,7 +341,8 @@ def test_unknown_field_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -317,7 +364,8 @@ def test_target_requires_exactly_one_form(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -339,7 +387,8 @@ def test_invalid_ga_format_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -360,7 +409,8 @@ def test_empty_scope_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope: {}
             target:
               ga: "2/2/229"
@@ -380,7 +430,8 @@ def test_duplicate_name_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -411,7 +462,8 @@ def test_dormant_loads_but_is_not_schedulable(tmp_path: Path) -> None:
     unit: "%"
     kind: constancy
     parameters:
-      window_hours: 24
+      constant_hours: 24
+      same_within: 0
     scope:
       name_like: "%.Batterie.%"
     target:
@@ -442,7 +494,8 @@ def test_dormant_requires_reason_and_condition(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -464,7 +517,8 @@ def test_dormant_missing_active_when_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -486,7 +540,8 @@ def test_missing_name_reports_position(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
             target:
@@ -595,7 +650,8 @@ def test_devices_on_other_kind_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             devices:
               Waschmaschine:
                 max_run_hours: 4
@@ -700,7 +756,8 @@ def test_references_on_other_kind_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             references:
               Waschmaschine:
                 healthy_ma: 0
@@ -1020,7 +1077,8 @@ def test_rooms_on_other_kind_rejected(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             rooms:
               EG.Büro:
                 min_gap_k: 1.0
@@ -1119,8 +1177,12 @@ def test_expectation_fault_rejects_channel_roles(tmp_path: Path) -> None:
 
 
 def test_expectation_on_another_kind_rejected(tmp_path: Path) -> None:
-    # Only the deviation kind measures against an expectation.
-    body = _EXPECTATION.replace("kind: deviation", "kind: constancy")
+    # Only the deviation kind measures against an expectation. The kind it
+    # is flipped to brings its own required parameters, so the entry stays
+    # schema-valid and the loader's check is what has to catch this.
+    body = _EXPECTATION.replace("kind: deviation", "kind: constancy").replace(
+        "    parameters:", "    parameters:\n      constant_hours: 48\n      same_within: 0"
+    )
     with pytest.raises(ValueError, match=r"'pv_underperformance'.*expectation"):
         FaultList.load(_write(tmp_path, body))
 
@@ -1197,7 +1259,8 @@ def test_engine_kind_still_requires_target(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             scope:
               name_like: "%.Stromwert"
         """,
@@ -1259,7 +1322,8 @@ def test_measuring_kinds_still_require_a_scope(tmp_path: Path) -> None:
             unit: "mA"
             kind: constancy
             parameters:
-              healthy: 43
+              constant_hours: 48
+              same_within: 0
             target:
               ga: "2/2/229"
         """,

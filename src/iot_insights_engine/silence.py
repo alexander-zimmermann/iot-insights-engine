@@ -19,13 +19,15 @@ it).
 Channels that never sent are excluded without a report — symmetry
 addresses are normal, not findings. Dead registers (a constant zero over
 the whole window, like the L2 voltage that read 0.0 for 717 buckets) drop
-out where the scope resolves; both drops are logged by the caller.
+out where the scope resolves; both drops are logged by the caller. What
+silence drops here is what the constancy kind exists to report: a dead
+register is not quiet, it is stuck.
 
 Measured per channel, delivered per main group: one severity per group on
 its Zentral diagnosis address, and the payload names the exact channels.
-The whole kind lives here — the measurement, the per-group plan
-(`plan_run`) and the wire payload (`group_payload`); the runner owns the
-lifecycle around it.
+The measurement and the wire payload (`group_payload`) live here; the
+per-group delivery rule is shared with constancy in `groups`, and the
+runner owns the lifecycle around both.
 
 This module also holds what every kind needs before it can measure
 anything: the `Channel` a catalog query resolves to, the query itself
@@ -37,7 +39,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -49,8 +51,9 @@ from psycopg.rows import DictRow
 
 from .episodes import Observation
 from .faults import Scope
+from .groups import GroupPublish, group_plan, main_group
 from .logging_setup import get_logger
-from .reconcile import Measured, plan_from, reconcile
+from .reconcile import Measured
 
 if TYPE_CHECKING:
     from .episode_store import OpenEpisodeRow
@@ -80,13 +83,6 @@ DEAD_MIN_BUCKETS = 24
 # Two buckets is the least a gap can be read off — a channel that sent
 # fewer has no pause, and nothing measured it.
 MIN_PAUSE_BUCKETS = 2
-
-
-def main_group(ga: str) -> int:
-    """The KNX main group of a group address — the granularity silence
-    reports at (one Zentral diagnosis address per main group).
-    """
-    return int(ga.split("/", 1)[0])
 
 
 class ChannelState(StrEnum):
@@ -498,20 +494,29 @@ class ChannelReport:
     severity: int
     gap_hours: float | None
 
-
-@dataclass(frozen=True, slots=True)
-class GroupPublish:
-    main_group: int
-    severity: int
-    channels: tuple[ChannelReport, ...]
-
     @property
-    def subject(self) -> str:
-        return str(self.main_group)
+    def magnitude(self) -> float | None:
+        """How bad this channel is, in the fault's declared unit — the gap
+        it stands in, which orders the group's list."""
+        return self.gap_hours
 
-    @property
-    def entity(self) -> str:
-        return str(self.main_group)
+
+def report_for(
+    subject: str, severity: int, state: SilenceState | None, episode: Episode | None
+) -> ChannelReport:
+    """One channel's line in the group publish. A subject held open for want
+    of data has neither state nor episode this run, so its report names the
+    address and the tier it still carries, and nothing it cannot know.
+    """
+    return ChannelReport(
+        ga=subject,
+        name=state.channel.name if state is not None else subject,
+        silent_since=state.silent_since if state is not None else None,
+        severity=severity,
+        gap_hours=(
+            episode.evidence[-1].value if episode is not None and episode.evidence else None
+        ),
+    )
 
 
 def plan_run(
@@ -520,75 +525,20 @@ def plan_run(
     open_rows: Sequence[OpenEpisodeRow],
     measured: Measured[SilenceState],
     frontier: datetime,
-) -> Plan[GroupPublish]:
-    """The shared reconciliation, delivered per main group — the one thing
-    channel silence does not share with the other kinds.
-
-    A group publishes when its severity moved or its set of open channels
-    changed: a second channel going silent at the same tier still gets named
-    on the bus.
-    """
-    result = reconcile(
+) -> Plan[GroupPublish[ChannelReport]]:
+    """The shared per-main-group delivery, with silence's own channel
+    reports — the one thing this kind does not share with the per-subject
+    kinds."""
+    return group_plan(
         episodes=episodes,
         open_rows=open_rows,
-        dataless=measured.dataless,
+        measured=measured,
         frontier=frontier,
+        report_for=report_for,
     )
-    # The fold leaves at most one open episode per subject, and it is the
-    # one the reconciliation carried into `after`.
-    open_episodes = {e.subject: e for e in episodes if e.ended_at is None}
-    reports: dict[str, ChannelReport] = {}
-    for subject, severity in result.after.items():
-        episode = open_episodes.get(subject)
-        if episode is None:
-            # Kept open for want of data: nothing measured it this run, so
-            # there is no gap to report — only the address and the tier it
-            # still carries.
-            reports[subject] = ChannelReport(
-                ga=subject, name=subject, silent_since=None, severity=severity, gap_hours=None
-            )
-            continue
-        state = measured.states[subject]
-        reports[subject] = ChannelReport(
-            ga=subject,
-            name=state.channel.name,
-            silent_since=state.silent_since,
-            severity=severity,
-            gap_hours=episode.evidence[-1].value if episode.evidence else None,
-        )
-
-    before = _group_state((row.subject, row.severity) for row in open_rows)
-    after = _group_state((subject, report.severity) for subject, report in reports.items())
-
-    publishes: list[GroupPublish] = []
-    for group in sorted(set(before) | set(after)):
-        severity, _ = after.get(group, (0, frozenset()))
-        if after.get(group) == before.get(group):
-            continue
-        channels = sorted(
-            (r for r in reports.values() if main_group(r.ga) == group),
-            key=lambda r: (-r.severity, -(r.gap_hours or 0.0), r.ga),
-        )
-        publishes.append(GroupPublish(group, severity, tuple(channels)))
-
-    return plan_from(result, publishes)
 
 
-def _group_state(
-    subject_severities: Iterable[tuple[str, int]],
-) -> dict[int, tuple[int, frozenset[str]]]:
-    """Per main group: the maximum severity and the set of open subjects —
-    the two things whose change warrants a publish."""
-    severities: dict[int, int] = {}
-    subjects: dict[int, set[str]] = {}
-    for subject, severity in subject_severities:
-        group = main_group(subject)
-        severities[group] = max(severities.get(group, 0), severity)
-        subjects.setdefault(group, set()).add(subject)
-    return {g: (severities[g], frozenset(subjects[g])) for g in severities}
-
-
-def group_payload(publish: GroupPublish) -> dict[str, Any]:
+def group_payload(publish: GroupPublish[ChannelReport]) -> dict[str, Any]:
     """What this kind says on the bus: how many channels in the group are
     open, and which — fields and wire names in one place."""
     return {
