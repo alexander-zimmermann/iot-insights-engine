@@ -58,6 +58,18 @@ class DriftSignal(StrEnum):
     RECOVERY = "recovery"
 
 
+class DeviationExpectation(StrEnum):
+    """Where a deviation fault takes its expectation from, where that is not
+    a channel of the house. The fault entry names one; the computation
+    compares a measured yield against expected kWh and never learns which
+    model produced them, which is what makes the swap a line in the file
+    and a function here rather than a rewrite.
+    """
+
+    # The weather-adjusted forecast.solar curve, integrated per day.
+    FORECAST_SOLAR = "forecast_solar"
+
+
 # What each signal calls its declared healthy level. The unit is in the
 # name because that is the whole point of the reference; the loader keeps
 # it out of the dataclass, where the signal already says what it is.
@@ -214,7 +226,9 @@ class Fault:
     parameters expressed in the channel's own unit. External faults carry
     neither parameters nor a target — threshold and delivery live in
     Basalte, the scope names the address whose writes come back. A volume
-    fault carries no scope: it measures the episode stream, not channels.
+    fault carries no scope: it measures the episode stream, not channels,
+    and neither does a deviation fault that names an `expectation` — it
+    measures a yield against that model.
     """
 
     name: str
@@ -230,12 +244,15 @@ class Fault:
     references: tuple[DeviceReference, ...] = ()
     roles: Roles | ExchangerRoles | None = None
     rooms: tuple[RoomRule, ...] = ()
+    expectation: DeviationExpectation | None = None
 
     def channel_scope(self) -> Scope:
-        """The catalog query this fault measures over. Every kind but volume
-        declares one and the loader enforces it, so a missing scope here is a
-        new kind that arrived without saying what it measures — never an
-        empty query, which would resolve to the whole catalog.
+        """The catalog query this fault measures over. Every fault that
+        measures channels declares one and the loader enforces it, so a
+        missing scope here is a kind that measures channels and arrived
+        without saying which — never an empty query, which would resolve to
+        the whole catalog. The two that measure none (the volume watchdog,
+        and a deviation fault with a named expectation) never ask.
         """
         if self.scope is None:
             raise ValueError(f"fault {self.name}: this kind measures channels and needs a scope")
@@ -288,6 +305,7 @@ class FaultList:
                 or _check_devices(raw)
                 or _check_references(raw)
                 or _check_signal(raw)
+                or _check_expectation(raw)
                 or _check_rooms(raw)
             )
             if problem is not None:
@@ -412,6 +430,30 @@ def _check_signal(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _check_expectation(raw: dict[str, Any]) -> str | None:
+    """A named expectation belongs to the deviation kind alone, and it is
+    that kind's other shape: a yield measured against a model, not a room
+    against its setpoint. So the rooms, their shared roles and the catalog
+    query they are resolved through would be dead configuration nothing
+    reads. Checked in the loader because the schema's if/else error names
+    the branch rather than the field.
+    """
+    if "expectation" not in raw:
+        return None
+    if raw["kind"] != MeasurementKind.DEVIATION:
+        return (
+            f"fault {raw['name']!r}: expectation: only a deviation fault "
+            f"names where its expectation comes from"
+        )
+    for forbidden in ("roles", "rooms", "scope"):
+        if forbidden in raw:
+            return (
+                f"fault {raw['name']!r}: {forbidden}: a deviation fault that names an "
+                f"expectation measures against that model, not against channels"
+            )
+    return None
+
+
 def _roles_owner(raw: dict[str, Any]) -> bool:
     """Whether this fault's kind (and signal) declares channel roles at all:
     the deviation kind's reference and gate, or the recovery signal's airs.
@@ -437,6 +479,9 @@ def _check_rooms(raw: dict[str, Any]) -> str | None:
     if raw["kind"] != MeasurementKind.DEVIATION:
         if "rooms" in raw:
             return f"fault {raw['name']!r}: rooms: only a deviation fault declares rooms"
+        return None
+    if "expectation" in raw:
+        # The other shape of the kind: no rooms, so no gate to pair up.
         return None
     has_gate = "gate" in raw["roles"]
     has_gate_min = "gate_min_pct" in raw.get("parameters", {})
@@ -522,6 +567,9 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         rooms=tuple(
             RoomRule(match=match, min_gap_k=rule["min_gap_k"], value=rule["value"])
             for match, rule in raw.get("rooms", {}).items()
+        ),
+        expectation=(
+            DeviationExpectation(raw["expectation"]) if "expectation" in raw else None
         ),
         dormant=(
             Dormant(reason=dormant["reason"], active_when=dormant["active_when"])

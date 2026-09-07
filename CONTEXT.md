@@ -30,8 +30,11 @@ How a fault is measured. Every fault has exactly one:
   recovery, below) the healthy level declared for it, walked as a CUSUM
   with a pinned reference. Which series it walks is the fault's declared
   **signal**: `standby`, `duty_cycle` or `recovery`;
-- **deviation** — a value sits too far under its declared reference while
-  a gate condition holds;
+- **deviation** — a value sits too far under its declared reference. Two
+  shapes, told apart by what the fault declares that reference as: rooms
+  against a channel of the house while a gate condition holds, or the
+  plant's daily yield against a model named in the entry — its declared
+  **expectation**, swappable there without touching the comparison;
 - **volume** — more than N incidents in a week, measured over the engine's
   own episode stream;
 - **external** — Basalte detects and delivers the fault itself; the engine
@@ -44,7 +47,7 @@ and plans.
 ## Subject
 
 The thing a fault's verdict is about: a channel, a device, a room, an
-exchanger, or the house itself. Episodes are stored per fault and subject.
+exchanger, the PV plant, or the house itself. Episodes are stored per fault and subject.
 
 ## Scope
 
@@ -91,7 +94,8 @@ self-clearing.
 ## Frontier
 
 The "now" a run is measured against: the newest bucket of the aggregate it
-reads, not the wall clock. The continuous aggregate materializes with an
+reads, not the wall clock — for a kind that measures whole days, the newest
+*complete* one. The continuous aggregate materializes with an
 end offset, so the newest visible bucket lags real time for every channel
 at once; the frontier cancels that lag. Episodes also *end* in frontier
 time, so a stalled refresh freezes the picture instead of clearing every
@@ -110,9 +114,9 @@ one per room — and the kind's declaration says which form it expects.
 
 ## Runner
 
-The run lifecycle every kind shares: window off the frontier, fold,
-reconciliation, run record, dry-run gating, and the publish-before-write
-tail. It touches the world through two injected ends, the **store** and
+The run lifecycle every kind shares: window off the frontier, fold in the
+kind's own cadence, reconciliation, run record, dry-run gating, and the
+publish-before-write tail. It touches the world through two injected ends, the **store** and
 the **publisher**, so those guarantees are testable through fakes.
 Publishes go out before the database writes: a failed run then repeats the
 same publish instead of losing it behind an already-updated database.

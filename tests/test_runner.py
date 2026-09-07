@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import Episode, Observation
+from iot_insights_engine.episodes import Episode, EpisodePolicy, Observation
 from iot_insights_engine.faults import Fault, MeasurementKind, Target
 from iot_insights_engine.reconcile import Measured, Plan, Window
 from iot_insights_engine.runner import LOOKBACK, Kind, run_subjects
@@ -102,6 +102,8 @@ class _Publish:
 # Frozen, so it is safe as a default; `_fault(target=None)` is the fault a
 # self-delivering kind gets.
 _PER_DEVICE = Target(per_device=True)
+# Likewise: the hourly cadence every kind but the daily-yield shape folds in.
+_HOURLY = EpisodePolicy()
 
 
 def _fault(target: Target | None = _PER_DEVICE) -> Fault:
@@ -120,6 +122,7 @@ def _kind(
     frontier: datetime | None = _FRONTIER,
     observations: tuple[Observation, ...] = (),
     seen: dict[str, Any] | None = None,
+    policy: EpisodePolicy = _HOURLY,
 ) -> Kind[Any, Any]:
     def measure(
         _conn: Any, _fault: Fault, window: Window, open_rows: Sequence[OpenEpisodeRow]
@@ -138,6 +141,7 @@ def _kind(
         measure=measure,
         publish_for=lambda subject, severity, _state: _Publish(subject, severity),
         payload=lambda p: {"subject": p.subject},
+        policy=policy,
     )
 
 
@@ -337,3 +341,33 @@ def test_the_measurement_sees_the_window_and_the_open_rows() -> None:
     assert seen["open_rows"] == (row,)
     assert seen["window"].frontier == _FRONTIER
     assert seen["window"].start == _FRONTIER - LOOKBACK
+
+
+def test_a_kind_folds_in_its_own_cadence() -> None:
+    # A kind that measures days must fold days. Yesterday's observation is
+    # the newest this kind can have; under the hourly default it would look
+    # long stale and its episode would close on the run that first saw it.
+    daily = EpisodePolicy(bucket=timedelta(days=1), quiet_runs=1)
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+    seen: dict[str, Any] = {}
+
+    run_subjects(
+        store,
+        publisher,
+        _fault(),
+        _kind(
+            observations=(
+                Observation(subject="pv", time=_FRONTIER - timedelta(days=1), score=2.0),
+            ),
+            seen=seen,
+            policy=daily,
+        ),
+        dry_run=False,
+    )
+
+    assert seen["window"].policy is daily
+    assert store.applied is not None
+    inserts, _, _ = store.applied
+    (episode,) = inserts
+    assert episode.ended_at is None

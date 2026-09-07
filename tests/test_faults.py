@@ -15,6 +15,7 @@ import pytest
 
 from iot_insights_engine.faults import (
     _SCHEMA_PATH,
+    DeviationExpectation,
     DeviceLimit,
     DeviceReference,
     Dormant,
@@ -1045,6 +1046,96 @@ def test_room_entry_without_gap_rejected(tmp_path: Path) -> None:
         '        value: "Sensorik.EG.Büro.Sensor.Temperatur"',
     )
     with pytest.raises(ValueError, match=r"'fbh_cold'.*Büro"):
+        FaultList.load(_write(tmp_path, body))
+
+
+_EXPECTATION = """
+faults:
+  - name: pv_underperformance
+    sentence: "Die Anlage hat gestern mehr als 35 % weniger erzeugt, als die
+      wetterbereinigte Prognose erwartet hat."
+    unit: "× des erlaubten Fehlbetrags"
+    kind: deviation
+    expectation: forecast_solar
+    parameters:
+      min_shortfall_pct: 35
+      min_expected_kwh: 3
+    target:
+      ga: "15/4/11"
+"""
+
+
+def test_deviation_fault_loads_a_named_expectation(tmp_path: Path) -> None:
+    # The other shape of the kind: the reference is a model named in the
+    # entry, so there are no rooms to marry and no catalog query to carry.
+    [fault] = FaultList.load(_write(tmp_path, _EXPECTATION))
+    assert fault.kind is MeasurementKind.DEVIATION
+    assert fault.expectation is DeviationExpectation.FORECAST_SOLAR
+    assert fault.scope is None
+    assert fault.rooms == ()
+    assert fault.roles is None
+    assert fault.parameters == {"min_shortfall_pct": 35, "min_expected_kwh": 3}
+    assert fault.target == Target(ga="15/4/11")
+
+
+def test_expectation_fault_needs_its_shortfall(tmp_path: Path) -> None:
+    body = _EXPECTATION.replace("min_shortfall_pct: 35", "shortfall: 35")
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*min_shortfall_pct"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_expectation_fault_needs_its_floor(tmp_path: Path) -> None:
+    # Without it a day that expected nothing would score a shortfall.
+    body = _EXPECTATION.replace("      min_expected_kwh: 3\n", "")
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*min_expected_kwh"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_expectation_fault_rejects_a_channel_scope(tmp_path: Path) -> None:
+    # It measures against a model, so a catalog query here reads nothing.
+    body = _EXPECTATION + """    scope:
+      name_like: "%.Photovoltaik.%"
+"""
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*scope"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_expectation_fault_rejects_rooms(tmp_path: Path) -> None:
+    body = _EXPECTATION + """    rooms:
+      EG.Büro:
+        min_gap_k: 1.0
+        value: "Sensorik.EG.Büro.Sensor.Temperatur"
+"""
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*rooms"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_expectation_fault_rejects_channel_roles(tmp_path: Path) -> None:
+    body = _EXPECTATION + """    roles:
+      reference: "%.FBH.Soll-Temperatur-Status"
+"""
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*roles"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_expectation_on_another_kind_rejected(tmp_path: Path) -> None:
+    # Only the deviation kind measures against an expectation.
+    body = _EXPECTATION.replace("kind: deviation", "kind: constancy")
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*expectation"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_unknown_expectation_rejected(tmp_path: Path) -> None:
+    # A model nobody wired up must fail here, not at 03:00 in the cluster.
+    body = _EXPECTATION.replace("expectation: forecast_solar", "expectation: clear_sky")
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*expectation"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_a_shortfall_over_a_hundred_percent_rejected(tmp_path: Path) -> None:
+    # A percentage of the expectation cannot exceed it.
+    body = _EXPECTATION.replace("min_shortfall_pct: 35", "min_shortfall_pct: 135")
+    with pytest.raises(ValueError, match=r"'pv_underperformance'.*min_shortfall_pct"):
         FaultList.load(_write(tmp_path, body))
 
 

@@ -20,12 +20,19 @@ from iot_insights_engine import (
     volume,
 )
 from iot_insights_engine.config import Settings
+from iot_insights_engine.detect_faults import _kind_for
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import (
     Episode,
     EventKind,
     EvidenceRow,
     NotificationEvent,
+)
+from iot_insights_engine.faults import (
+    DeviationExpectation,
+    Fault,
+    MeasurementKind,
+    Target,
 )
 from iot_insights_engine.reconcile import Measured, Plan
 from iot_insights_engine.runner import NatsPublisher, publish_subjects
@@ -484,3 +491,87 @@ def test_publish_volume_clear_forces_level_zero() -> None:
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
+
+
+def _plant_publish(severity: int) -> deviation.PlantPublish:
+    """Short against the forecast while firing, back on target on the clear."""
+    return deviation.PlantPublish(
+        severity=severity,
+        state=deviation.YieldState(
+            expectation=DeviationExpectation.FORECAST_SOLAR,
+            min_shortfall_pct=35.0,
+            day=_T0,
+            actual_kwh=12.0 if severity else 39.0,
+            expected_kwh=40.0,
+            shortfall_pct=70.0 if severity else 2.5,
+            short_since=_T0 if severity else None,
+        ),
+    )
+
+
+def test_publish_plant_carries_the_day_against_its_expectation() -> None:
+    settings = _settings()
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_subjects(
+            NatsPublisher(settings),
+            "pv_underperformance",
+            (_plant_publish(2),),
+            deviation.payload_yield,
+        )
+    (call,) = pub.call_args_list
+    # One plant-wide address, so a 1:1 subject with no entity token — the
+    # writer rule pins exactly this string to 15/4/11.
+    assert call.args[1] == "anomaly.pv_underperformance"
+    payload = call.args[2]
+    assert payload["severity_level"] == 2
+    assert payload["firing"] is True
+    assert payload["expectation"] == "forecast_solar"
+    assert payload["day"] == _T0
+    assert payload["actual_kwh"] == 12.0
+    assert payload["expected_kwh"] == 40.0
+    assert payload["shortfall_pct"] == 70.0
+    assert payload["short_since"] == _T0
+
+
+def test_publish_plant_clear_forces_level_zero() -> None:
+    settings = _settings()
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_subjects(
+            NatsPublisher(settings),
+            "pv_underperformance",
+            (_plant_publish(0),),
+            deviation.payload_yield,
+        )
+    (call,) = pub.call_args_list
+    assert call.args[1] == "anomaly.pv_underperformance"
+    assert call.args[2]["severity_level"] == 0
+    assert call.args[2]["severity"] is None
+    assert call.args[2]["firing"] is False
+
+
+def _deviation_fault(expectation: DeviationExpectation | None) -> Fault:
+    return Fault(
+        name="pv_underperformance" if expectation else "fbh_cold",
+        sentence="ein Wert liegt unter seiner Erwartung",
+        unit="× der erlaubten Abweichung",
+        kind=MeasurementKind.DEVIATION,
+        parameters={},
+        target=Target(ga="15/4/11") if expectation else Target(per_room=True),
+        expectation=expectation,
+    )
+
+
+def test_a_named_expectation_picks_the_daily_yield_shape() -> None:
+    # The one thing that decides which of the kind's two shapes runs.
+    kind = _kind_for(_deviation_fault(DeviationExpectation.FORECAST_SOLAR))
+    assert kind is not None
+    assert kind.measure is deviation.measure_yield
+    assert kind.frontier is deviation.yield_frontier
+    assert kind.policy.bucket == deviation.DAY
+
+
+def test_a_deviation_without_an_expectation_stays_the_room_shape() -> None:
+    kind = _kind_for(_deviation_fault(None))
+    assert kind is not None
+    assert kind.measure is deviation.measure
+    assert kind.policy.bucket == timedelta(hours=1)

@@ -211,12 +211,16 @@ class Kind[S, P: SubjectPublish]:
     Folding defaults to the pure observation pipeline; planning defaults to
     the shared per-subject delivery through `publish_for` — a kind that
     works another way declares `fold` or `plan` instead (one of
-    `publish_for`/`plan` is required). `delivery` is None for the one kind
-    whose faults declare no target at all; `payload` is None for the one
-    kind that publishes nothing; `warn_dataless` is off for the one kind
-    whose dataless set is routinely huge and already accounted for; and
-    `externally_delivered` marks episodes someone else already notified
-    about, so nothing downstream notifies a second time.
+    `publish_for`/`plan` is required). `policy` is how its observations
+    fold — hourly, like the aggregates every kind so far reads, unless the
+    kind measures in another cadence and declares its own, so that "a few
+    quiet runs" is counted in the unit it actually measures in.
+    `delivery` is None for the one kind whose faults declare no target at
+    all; `payload` is None for the one kind that publishes nothing;
+    `warn_dataless` is off for the one kind whose dataless set is routinely
+    huge and already accounted for; and `externally_delivered` marks
+    episodes someone else already notified about, so nothing downstream
+    notifies a second time.
     """
 
     event: str
@@ -232,6 +236,7 @@ class Kind[S, P: SubjectPublish]:
     plan: PlanHook[S, P] | None = None
     warn_dataless: bool = True
     externally_delivered: bool = False
+    policy: EpisodePolicy = EpisodePolicy()
 
 
 def publish_subjects[P: SubjectPublish](
@@ -270,7 +275,7 @@ def run_subjects[S, P: SubjectPublish](
         raise ValueError(
             f"fault {fault.name}: {fault.kind} delivery needs a {kind.delivery} target"
         )
-    policy = EpisodePolicy()
+    policy = kind.policy
 
     with store.read() as conn:
         frontier = kind.frontier(conn)
