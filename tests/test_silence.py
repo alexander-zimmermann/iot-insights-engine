@@ -2,7 +2,8 @@
 
 Each test feeds an invented bucket series (the shape `knx_1h` hands the
 measurement) into the real computation and asserts only what comes out:
-a channel state, and per-bucket observations for the episode pipeline.
+a channel state, per-bucket observations for the episode pipeline, and —
+for the gap walk — what the run would hold open.
 The spec fixture: "sent hourly until 10:00, then nothing" must yield
 "silent since 10:00"; a never-sent channel must yield nothing.
 
@@ -15,20 +16,27 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from iot_insights_engine.episode_store import OpenEpisodeRow
+from iot_insights_engine.episodes import EpisodePolicy
+from iot_insights_engine.reconcile import Measured, Window
 from iot_insights_engine.silence import (
     BUCKET,
     Channel,
     ChannelState,
     ChannelStats,
+    SilenceState,
     classify,
     drop_unmeasurable,
+    gap_walk,
     normal_pause,
+    plan_run,
     silence_observations,
 )
 
 _T0 = datetime(2026, 8, 30, 0, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
 _FREEZER = Channel(ga="2/2/227", name="Schalten.Gefrierschrank.Stromwert", dpt="9.021")
+_HALLWAY = Channel(ga="9/1/7", name="Bewegungsmelder.KG.Flur.KNX.Decke.Präsenz", dpt="1.001")
 
 
 def _at(hours: float) -> datetime:
@@ -100,7 +108,12 @@ def test_pause_needs_two_buckets() -> None:
 def test_hourly_sender_gone_quiet_is_silent_since_its_last_bucket() -> None:
     # The spec fixture: sent hourly until 10:00, then nothing.
     state = classify(
-        _FREEZER, _hourly_until(10), frontier=_at(16), gap_factor=5.0, gap_quantile=0.9
+        _FREEZER,
+        _hourly_until(10),
+        start=_at(0),
+        frontier=_at(16),
+        gap_factor=5.0,
+        gap_quantile=0.9,
     )
     assert state.state is ChannelState.SILENT
     assert state.silent_since == _at(10)
@@ -109,21 +122,31 @@ def test_hourly_sender_gone_quiet_is_silent_since_its_last_bucket() -> None:
 
 def test_hourly_sender_within_five_pauses_is_alive() -> None:
     state = classify(
-        _FREEZER, _hourly_until(10), frontier=_at(15), gap_factor=5.0, gap_quantile=0.9
+        _FREEZER,
+        _hourly_until(10),
+        start=_at(0),
+        frontier=_at(15),
+        gap_factor=5.0,
+        gap_quantile=0.9,
     )
     assert state.state is ChannelState.ALIVE
     assert state.silent_since is None
 
 
 def test_never_sent_channel_is_excluded_not_silent() -> None:
-    state = classify(_FREEZER, [], frontier=_at(16), gap_factor=5.0, gap_quantile=0.9)
+    state = classify(_FREEZER, [], start=_at(0), frontier=_at(16), gap_factor=5.0, gap_quantile=0.9)
     assert state.state is ChannelState.NEVER_SENT
 
 
 def test_daily_sender_mid_pause_is_alive() -> None:
     buckets = [_at(24 * d) for d in range(10)]
     state = classify(
-        _FREEZER, buckets, frontier=buckets[-1] + 30 * _HOUR, gap_factor=5.0, gap_quantile=0.9
+        _FREEZER,
+        buckets,
+        start=_at(0),
+        frontier=buckets[-1] + 30 * _HOUR,
+        gap_factor=5.0,
+        gap_quantile=0.9,
     )
     assert state.state is ChannelState.ALIVE
 
@@ -131,7 +154,12 @@ def test_daily_sender_mid_pause_is_alive() -> None:
 def test_daily_sender_past_five_of_its_own_pauses_is_silent() -> None:
     buckets = [_at(24 * d) for d in range(10)]
     state = classify(
-        _FREEZER, buckets, frontier=buckets[-1] + 121 * _HOUR, gap_factor=5.0, gap_quantile=0.9
+        _FREEZER,
+        buckets,
+        start=_at(0),
+        frontier=buckets[-1] + 121 * _HOUR,
+        gap_factor=5.0,
+        gap_quantile=0.9,
     )
     assert state.state is ChannelState.SILENT
     assert state.silent_since == buckets[-1]
@@ -145,13 +173,13 @@ def test_burst_sender_idle_for_a_day_is_alive_where_the_median_called_it_silent(
     frontier = buckets[-1] + 30 * _HOUR
     assert (
         classify(
-            _FREEZER, buckets, frontier=frontier, gap_factor=5.0, gap_quantile=0.5
+            _FREEZER, buckets, start=_at(0), frontier=frontier, gap_factor=5.0, gap_quantile=0.5
         ).state
         is ChannelState.SILENT
     )
     assert (
         classify(
-            _FREEZER, buckets, frontier=frontier, gap_factor=5.0, gap_quantile=0.9
+            _FREEZER, buckets, start=_at(0), frontier=frontier, gap_factor=5.0, gap_quantile=0.9
         ).state
         is ChannelState.ALIVE
     )
@@ -164,6 +192,7 @@ def test_burst_sender_quiet_for_five_of_its_own_days_is_still_silent() -> None:
     state = classify(
         _FREEZER,
         buckets,
+        start=_at(0),
         frontier=buckets[-1] + 101 * _HOUR,
         gap_factor=5.0,
         gap_quantile=0.9,
@@ -175,7 +204,9 @@ def test_burst_sender_quiet_for_five_of_its_own_days_is_still_silent() -> None:
 def test_single_bucket_channel_has_no_measurable_pause() -> None:
     # One send ever: "its own normal pause" does not exist, so silence is
     # not decidable — the channel stays alive and produces nothing.
-    state = classify(_FREEZER, [_at(0)], frontier=_at(500), gap_factor=5.0, gap_quantile=0.9)
+    state = classify(
+        _FREEZER, [_at(0)], start=_at(0), frontier=_at(500), gap_factor=5.0, gap_quantile=0.9
+    )
     assert state.state is ChannelState.ALIVE
     assert state.pause is None
 
@@ -271,3 +302,163 @@ def test_channel_without_data_is_dropped_as_never_sent() -> None:
 def test_channel_main_group() -> None:
     assert _FREEZER.main_group == 2
     assert BUCKET == _HOUR
+
+
+# ---------------------------------------------------------------- unproven
+
+# The window opens at _at(0); this is the hour its last day begins.
+_LAST_DAY = 24 * 29
+
+
+def _newcomer(hours: tuple[int, ...] = (15, 16, 17, 18)) -> list[datetime]:
+    """A motion detector the coupler let through on the last afternoon of
+    the window: a few consecutive buckets, nothing before them."""
+    return [_at(_LAST_DAY + h) for h in hours]
+
+
+def test_channel_first_seen_in_the_window_is_unproven_in_its_first_night() -> None:
+    # Four consecutive buckets: every gap it ever showed is an hour, so the
+    # first quiet night would read as eight of its own pauses.
+    state = classify(
+        _HALLWAY,
+        _newcomer(),
+        start=_at(0),
+        frontier=_at(_LAST_DAY + 26),
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.UNPROVEN
+    assert state.pause == _HOUR
+    assert state.silent_since is None
+
+
+def test_newcomer_is_proven_once_the_quantile_is_more_than_its_largest_gap() -> None:
+    # Two days on: twenty gaps, two nights among them — the p95 is now the
+    # shorter night rather than the longest gap, and the next one is well
+    # within five of it.
+    buckets = _newcomer() + [_at(_LAST_DAY + 24 + h) for h in range(5, 21)] + [_at(_LAST_DAY + 53)]
+    assert len(buckets) - 1 == 20
+    state = classify(
+        _HALLWAY,
+        buckets,
+        start=_at(0),
+        frontier=_at(_LAST_DAY + 61),
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.ALIVE
+    assert state.pause == 9 * _HOUR
+
+
+def test_nineteen_gaps_leave_a_newcomer_unproven_at_p95() -> None:
+    # One short of twenty, and "19 von 20 Fällen" is still its largest gap.
+    buckets = _newcomer() + [_at(_LAST_DAY + 24 + h) for h in range(5, 21)]
+    assert len(buckets) - 1 == 19
+    state = classify(
+        _HALLWAY,
+        buckets,
+        start=_at(0),
+        frontier=_at(_LAST_DAY + 24 + 20 + 60),
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.UNPROVEN
+
+
+def test_sparse_channel_present_since_the_window_start_is_judged_as_before() -> None:
+    # Bordbar: five sends in its first week, then nothing — it was there
+    # when the window opened, so its silence counts however thin it is.
+    buckets = [_at(h) for h in (5, 59, 84, 118, 121)]
+    state = classify(
+        _FREEZER,
+        buckets,
+        start=_at(0),
+        frontier=_at(24 * 30),
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.SILENT
+    assert state.silent_since == _at(121)
+
+
+def test_lead_shorter_than_its_own_threshold_does_not_make_a_channel_new() -> None:
+    # First seen 18 h into the window, sending daily: the empty lead is far
+    # shorter than the five days it would have to be silent — an
+    # established channel with a late first bucket, not a newcomer.
+    buckets = [_at(18 + 24 * d) for d in range(4)]
+    state = classify(
+        _FREEZER,
+        buckets,
+        start=_at(0),
+        frontier=buckets[-1] + 121 * _HOUR,
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.SILENT
+
+
+def test_hourly_newcomer_is_proven_after_a_day() -> None:
+    # A cyclic sender that appeared yesterday: twenty hourly gaps prove its
+    # pause, and it is silent after five of them like any other.
+    buckets = [_at(_LAST_DAY - 20 + h) for h in range(21)]
+    state = classify(
+        _FREEZER,
+        buckets,
+        start=_at(0),
+        frontier=buckets[-1] + 6 * _HOUR,
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    assert state.state is ChannelState.SILENT
+
+
+# ---------------------------------------------------------------- gap_walk
+
+
+def _walk(
+    buckets: list[datetime], frontier: datetime
+) -> tuple[Measured[SilenceState], Window]:
+    stats = ChannelStats(
+        ga=_HALLWAY.ga,
+        buckets=len(buckets),
+        last_bucket=buckets[-1],
+        floor_value=0.0,
+        ceil_value=1.0,
+    )
+    window = Window(start=_at(0), frontier=frontier, policy=EpisodePolicy())
+    measured = gap_walk(
+        channels=[_HALLWAY],
+        kept=[_HALLWAY],
+        candidates=[_HALLWAY],
+        series={_HALLWAY.ga: buckets},
+        stats_by_ga={_HALLWAY.ga: stats},
+        window=window,
+        gap_factor=5.0,
+        gap_quantile=0.95,
+    )
+    return measured, window
+
+
+def test_unproven_channel_is_unmeasured_and_yields_no_observations() -> None:
+    measured, _ = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26))
+    assert measured.states[_HALLWAY.ga].state is ChannelState.UNPROVEN
+    assert measured.observations == ()
+    assert _HALLWAY.ga in measured.dataless
+    assert measured.record["unproven"] == 1
+
+
+def test_open_episode_on_an_unproven_subject_is_held_not_closed() -> None:
+    measured, window = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26))
+    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=1)
+    plan = plan_run(episodes=(), open_rows=[row], measured=measured, frontier=window.frontier)
+    assert plan.stale_opens == (_HALLWAY.ga,)
+    assert plan.orphan_closes == ()
+    assert plan.publishes == ()
+
+
+def test_proven_channel_walks_its_gaps_as_before() -> None:
+    measured, _ = _walk(_hourly_until(10), frontier=_at(18))
+    assert measured.states[_HALLWAY.ga].state is ChannelState.SILENT
+    assert len(measured.observations) == 3
+    assert _HALLWAY.ga not in measured.dataless
+    assert measured.record["unproven"] == 0
