@@ -23,7 +23,9 @@ starts to.
 How a fault is measured. Every fault has exactly one:
 
 - **silence** — a channel that used to send has gone quiet, longer than a
-  multiple of its own normal pause;
+  multiple of its own normal pause. A channel that first appeared inside
+  the window is **unproven** until it has shown as many gaps as the
+  declared quantile needs, and is unmeasured rather than alive until then;
 - **constancy** — a channel keeps sending and keeps delivering the same
   value: the producer works, the register behind it is dead. What silence
   drops as unmeasurable is what this kind reports;

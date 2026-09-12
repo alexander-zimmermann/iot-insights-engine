@@ -5,9 +5,9 @@ times its own normal pause, measured from the latest bucket per channel
 over the hourly aggregate. That pause is the `gap_quantile` of the
 channel's own gaps rather than their median — see `normal_pause` for why
 the median misreads every channel a human switches. Channel state
-(alive / silent / never sent) is computed on demand from `knx_1h`, never
-stored: a staleness detector working off stale data is the joke that
-tells itself.
+(alive / silent / unproven / never sent) is computed on demand from
+`knx_1h`, never stored: a staleness detector working off stale data is
+the joke that tells itself.
 
 Gaps are measured against the aggregate's *frontier* (its newest bucket
 anywhere), not the wall clock: the continuous aggregate materializes with
@@ -22,6 +22,13 @@ the whole window, like the L2 voltage that read 0.0 for 717 buckets) drop
 out where the scope resolves; both drops are logged by the caller. What
 silence drops here is what the constancy kind exists to report: a dead
 register is not quiet, it is stuck.
+
+A channel that first appeared inside the window is *unproven* until it
+has shown as many gaps as the declared quantile needs (see `classify`):
+a motion detector the coupler let through in the afternoon has only ever
+shown one-hour gaps by midnight, and would read the first night of its
+life as five pauses of silence. Unproven is unmeasured, not alive: no
+observations, open episodes held.
 
 Measured per channel, delivered per main group: one severity per group on
 its Zentral diagnosis address, and the payload names the exact channels.
@@ -90,6 +97,8 @@ class ChannelState(StrEnum):
     SILENT = "silent"
     NEVER_SENT = "never_sent"
     DEAD = "dead"
+    # First seen inside the window, too few gaps shown to be judged yet.
+    UNPROVEN = "unproven"
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,12 +130,19 @@ class ChannelStats:
 
 @dataclass(frozen=True, slots=True)
 class SilenceState:
-    """The measured state of one channel, computed on demand."""
+    """The measured state of one channel, computed on demand. Unproven
+    carries the pause the channel would be judged against, never a
+    silent-since."""
 
     channel: Channel
     state: ChannelState
     silent_since: datetime | None = None
     pause: timedelta | None = None
+
+
+def _rank(quantile: float, count: int) -> int:
+    """Nearest rank of `quantile` among `count` sorted gaps, one-based."""
+    return max(1, ceil(quantile * count))
 
 
 def normal_pause(buckets: list[datetime], quantile: float) -> timedelta | None:
@@ -149,28 +165,45 @@ def normal_pause(buckets: list[datetime], quantile: float) -> timedelta | None:
     if len(buckets) < MIN_PAUSE_BUCKETS:
         return None
     gaps = sorted(b - a for a, b in zip(buckets, buckets[1:], strict=False))
-    rank = max(1, ceil(quantile * len(gaps)))
-    return max(gaps[rank - 1], BUCKET)
+    return max(gaps[_rank(quantile, len(gaps)) - 1], BUCKET)
 
 
 def classify(
     channel: Channel,
     buckets: list[datetime],
     *,
+    start: datetime,
     frontier: datetime,
     gap_factor: float,
     gap_quantile: float,
 ) -> SilenceState:
-    """State of one channel from its time-ordered bucket series. Silent
-    means the frontier sits strictly more than `gap_factor` of the
-    channel's own pauses past its last bucket; silent-since names the last
-    bucket, not the detection time.
+    """State of one channel from its time-ordered bucket series inside the
+    window that opens at `start`. Silent means the frontier sits strictly
+    more than `gap_factor` of the channel's own pauses past its last
+    bucket; silent-since names the last bucket, not the detection time.
+
+    Unproven means the channel is both *new* — the empty stretch between
+    the window start and its first bucket is longer than the silence it
+    would now be accused of, so nothing before that stretch vouches for
+    it — and *thin* — the declared quantile of its gaps is still just its
+    largest gap, a maximum rather than a quantile; at 0.95 that takes
+    twenty gaps, "19 von 20 Fällen" needs twenty cases. A channel that was
+    there when the window opened is judged however sparse it is: its
+    silence is measured against a history, not against its own first day.
+    Both limits follow from `gap_factor` and `gap_quantile` alone; at a
+    quantile of 1.0 the pause is the largest gap by declaration, so a
+    newcomer stays unproven until the window has slid past its lead.
     """
     if not buckets:
         return SilenceState(channel, ChannelState.NEVER_SENT)
     pause = normal_pause(buckets, gap_quantile)
     if pause is None:
         return SilenceState(channel, ChannelState.ALIVE)
+    gaps = len(buckets) - 1
+    new = buckets[0] - start > gap_factor * pause
+    thin = _rank(gap_quantile, gaps) == gaps
+    if new and thin:
+        return SilenceState(channel, ChannelState.UNPROVEN, pause=pause)
     if frontier - buckets[-1] > gap_factor * pause:
         return SilenceState(channel, ChannelState.SILENT, silent_since=buckets[-1], pause=pause)
     return SilenceState(channel, ChannelState.ALIVE, pause=pause)
@@ -414,6 +447,93 @@ def _candidates(
     ]
 
 
+def _log_unproven(
+    states: Mapping[str, SilenceState], series: Mapping[str, list[datetime]]
+) -> None:
+    """The newcomers held back this run, with what each is waiting to show."""
+    unproven = [state for state in states.values() if state.state is ChannelState.UNPROVEN]
+    if unproven:
+        log.info(
+            "channels_unproven",
+            count=len(unproven),
+            channels=[
+                {
+                    "ga": state.channel.ga,
+                    "gaps": len(series.get(state.channel.ga, [])) - 1,
+                    "pause_hours": state.pause / BUCKET if state.pause is not None else None,
+                }
+                for state in unproven
+            ],
+        )
+
+
+def gap_walk(
+    *,
+    channels: Sequence[Channel],
+    kept: Sequence[Channel],
+    candidates: Sequence[Channel],
+    series: Mapping[str, list[datetime]],
+    stats_by_ga: Mapping[str, ChannelStats],
+    window: Window,
+    gap_factor: float,
+    gap_quantile: float,
+) -> Measured[SilenceState]:
+    """The measurement's pure half: the candidates classified off their
+    fetched series and walked for observations, and the whole scope sorted
+    into measured and not.
+    """
+    states: dict[str, SilenceState] = {}
+    observations: list[Observation] = []
+    for channel in candidates:
+        buckets = series.get(channel.ga, [])
+        state = classify(
+            channel,
+            buckets,
+            start=window.start,
+            frontier=window.frontier,
+            gap_factor=gap_factor,
+            gap_quantile=gap_quantile,
+        )
+        states[channel.ga] = state
+        if state.pause is not None and state.state is not ChannelState.UNPROVEN:
+            observations.extend(
+                silence_observations(
+                    channel.ga, buckets, state.pause, gap_factor, window.frontier
+                )
+            )
+
+    # A silence measurement ends at the frontier by construction: the gap
+    # walk runs right up to it for every proven channel with a pause. One
+    # that sent too little, or is still unproven, was not measured at all,
+    # which is not the same as recovered.
+    unproven = frozenset(
+        ga for ga, state in states.items() if state.state is ChannelState.UNPROVEN
+    )
+    measured_through = {
+        ga: window.frontier
+        for ga, stats in stats_by_ga.items()
+        if stats.buckets >= MIN_PAUSE_BUCKETS and ga not in unproven
+    }
+    dataless = frozenset(
+        channel.ga
+        for channel in channels
+        if not window.reaches(measured_through.get(channel.ga))
+    )
+
+    return Measured(
+        states=states,
+        observations=tuple(observations),
+        dataless=dataless,
+        record={
+            "channels": len(kept),
+            "candidates": len(candidates),
+            "unproven": len(unproven),
+            "silent": sum(1 for s in states.values() if s.state is ChannelState.SILENT),
+        },
+        labels={c.ga: c.name for c in channels},
+    )
+
+
 def measure(
     conn: psycopg.Connection[DictRow],
     fault: Fault,
@@ -434,52 +554,18 @@ def measure(
     _log_drops(drops)
     candidates = _candidates(kept, stats_by_ga, open_rows, gap_factor, window.frontier)
     series = bucket_series(conn, [c.ga for c in candidates], window.start)
-
-    states: dict[str, SilenceState] = {}
-    observations: list[Observation] = []
-    for channel in candidates:
-        buckets = series.get(channel.ga, [])
-        state = classify(
-            channel,
-            buckets,
-            frontier=window.frontier,
-            gap_factor=gap_factor,
-            gap_quantile=gap_quantile,
-        )
-        states[channel.ga] = state
-        if state.pause is not None:
-            observations.extend(
-                silence_observations(
-                    channel.ga, buckets, state.pause, gap_factor, window.frontier
-                )
-            )
-
-    # A silence measurement ends at the frontier by construction: the gap
-    # walk runs right up to it for every channel whose own pause could be
-    # estimated. A channel that sent too little to show one was not measured
-    # at all, which is not the same as recovered.
-    measured_through = {
-        ga: window.frontier
-        for ga, stats in stats_by_ga.items()
-        if stats.buckets >= MIN_PAUSE_BUCKETS
-    }
-    dataless = frozenset(
-        channel.ga
-        for channel in channels
-        if not window.reaches(measured_through.get(channel.ga))
+    measured = gap_walk(
+        channels=channels,
+        kept=kept,
+        candidates=candidates,
+        series=series,
+        stats_by_ga=stats_by_ga,
+        window=window,
+        gap_factor=gap_factor,
+        gap_quantile=gap_quantile,
     )
-
-    return Measured(
-        states=states,
-        observations=tuple(observations),
-        dataless=dataless,
-        record={
-            "channels": len(kept),
-            "candidates": len(candidates),
-            "silent": sum(1 for s in states.values() if s.state is ChannelState.SILENT),
-        },
-        labels={c.ga: c.name for c in channels},
-    )
+    _log_unproven(measured.states, series)
+    return measured
 
 
 @dataclass(frozen=True, slots=True)
