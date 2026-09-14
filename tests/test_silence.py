@@ -14,14 +14,17 @@ quantile over nine gaps says nothing about one over seven hundred.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import EpisodePolicy
-from iot_insights_engine.reconcile import Measured, Window
+from iot_insights_engine.groups import GroupPublish
+from iot_insights_engine.reconcile import Measured, Plan, Window
 from iot_insights_engine.silence import (
     BUCKET,
     Channel,
+    ChannelReport,
     ChannelState,
     ChannelStats,
     SilenceState,
@@ -415,28 +418,52 @@ def test_hourly_newcomer_is_proven_after_a_day() -> None:
 # ---------------------------------------------------------------- gap_walk
 
 
+# The fingerprint this run measures by, and the one the median estimator
+# ran on before the quantile replaced it.
+_FINGERPRINT = "silence(gap_factor=5.0, gap_quantile=0.95)"
+_OLD_FINGERPRINT = "silence(gap_factor=5.0, gap_quantile=0.5)"
+# A second channel in the same scope and main group, never heard from.
+_STAIRS = Channel(ga="9/1/9", name="Bewegungsmelder.KG.Treppe.KNX.Decke.Präsenz", dpt="1.001")
+
+
 def _walk(
-    buckets: list[datetime], frontier: datetime
+    buckets: list[datetime],
+    frontier: datetime,
+    *,
+    open_rows: Sequence[OpenEpisodeRow] = (),
+    series: Mapping[str, list[datetime]] | None = None,
 ) -> tuple[Measured[SilenceState], Window]:
-    stats = ChannelStats(
-        ga=_HALLWAY.ga,
-        buckets=len(buckets),
-        last_bucket=buckets[-1],
-        floor_value=0.0,
-        ceil_value=1.0,
-    )
+    """The hallway detector with the given series — and the stairs detector
+    in scope beside it, without a single bucket."""
+    series = {_HALLWAY.ga: buckets} if series is None else dict(series)
+    stats_by_ga = {
+        ga: ChannelStats(
+            ga=ga, buckets=len(b), last_bucket=b[-1], floor_value=0.0, ceil_value=1.0
+        )
+        for ga, b in series.items()
+        if b
+    }
+    kept = [c for c in (_HALLWAY, _STAIRS) if c.ga in stats_by_ga]
     window = Window(start=_at(0), frontier=frontier, policy=EpisodePolicy())
     measured = gap_walk(
-        channels=[_HALLWAY],
-        kept=[_HALLWAY],
-        candidates=[_HALLWAY],
-        series={_HALLWAY.ga: buckets},
-        stats_by_ga={_HALLWAY.ga: stats},
+        channels=[_HALLWAY, _STAIRS],
+        kept=kept,
+        candidates=kept,
+        series=series,
+        stats_by_ga=stats_by_ga,
+        open_rows=open_rows,
         window=window,
         gap_factor=5.0,
         gap_quantile=0.95,
+        fingerprint=_FINGERPRINT,
     )
     return measured, window
+
+
+def _plan(
+    measured: Measured[SilenceState], window: Window, *rows: OpenEpisodeRow
+) -> Plan[GroupPublish[ChannelReport]]:
+    return plan_run(episodes=(), open_rows=list(rows), measured=measured, frontier=window.frontier)
 
 
 def test_unproven_channel_is_unmeasured_and_yields_no_observations() -> None:
@@ -447,13 +474,97 @@ def test_unproven_channel_is_unmeasured_and_yields_no_observations() -> None:
     assert measured.record["unproven"] == 1
 
 
-def test_open_episode_on_an_unproven_subject_is_held_not_closed() -> None:
-    measured, window = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26))
-    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=1)
-    plan = plan_run(episodes=(), open_rows=[row], measured=measured, frontier=window.frontier)
+def test_open_episode_this_rule_made_on_an_unproven_subject_is_held_not_closed() -> None:
+    # A device that died with a real history slides into `new ∧ thin` once
+    # enough of its buckets have left the window: the accusation was this
+    # rule's own, and stands until data says otherwise.
+    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=1, fingerprint=_FINGERPRINT)
+    measured, window = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26), open_rows=[row])
+    assert measured.stranded == frozenset()
+    plan = _plan(measured, window, row)
     assert plan.stale_opens == (_HALLWAY.ga,)
     assert plan.orphan_closes == ()
     assert plan.publishes == ()
+
+
+def test_open_episode_another_rule_left_on_an_unproven_subject_is_closed() -> None:
+    # The median estimator accused a hand-driven socket the quantile never
+    # would: a stranded accusation, closed at the frontier — and the group
+    # it pinned is published clear, because the row was the group's last.
+    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=2, fingerprint=_OLD_FINGERPRINT)
+    measured, window = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26), open_rows=[row])
+    # Still dataless — the channel is unmeasured either way; stranded is
+    # what the row is, not what the channel is.
+    assert _HALLWAY.ga in measured.dataless
+    assert measured.stranded == frozenset({_HALLWAY.ga})
+    plan = _plan(measured, window, row)
+    assert plan.orphan_closes == ((7, window.frontier),)
+    assert plan.stale_opens == ()
+    assert plan.publishes == (GroupPublish(main_group=9, severity=0, channels=()),)
+
+
+def test_open_episode_without_a_fingerprint_on_an_unproven_subject_is_held() -> None:
+    # A row older than the stamp: nobody can say which rule made it, so it
+    # is held like any other — the bench mark for a hand backfill, never a
+    # close by default.
+    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=1)
+    measured, window = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26), open_rows=[row])
+    assert measured.stranded == frozenset()
+    plan = _plan(measured, window, row)
+    assert plan.stale_opens == (_HALLWAY.ga,)
+    assert plan.orphan_closes == ()
+
+
+def test_never_sent_channel_holds_its_row_whatever_rule_left_it() -> None:
+    # The window slid past every bucket of a dead device: there is no data
+    # to decide a recovery with, and the rule that opened the row is beside
+    # the point.
+    row = OpenEpisodeRow(id=8, subject=_STAIRS.ga, severity=2, fingerprint=_OLD_FINGERPRINT)
+    measured, window = _walk(_hourly_until(10), frontier=_at(18), open_rows=[row])
+    assert _STAIRS.ga in measured.dataless
+    assert measured.stranded == frozenset()
+    plan = _plan(measured, window, row)
+    assert plan.stale_opens == (_STAIRS.ga,)
+    assert plan.orphan_closes == ()
+
+
+def test_single_bucket_channel_holds_its_row_whatever_rule_left_it() -> None:
+    # One bucket left in the window: no pause to read a gap off, so the
+    # channel was not measured, and its row is held like a never-sent one.
+    row = OpenEpisodeRow(id=8, subject=_STAIRS.ga, severity=2, fingerprint=_OLD_FINGERPRINT)
+    measured, window = _walk(
+        _hourly_until(10),
+        frontier=_at(18),
+        open_rows=[row],
+        series={_HALLWAY.ga: _hourly_until(10), _STAIRS.ga: [_at(2)]},
+    )
+    assert _STAIRS.ga in measured.dataless
+    assert measured.stranded == frozenset()
+    plan = _plan(measured, window, row)
+    assert plan.stale_opens == (_STAIRS.ga,)
+
+
+def test_run_record_splits_the_stale_opens_by_channel_state_and_names_the_stranded() -> None:
+    # What the log shows instead of the bus: which rows this run holds, and
+    # why, and which it lets go as another rule's leftovers.
+    hallway = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=2, fingerprint=_OLD_FINGERPRINT)
+    stairs = OpenEpisodeRow(id=8, subject=_STAIRS.ga, severity=2, fingerprint=_OLD_FINGERPRINT)
+    measured, _ = _walk(
+        _newcomer(), frontier=_at(_LAST_DAY + 26), open_rows=[hallway, stairs]
+    )
+    assert measured.record["stale_opens_by_state"] == {
+        "unproven": [],
+        "never_sent": [_STAIRS.ga],
+        "single_bucket": [],
+    }
+    assert measured.record["stranded"] == [_HALLWAY.ga]
+
+
+def test_run_record_lists_a_held_unproven_row_under_unproven() -> None:
+    row = OpenEpisodeRow(id=7, subject=_HALLWAY.ga, severity=1, fingerprint=_FINGERPRINT)
+    measured, _ = _walk(_newcomer(), frontier=_at(_LAST_DAY + 26), open_rows=[row])
+    assert measured.record["stale_opens_by_state"]["unproven"] == [_HALLWAY.ga]
+    assert measured.record["stranded"] == []
 
 
 def test_proven_channel_walks_its_gaps_as_before() -> None:

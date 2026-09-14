@@ -70,6 +70,21 @@ class TestAfter:
         assert result.stale_opens == ("2/2/227",)
         assert result.moved == ()
 
+    def test_a_stranded_row_closes_though_its_subject_is_dataless(self) -> None:
+        # Dataless keeps a row open for want of data; stranded says the
+        # accusation was never this rule's, so there is nothing to keep.
+        result = reconcile(
+            episodes=[],
+            open_rows=[OpenEpisodeRow(id=7, subject="2/2/227", severity=2)],
+            dataless=frozenset({"2/2/227"}),
+            frontier=_FRONTIER,
+            stranded=frozenset({"2/2/227"}),
+        )
+        assert result.orphan_closes == ((7, _FRONTIER),)
+        assert result.stale_opens == ()
+        assert dict(result.after) == {}
+        assert result.moved == (("2/2/227", 0),)
+
     def test_an_escalation_moves_to_the_new_severity(self) -> None:
         result = reconcile(
             episodes=[_episode("2/2/227", 2)],

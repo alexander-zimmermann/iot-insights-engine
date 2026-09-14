@@ -246,6 +246,24 @@ class Fault:
     rooms: tuple[RoomRule, ...] = ()
     expectation: DeviationExpectation | None = None
 
+    @property
+    def fingerprint(self) -> str:
+        """The rule this fault declares, fingerprinted: its kind — with the
+        signal or expectation that picks the kind's shape — and its
+        `parameters` block, read as numbers (`5` and `5.0` declare the same
+        rule). Per-subject declarations — device limits, references, rooms
+        — are not part of it: they name who is measured, not how. Every
+        episode carries the fingerprint of the rule that last made it, so a
+        run can tell its own rows from an earlier rule's leftovers.
+        """
+        shape = "/".join(
+            str(part) for part in (self.kind, self.signal, self.expectation) if part is not None
+        )
+        parameters = ", ".join(
+            f"{name}={float(value)!r}" for name, value in sorted(self.parameters.items())
+        )
+        return f"{shape}({parameters})"
+
     def channel_scope(self) -> Scope:
         """The catalog query this fault measures over. Every fault that
         measures channels declares one and the loader enforces it, so a

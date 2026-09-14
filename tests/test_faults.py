@@ -569,6 +569,29 @@ def test_fault_objects_are_frozen(tmp_path: Path) -> None:
         silence.unit = "h"  # type: ignore[misc]
 
 
+def test_fingerprint_names_the_kind_and_the_parameters_it_measures_by(tmp_path: Path) -> None:
+    # The fingerprint is what an episode carries: how the fault measured
+    # when it made the row. The signal picks the kind's shape, so it is in.
+    faults = FaultList.load(_write(tmp_path, _VALID))
+    assert faults.get("channel_silence").fingerprint == (
+        "silence(gap_factor=5.0, gap_quantile=0.9)"
+    )
+    assert faults.get("appliance_standby").fingerprint == (
+        "drift/standby(budget_ma_h=480.0, min_window_fraction=0.8, rise_ma=40.0, "
+        "window_hours=24.0)"
+    )
+
+
+def test_fingerprint_reads_a_parameter_as_a_number_not_as_its_spelling(tmp_path: Path) -> None:
+    # `5` and `5.0` declare the same rule: a cosmetic edit of the fault file
+    # must not disown every open row.
+    spelled_as_int = FaultList.load(_write(tmp_path, _VALID)).get("channel_silence")
+    spelled_as_float = FaultList.load(
+        _write(tmp_path, _VALID.replace("gap_factor: 5\n", "gap_factor: 5.0\n"))
+    ).get("channel_silence")
+    assert spelled_as_int.fingerprint == spelled_as_float.fingerprint
+
+
 def test_target_union_holds_for_python_construction() -> None:
     # The schema's oneOf, mirrored for Python-side construction
     with pytest.raises(ValueError, match="exactly one"):
@@ -1221,6 +1244,11 @@ def test_external_fault_loads_without_target_and_parameters(tmp_path: Path) -> N
     assert fault.parameters == {}
     assert fault.target is None
     assert fault.scope.name_like == ("%.Gastherme.System-Druck-Anomalie",)
+
+
+def test_fingerprint_of_an_external_fault_is_its_kind_alone(tmp_path: Path) -> None:
+    [fault] = FaultList.load(_write(tmp_path, _EXTERNAL))
+    assert fault.fingerprint == "external()"
 
 
 def test_external_fault_rejects_a_target(tmp_path: Path) -> None:

@@ -3,8 +3,8 @@ episodes tables.
 
 Everything here is idempotent — evidence and events land with ON CONFLICT
 DO NOTHING on their natural keys, and the row updates only ever raise
-severity and peak, so a rerun after a half-applied failure converges
-instead of duplicating.
+severity and peak and re-stamp the fingerprint, so a rerun after a
+half-applied failure converges instead of duplicating.
 """
 
 from __future__ import annotations
@@ -24,20 +24,29 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class OpenEpisodeRow:
-    """The open episode the database holds for one fault and subject."""
+    """The open episode the database holds for one fault and subject, with
+    the fingerprint of the rule that last made it — None on a row older
+    than the stamp, which nobody can attribute to a rule.
+    """
 
     id: int
     subject: str
     severity: int
+    fingerprint: str | None = None
 
 
 def open_rows(conn: psycopg.Connection[DictRow], fault_name: str) -> list[OpenEpisodeRow]:
     rows = conn.execute(
-        "SELECT id, subject, severity FROM episodes"
+        "SELECT id, subject, severity, fingerprint FROM episodes"
         " WHERE fault = %(fault)s AND ended_at IS NULL",
         {"fault": fault_name},
     ).fetchall()
-    return [OpenEpisodeRow(id=r["id"], subject=r["subject"], severity=r["severity"]) for r in rows]
+    return [
+        OpenEpisodeRow(
+            id=r["id"], subject=r["subject"], severity=r["severity"], fingerprint=r["fingerprint"]
+        )
+        for r in rows
+    ]
 
 
 def processed_through(
@@ -79,20 +88,24 @@ def apply(
     updates: Sequence[tuple[int, Episode]],
     orphan_closes: Sequence[tuple[int, datetime]],
     *,
+    fingerprint: str,
     externally_delivered: bool = False,
 ) -> None:
-    """`externally_delivered` marks episodes whose fault Basalte already
-    delivered itself — the engine only records them, and nothing downstream
-    may notify a second time.
+    """`fingerprint` names the rule this run measured by, stamped on every
+    row it makes or re-makes — never on a row it merely closes — so a later
+    rule can tell its own rows from this one's. `externally_delivered`
+    marks episodes whose fault Basalte already delivered itself — the
+    engine only records them, and nothing downstream may notify a second
+    time.
     """
     for episode in inserts:
         inserted = conn.execute(
             """
             INSERT INTO episodes (fault, subject, started_at, last_seen_at,
-                                  ended_at, severity, peak_score,
+                                  ended_at, severity, peak_score, fingerprint,
                                   externally_delivered)
             VALUES (%(fault)s, %(subject)s, %(started_at)s, %(last_seen_at)s,
-                    %(ended_at)s, %(severity)s, %(peak_score)s,
+                    %(ended_at)s, %(severity)s, %(peak_score)s, %(fingerprint)s,
                     %(externally_delivered)s)
             RETURNING id
             """,
@@ -104,6 +117,7 @@ def apply(
                 "ended_at": episode.ended_at,
                 "severity": episode.severity,
                 "peak_score": episode.peak_score,
+                "fingerprint": fingerprint,
                 "externally_delivered": externally_delivered,
             },
         ).fetchone()
@@ -117,7 +131,8 @@ def apply(
             SET last_seen_at = GREATEST(last_seen_at, %(last_seen_at)s),
                 severity = GREATEST(severity, %(severity)s),
                 peak_score = GREATEST(peak_score, %(peak_score)s),
-                ended_at = %(ended_at)s
+                ended_at = %(ended_at)s,
+                fingerprint = %(fingerprint)s
             WHERE id = %(id)s
             """,
             {
@@ -126,6 +141,7 @@ def apply(
                 "severity": episode.severity,
                 "peak_score": episode.peak_score,
                 "ended_at": episode.ended_at,
+                "fingerprint": fingerprint,
             },
         )
         _write_details(conn, episode_id, episode)

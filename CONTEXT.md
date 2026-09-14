@@ -18,6 +18,16 @@ A **dormant** fault loads fully but is excluded from the schedule: it
 declares why it cannot run yet and the observable condition under which it
 starts to.
 
+## Fingerprint
+
+The rule a fault measures by — its kind, with the signal or expectation
+that picks the kind's shape, and its parameters, read as numbers —
+condensed to one string. Every episode carries the fingerprint of the rule
+that last made it, so a run can tell its own rows from an earlier rule's
+leftovers. A row older than the stamp carries none and is held like any
+other. Per-subject declarations (device limits, references, rooms) are not
+part of it: they name who is measured, not how.
+
 ## Kind
 
 How a fault is measured. Every fault has exactly one:
@@ -94,7 +104,12 @@ holds: what to insert, what to update, which orphaned rows to close, and
 which subjects moved to a new severity. A subject is **dataless** when
 this run cannot tell a recovery from a blind spot — its measurement does
 not reach the frontier — and its episode then stays open instead of
-self-clearing.
+self-clearing. A row is **stranded** when a rule other than this run's
+left it on a subject this run declines to judge — for silence, an
+unproven channel: nothing the current rule does would open it, so it
+closes at the frontier though its subject is dataless, and its group is
+published anew — clear, if the row was the group's last. The same row
+under the current rule is a silence sliding out of view and stays open.
 
 ## Frontier
 

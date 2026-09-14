@@ -28,7 +28,10 @@ has shown as many gaps as the declared quantile needs (see `classify`):
 a motion detector the coupler let through in the afternoon has only ever
 shown one-hour gaps by midnight, and would read the first night of its
 life as five pauses of silence. Unproven is unmeasured, not alive: no
-observations, open episodes held.
+observations, open episodes held — those this rule made. A row an earlier
+rule left on a channel this one declines to judge is a *stranded*
+accusation and closes (see `gap_walk`); every episode carries the
+fingerprint of the rule that last made it for exactly this question.
 
 Measured per channel, delivered per main group: one severity per group on
 its Zentral diagnosis address, and the payload names the exact channels.
@@ -474,13 +477,17 @@ def gap_walk(
     candidates: Sequence[Channel],
     series: Mapping[str, list[datetime]],
     stats_by_ga: Mapping[str, ChannelStats],
+    open_rows: Sequence[OpenEpisodeRow],
     window: Window,
     gap_factor: float,
     gap_quantile: float,
+    fingerprint: str,
 ) -> Measured[SilenceState]:
     """The measurement's pure half: the candidates classified off their
-    fetched series and walked for observations, and the whole scope sorted
-    into measured and not.
+    fetched series and walked for observations, the whole scope sorted into
+    measured and not, and the open rows on unproven channels sorted into
+    this rule's own and another's — by `fingerprint`, the one this run
+    measures by, against the one each row carries.
     """
     states: dict[str, SilenceState] = {}
     observations: list[Observation] = []
@@ -520,6 +527,29 @@ def gap_walk(
         if not window.reaches(measured_through.get(channel.ga))
     )
 
+    # Unproven holds an open row only where this rule made it: a device that
+    # died with a real history slides into `new ∧ thin` as its buckets leave
+    # the window, and its silence stands. A row an earlier rule left on a
+    # channel this one declines to judge is a stranded accusation — nothing
+    # here would open it, so nothing here can be recovering from it — and
+    # must not ride `dataless` into being held forever. A row without a
+    # stamp predates the fingerprint and is held: nobody can say who made it.
+    stranded = frozenset(
+        row.subject
+        for row in open_rows
+        if row.subject in unproven
+        and row.fingerprint is not None
+        and row.fingerprint != fingerprint
+    )
+
+    # The reconciliation's `stale_opens`, by construction: a dataless
+    # subject produced no observation, so its open row has no episode to
+    # meet. Split here, where the channel states are at hand.
+    stale_opens = sorted(
+        row.subject
+        for row in open_rows
+        if row.subject in dataless and row.subject not in stranded
+    )
     return Measured(
         states=states,
         observations=tuple(observations),
@@ -529,8 +559,19 @@ def gap_walk(
             "candidates": len(candidates),
             "unproven": len(unproven),
             "silent": sum(1 for s in states.values() if s.state is ChannelState.SILENT),
+            # Why each held row's channel went unmeasured, and which rows
+            # this run lets go as another rule's leftovers.
+            "stale_opens_by_state": {
+                "unproven": [ga for ga in stale_opens if ga in unproven],
+                "never_sent": [ga for ga in stale_opens if ga not in stats_by_ga],
+                "single_bucket": [
+                    ga for ga in stale_opens if ga in stats_by_ga and ga not in unproven
+                ],
+            },
+            "stranded": sorted(stranded),
         },
         labels={c.ga: c.name for c in channels},
+        stranded=stranded,
     )
 
 
@@ -560,9 +601,11 @@ def measure(
         candidates=candidates,
         series=series,
         stats_by_ga=stats_by_ga,
+        open_rows=open_rows,
         window=window,
         gap_factor=gap_factor,
         gap_quantile=gap_quantile,
+        fingerprint=fault.fingerprint,
     )
     _log_unproven(measured.states, series)
     return measured

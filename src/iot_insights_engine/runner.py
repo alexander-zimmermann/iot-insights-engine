@@ -84,9 +84,12 @@ class Store(Protocol):
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
         *,
+        fingerprint: str,
         externally_delivered: bool,
     ) -> None:
-        """One plan's row changes, in one transaction."""
+        """One plan's row changes, in one transaction; the rows it makes or
+        re-makes stamped with the fingerprint of the rule the run measured
+        by."""
         ...
 
 
@@ -131,6 +134,7 @@ class DbStore:
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
         *,
+        fingerprint: str,
         externally_delivered: bool,
     ) -> None:
         with write_connection(self.settings) as conn, conn.transaction():
@@ -140,6 +144,7 @@ class DbStore:
                 inserts,
                 updates,
                 orphan_closes,
+                fingerprint=fingerprint,
                 externally_delivered=externally_delivered,
             )
 
@@ -309,6 +314,7 @@ def run_subjects[S, P: SubjectPublish](
     log.info(
         kind.event,
         fault=fault.name,
+        fingerprint=fault.fingerprint,
         frontier=frontier.isoformat(),
         **measured.record,
         episodes=len(episodes),
@@ -334,6 +340,7 @@ def run_subjects[S, P: SubjectPublish](
         plan.inserts,
         plan.updates,
         plan.orphan_closes,
+        fingerprint=fault.fingerprint,
         externally_delivered=kind.externally_delivered,
     )
 
@@ -362,6 +369,7 @@ def _plan_for[S, P: SubjectPublish](
         episodes=episodes,
         open_rows=open_rows,
         dataless=measured.dataless,
+        stranded=measured.stranded,
         frontier=frontier,
         publish_for=payload,
     )
