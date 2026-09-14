@@ -22,11 +22,13 @@ starts to.
 
 The rule a fault measures by — its kind, with the signal or expectation
 that picks the kind's shape, and its parameters, read as numbers —
-condensed to one string. Every episode carries the fingerprint of the rule
-that last made it, so a run can tell its own rows from an earlier rule's
-leftovers. A row older than the stamp carries none and is held like any
-other. Per-subject declarations (device limits, references, rooms) are not
-part of it: they name who is measured, not how.
+condensed to one string. A kind whose code decides what it accuses folds
+a **revision** in, bumped when that code changes without a parameter
+moving (silence's unproven guard did). Every episode carries the
+fingerprint of the rule that last made it, so a run can tell its own rows
+from an earlier rule's leftovers. A row older than the stamp carries none
+and is held like any other. Per-subject declarations (device limits,
+references, rooms) are not part of it: they name who is measured, not how.
 
 ## Kind
 

@@ -19,10 +19,12 @@ from datetime import UTC, datetime, timedelta
 
 from iot_insights_engine.episode_store import OpenEpisodeRow
 from iot_insights_engine.episodes import EpisodePolicy
+from iot_insights_engine.faults import Fault, MeasurementKind, Target
 from iot_insights_engine.groups import GroupPublish
 from iot_insights_engine.reconcile import Measured, Plan, Window
 from iot_insights_engine.silence import (
     BUCKET,
+    RULE_REVISION,
     Channel,
     ChannelReport,
     ChannelState,
@@ -30,6 +32,7 @@ from iot_insights_engine.silence import (
     SilenceState,
     classify,
     drop_unmeasurable,
+    fingerprint,
     gap_walk,
     normal_pause,
     plan_run,
@@ -558,6 +561,21 @@ def test_run_record_splits_the_stale_opens_by_channel_state_and_names_the_strand
         "single_bucket": [],
     }
     assert measured.record["stranded"] == [_HALLWAY.ga]
+
+
+def test_the_kinds_fingerprint_folds_the_code_revision_in() -> None:
+    # The unproven guard changed which channels the rule accuses without a
+    # line of the fault file moving; the stamp has to move with the code.
+    fault = Fault(
+        name="channel_silence",
+        sentence="ein Kanal schweigt",
+        unit="× der üblichen Sendepause",
+        kind=MeasurementKind.SILENCE,
+        parameters={"gap_factor": 5, "gap_quantile": 0.95},
+        target=Target(per_main_group=True),
+    )
+    assert fingerprint(fault) == f"{fault.fingerprint}@{RULE_REVISION}"
+    assert fingerprint(fault).startswith("silence(gap_factor=5.0, gap_quantile=0.95)@")
 
 
 def test_run_record_lists_a_held_unproven_row_under_unproven() -> None:

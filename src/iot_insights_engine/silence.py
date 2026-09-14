@@ -94,6 +94,11 @@ DEAD_MIN_BUCKETS = 24
 # fewer has no pause, and nothing measured it.
 MIN_PAUSE_BUCKETS = 2
 
+# Bumped when the code changes which channels it accuses without a
+# parameter moving — as the unproven guard did. The stamp on a row has to
+# move with the rule that made it, and the rule is code as much as file.
+RULE_REVISION = 1
+
 
 class ChannelState(StrEnum):
     ALIVE = "alive"
@@ -242,6 +247,13 @@ def silence_observations(
                 )
             t += BUCKET
     return observations
+
+
+def fingerprint(fault: Fault) -> str:
+    """This kind's stamp: the declared rule with the code revision folded
+    in, so a classifier change reads as a rule change to the rows it left
+    behind."""
+    return f"{fault.fingerprint}@{RULE_REVISION}"
 
 
 def frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
@@ -605,7 +617,7 @@ def measure(
         window=window,
         gap_factor=gap_factor,
         gap_quantile=gap_quantile,
-        fingerprint=fault.fingerprint,
+        fingerprint=fingerprint(fault),
     )
     _log_unproven(measured.states, series)
     return measured

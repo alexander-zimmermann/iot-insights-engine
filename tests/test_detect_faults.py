@@ -633,6 +633,21 @@ def test_a_deviation_without_an_expectation_stays_the_room_shape() -> None:
     assert kind.policy.bucket == timedelta(hours=1)
 
 
+def test_the_silence_kind_stamps_with_its_own_fingerprint() -> None:
+    kind = _kind_for(
+        Fault(
+            name="channel_silence",
+            sentence="ein Kanal schweigt",
+            unit="× der üblichen Sendepause",
+            kind=MeasurementKind.SILENCE,
+            parameters={"gap_factor": 5, "gap_quantile": 0.95},
+            target=Target(per_main_group=True),
+        )
+    )
+    assert kind is not None
+    assert kind.fingerprint is silence.fingerprint
+
+
 def test_a_constancy_fault_runs_the_per_main_group_shape() -> None:
     kind = _kind_for(
         Fault(

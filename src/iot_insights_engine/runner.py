@@ -169,6 +169,13 @@ class NatsPublisher:
         )
 
 
+def declared_fingerprint(fault: Fault) -> str:
+    """The default stamp: the rule as the fault file declares it. A kind
+    whose code decides what it accuses declares its own, with a revision
+    folded in."""
+    return fault.fingerprint
+
+
 class FoldHook[S](Protocol):
     """A kind's own fold: the measurement to episodes, where the default
     observation pipeline does not fit (external folds severity writes,
@@ -225,7 +232,9 @@ class Kind[S, P: SubjectPublish]:
     `warn_dataless` is off for the one kind whose dataless set is routinely
     huge and already accounted for; and `externally_delivered` marks
     episodes someone else already notified about, so nothing downstream
-    notifies a second time.
+    notifies a second time. `fingerprint` is what the rows get stamped
+    with — the declared rule, unless the kind's code is part of the rule
+    and says so.
     """
 
     event: str
@@ -242,6 +251,7 @@ class Kind[S, P: SubjectPublish]:
     warn_dataless: bool = True
     externally_delivered: bool = False
     policy: EpisodePolicy = EpisodePolicy()
+    fingerprint: Callable[[Fault], str] = declared_fingerprint
 
 
 def publish_subjects[P: SubjectPublish](
@@ -310,11 +320,12 @@ def run_subjects[S, P: SubjectPublish](
         )
 
     plan = _plan_for(kind, episodes, open_rows, measured, frontier)
+    fingerprint = kind.fingerprint(fault)
 
     log.info(
         kind.event,
         fault=fault.name,
-        fingerprint=fault.fingerprint,
+        fingerprint=fingerprint,
         frontier=frontier.isoformat(),
         **measured.record,
         episodes=len(episodes),
@@ -340,7 +351,7 @@ def run_subjects[S, P: SubjectPublish](
         plan.inserts,
         plan.updates,
         plan.orphan_closes,
-        fingerprint=fault.fingerprint,
+        fingerprint=fingerprint,
         externally_delivered=kind.externally_delivered,
     )
 
