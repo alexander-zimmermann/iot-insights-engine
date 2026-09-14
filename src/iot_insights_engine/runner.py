@@ -84,9 +84,12 @@ class Store(Protocol):
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
         *,
+        fingerprint: str,
         externally_delivered: bool,
     ) -> None:
-        """One plan's row changes, in one transaction."""
+        """One plan's row changes, in one transaction; the rows it makes or
+        re-makes stamped with the fingerprint of the rule the run measured
+        by."""
         ...
 
 
@@ -131,6 +134,7 @@ class DbStore:
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
         *,
+        fingerprint: str,
         externally_delivered: bool,
     ) -> None:
         with write_connection(self.settings) as conn, conn.transaction():
@@ -140,6 +144,7 @@ class DbStore:
                 inserts,
                 updates,
                 orphan_closes,
+                fingerprint=fingerprint,
                 externally_delivered=externally_delivered,
             )
 
@@ -162,6 +167,13 @@ class NatsPublisher:
         nats_publisher.publish_anomaly(
             self.settings, fault_name, severity, payload, entity=entity, firing=firing
         )
+
+
+def declared_fingerprint(fault: Fault) -> str:
+    """The default stamp: the rule as the fault file declares it. A kind
+    whose code decides what it accuses declares its own, with a revision
+    folded in."""
+    return fault.fingerprint
 
 
 class FoldHook[S](Protocol):
@@ -220,7 +232,9 @@ class Kind[S, P: SubjectPublish]:
     `warn_dataless` is off for the one kind whose dataless set is routinely
     huge and already accounted for; and `externally_delivered` marks
     episodes someone else already notified about, so nothing downstream
-    notifies a second time.
+    notifies a second time. `fingerprint` is what the rows get stamped
+    with — the declared rule, unless the kind's code is part of the rule
+    and says so.
     """
 
     event: str
@@ -237,6 +251,7 @@ class Kind[S, P: SubjectPublish]:
     warn_dataless: bool = True
     externally_delivered: bool = False
     policy: EpisodePolicy = EpisodePolicy()
+    fingerprint: Callable[[Fault], str] = declared_fingerprint
 
 
 def publish_subjects[P: SubjectPublish](
@@ -305,10 +320,12 @@ def run_subjects[S, P: SubjectPublish](
         )
 
     plan = _plan_for(kind, episodes, open_rows, measured, frontier)
+    fingerprint = kind.fingerprint(fault)
 
     log.info(
         kind.event,
         fault=fault.name,
+        fingerprint=fingerprint,
         frontier=frontier.isoformat(),
         **measured.record,
         episodes=len(episodes),
@@ -334,6 +351,7 @@ def run_subjects[S, P: SubjectPublish](
         plan.inserts,
         plan.updates,
         plan.orphan_closes,
+        fingerprint=fingerprint,
         externally_delivered=kind.externally_delivered,
     )
 
@@ -362,6 +380,7 @@ def _plan_for[S, P: SubjectPublish](
         episodes=episodes,
         open_rows=open_rows,
         dataless=measured.dataless,
+        stranded=measured.stranded,
         frontier=frontier,
         publish_for=payload,
     )

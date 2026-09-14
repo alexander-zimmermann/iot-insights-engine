@@ -16,13 +16,21 @@ the guarantees are the interesting part rather than the bookkeeping:
 * a stored severity is never lowered — the recompute window may have slid
   past the peak;
 * an open row whose subject produced no episode closes at the frontier,
-  unless the subject is `dataless`.
+  unless the subject is `dataless` — and closes even then if the row is
+  `stranded`.
 
 `dataless` means one thing in every kind, and `measurement_reaches` is
 where it is said: a subject is dataless when this run cannot tell a
 recovery from a blind spot, because its measurement does not reach the
 frontier. With no data to decide a recovery, its episode stays open
 instead of self-clearing.
+
+`stranded` is the one thing that overrides it, and it is about the row,
+not the subject: a rule other than this run's left the row on a subject
+this run declines to judge. Nothing this run does would open it, so
+nothing is being recovered from, and the row closes rather than being
+held for data that could never vindicate it. Which rows those are is the
+kind's to say — silence reads it off the fingerprint every row carries.
 
 What leaves a reconciliation is `after` — the severity every subject with
 an open episode carries now, the ones held open for want of data included
@@ -109,8 +117,9 @@ _NO_LABELS: Mapping[str, str] = MappingProxyType({})
 class Measured[S]:
     """What a kind's measurement saw over its whole scope: the state per
     subject its payload is shaped from, the observations they produced, the
-    subjects whose measurement did not reach the frontier, what a human
-    calls each subject, and the fields its run record names.
+    subjects whose measurement did not reach the frontier, the fields its
+    run record names, what a human calls each subject — and the open rows
+    it disowns as another rule's, by subject, where the kind can tell.
     """
 
     states: Mapping[str, S]
@@ -118,6 +127,7 @@ class Measured[S]:
     dataless: frozenset[str]
     record: Mapping[str, Any]
     labels: Mapping[str, str] = _NO_LABELS
+    stranded: frozenset[str] = frozenset()
 
 
 class SubjectPublish(Protocol):
@@ -170,12 +180,17 @@ def subject_plan[P](
     dataless: frozenset[str],
     frontier: datetime,
     publish_for: Callable[[str, int], P],
+    stranded: frozenset[str] = frozenset(),
 ) -> Plan[P]:
     """Reconcile, then deliver per subject: a publish goes out when a
     subject's severity moved, including the 0 when its episode ends.
     """
     result = reconcile(
-        episodes=episodes, open_rows=open_rows, dataless=dataless, frontier=frontier
+        episodes=episodes,
+        open_rows=open_rows,
+        dataless=dataless,
+        frontier=frontier,
+        stranded=stranded,
     )
     return plan_from(
         result, (publish_for(subject, severity) for subject, severity in result.moved)
@@ -188,6 +203,7 @@ def reconcile(
     open_rows: Sequence[OpenEpisodeRow],
     dataless: frozenset[str],
     frontier: datetime,
+    stranded: frozenset[str] = frozenset(),
 ) -> Reconciliation:
     """Pure reconciliation — the guarantees are in the module docstring."""
     open_by_subject = {row.subject: row for row in open_rows}
@@ -220,7 +236,7 @@ def reconcile(
     for row in open_rows:
         if row.subject in latest_by_subject:
             continue
-        if row.subject in dataless:
+        if row.subject in dataless and row.subject not in stranded:
             stale_opens.append(row.subject)
             # Still firing as far as anyone can tell — it keeps counting.
             after[row.subject] = row.severity

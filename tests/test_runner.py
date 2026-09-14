@@ -42,6 +42,7 @@ class _Store:
         self.events = events
         self._open_rows = open_rows or []
         self.applied: _Applied | None = None
+        self.fingerprint: str | None = None
         self.externally_delivered = False
 
     @contextmanager
@@ -62,10 +63,12 @@ class _Store:
         updates: Sequence[tuple[int, Episode]],
         orphan_closes: Sequence[tuple[int, datetime]],
         *,
+        fingerprint: str,
         externally_delivered: bool,
     ) -> None:
         self.events.append("apply")
         self.applied = (tuple(inserts), tuple(updates), tuple(orphan_closes))
+        self.fingerprint = fingerprint
         self.externally_delivered = externally_delivered
 
 
@@ -123,6 +126,7 @@ def _kind(
     observations: tuple[Observation, ...] = (),
     seen: dict[str, Any] | None = None,
     policy: EpisodePolicy = _HOURLY,
+    **overrides: Any,
 ) -> Kind[Any, Any]:
     def measure(
         _conn: Any, _fault: Fault, window: Window, open_rows: Sequence[OpenEpisodeRow]
@@ -142,6 +146,7 @@ def _kind(
         publish_for=lambda subject, severity, _state: _Publish(subject, severity),
         payload=lambda p: {"subject": p.subject},
         policy=policy,
+        **overrides,
     )
 
 
@@ -164,6 +169,29 @@ def test_the_publish_goes_out_before_the_write() -> None:
     assert store.applied is not None
     inserts, _, _ = store.applied
     assert [e.subject for e in inserts] == ["2/1/197"]
+
+
+def test_the_rows_are_stamped_with_the_fingerprint_the_run_measured_by() -> None:
+    # What the store writes on every row it makes or re-makes: the fault's
+    # fingerprint, so a later rule can tell its own rows from this one's.
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+
+    run_subjects(store, publisher, _fault(), _kind(observations=_FIRING), dry_run=False)
+
+    assert store.fingerprint == _fault().fingerprint == "duration()"
+
+
+def test_a_kind_declaring_its_own_fingerprint_stamps_with_that() -> None:
+    # A kind whose code decides what it accuses folds its revision in; the
+    # runner stamps whatever the kind declares, never the bare declaration.
+    events: list[str] = []
+    store, publisher = _Store(events), _Publisher(events)
+    kind = _kind(observations=_FIRING, fingerprint=lambda fault: f"{fault.fingerprint}@7")
+
+    run_subjects(store, publisher, _fault(), kind, dry_run=False)
+
+    assert store.fingerprint == "duration()@7"
 
 
 def test_a_clear_is_published_before_its_row_closes() -> None:

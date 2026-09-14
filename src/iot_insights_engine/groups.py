@@ -102,6 +102,7 @@ def group_plan[S, R: GroupChannel](
         open_rows=open_rows,
         dataless=measured.dataless,
         frontier=frontier,
+        stranded=measured.stranded,
     )
     # The fold leaves at most one open episode per subject, and it is the
     # one the reconciliation carried into `after`.

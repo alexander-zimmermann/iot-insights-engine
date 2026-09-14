@@ -115,7 +115,12 @@ is recomputed from the last 30 days on every run, so a redeploy cannot
 corrupt or lose it. Time is the aggregate's frontier — its newest
 bucket, not the wall clock — so a stalled refresh freezes the picture
 instead of clearing every open episode. A subject the run cannot measure
-up to the frontier is dataless and its episode stays open.
+up to the frontier is dataless and its episode stays open. Every episode
+carries the fingerprint of the rule that last made it — the fault's kind
+and parameters — so a rule change does not strand rows on channels it
+declines to judge: an open row an earlier rule left on a channel the
+current rule holds unproven closes, and its group address is published
+anew.
 
 ### Delivery
 

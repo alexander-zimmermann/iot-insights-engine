@@ -105,6 +105,8 @@ _KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
         # whose plan is its own.
         plan=silence.plan_run,
         payload=silence.group_payload,
+        # The unproven guard is code: its revision is part of the stamp.
+        fingerprint=silence.fingerprint,
         # The dataless set is every never-sent symmetry address in the
         # catalog — a thousand of them, normal, and already counted by the
         # measurement's scope_drops record. The ones actually held open are
