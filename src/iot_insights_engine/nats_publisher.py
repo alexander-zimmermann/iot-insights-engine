@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from typing import Any
 
 import nats
@@ -10,42 +9,9 @@ import nats
 from .config import Settings
 from .logging_setup import get_logger
 from .severity import severity_level
+from .slug import entity_slug
 
 log = get_logger(__name__)
-
-_UMLAUTS = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
-
-
-def slugify(value: str) -> str:
-    """Stable, NATS-subject-safe token from an entity name (lowercase, German
-    umlauts transliterated, every run of non-`[a-z0-9]` collapsed to one `-`).
-
-    The `anomaly.<uc>.<entity>` subject is pinned by the knx-nats-bridge
-    writer-rules, so this MUST stay deterministic — `tests/test_nats_publisher`
-    locks the mapping.
-    """
-    value = value.lower()
-    for umlaut, repl in _UMLAUTS.items():
-        value = value.replace(umlaut, repl)
-    return re.sub(r"[^a-z0-9]+", "-", value).strip("-")
-
-
-def entity_slug(group: dict[str, Any]) -> str | None:
-    """Deterministic entity slug for a grouped UC, or None for a 1:1 UC.
-
-    Prefers stable unique identifiers: a KNX GA (`2/2/227` → `2-2-227`),
-    inverter/meter id, else the slugified group values. The slug becomes the
-    last NATS-subject token, so it must not contain dots.
-    """
-    if not group:
-        return None
-    if "ga" in group:
-        return slugify(str(group["ga"]))
-    if "inverter_id" in group:
-        return f"inv{group['inverter_id']}"
-    if "meter_id" in group:
-        return f"meter{group['meter_id']}"
-    return "-".join(slugify(str(v)) for v in group.values())
 
 
 def _connect_opts(settings: Settings) -> dict[str, Any]:
@@ -110,7 +76,7 @@ def publish_anomaly(
     (auto-clear → GA falls back to 0), with `severity=None` as the matching
     name-side value.
     """
-    token = slugify(entity) if entity else None
+    token = entity_slug(entity) if entity else None
     subject = f"anomaly.{uc}.{token}" if token else f"anomaly.{uc}"
     body = {
         "firing": firing,

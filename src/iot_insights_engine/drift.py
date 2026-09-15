@@ -59,10 +59,10 @@ from typing import TYPE_CHECKING, Any
 
 from .episodes import Observation
 from .faults import ExchangerRoles
-from .nats_publisher import slugify
 from .reconcile import Measured, Window, measurement_reaches
 from .runs import split_runs
 from .silence import BUCKET, hourly_averages, like_match, pair_by_match, resolve_scope
+from .slug import entity_slug
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -670,7 +670,7 @@ class Exchanger:
     def slug(self) -> str:
         """Episode subject and NATS entity in one: the writer rules pin
         `anomaly.<fault>.<slug>` to the exchanger's fault address."""
-        return slugify(self.label)
+        return entity_slug(self.label)
 
     @property
     def gas(self) -> tuple[str, str, str]:
