@@ -76,10 +76,10 @@ from . import forecast_solar
 from .episodes import EpisodePolicy, Observation
 from .faults import DeviationExpectation, Roles
 from .logging_setup import get_logger
-from .nats_publisher import slugify
 from .reconcile import Measured, Window
 from .runs import split_runs
 from .silence import BUCKET, DEAD_MIN_BUCKETS, hourly_averages, like_match, resolve_scope
+from .slug import entity_slug
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -155,7 +155,7 @@ def resolve_rooms(
     claimed: dict[str, str] = {}
     slugs: dict[str, str] = {}
     for rule in rules:
-        slug = slugify(rule.match)
+        slug = entity_slug(rule.match)
         if slug in slugs:
             problems.append(
                 f"rooms {slugs[slug]!r} and {rule.match!r} share the slug {slug!r}"

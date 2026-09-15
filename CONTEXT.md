@@ -132,7 +132,13 @@ How a verdict leaves the engine: one publish per moved subject on
 knx-nats-bridge writer rules route to a KNX group address, where Basalte
 owns the text. The subject shape is pinned by those writer rules. A fault
 declares its **target** — one address, one per main group, one per device,
-one per room — and the kind's declaration says which form it expects. The
+one per room — and the kind's declaration says which form it expects. A
+per-device or per-room target may carry a **name template**, the target
+address's catalog name with `{entity}` for the entity as the fault's own
+map names it; the engine only validates it, the lares generator renders it
+into the writer rules. The **entity slug** is the subject's last token —
+`2/1/27` to `2-1-27`, `EG.Flur` to `eg-flur` — exported at the package root
+so those rules are generated with the very function that publishes. The
 two channel-scoped kinds, silence and constancy, share the per-main-group
 form but not the addresses behind it — one per fault per group, because two
 writers on one address overwrite each other's clears. The address says

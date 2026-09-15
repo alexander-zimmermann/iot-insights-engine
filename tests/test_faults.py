@@ -100,6 +100,7 @@ def test_loads_valid_file(tmp_path: Path) -> None:
     assert standby.target is not None
     assert standby.target.per_device is True
     assert standby.target.per_main_group is False
+    assert standby.target.name is None
 
 
 def test_scope_is_carried_not_resolved(tmp_path: Path) -> None:
@@ -602,6 +603,16 @@ def test_target_union_holds_for_python_construction() -> None:
         Target(per_main_group=True, per_device=True)
 
 
+def test_target_name_rules_hold_for_python_construction() -> None:
+    # The loader's name-template rules, mirrored the same way
+    with pytest.raises(ValueError, match=r"name template.*\{entity\}"):
+        Target(per_device=True, name="Schalten.Stromwert-Standby-Anomalie")
+    with pytest.raises(ValueError, match="name template.*per_device or per_room"):
+        Target(per_main_group=True, name="Zentral.{entity}.Anomalie")
+    with pytest.raises(ValueError, match="name template.*per_device or per_room"):
+        Target(ga="1/2/3", name="Zentral.{entity}.Anomalie")
+
+
 _DURATION = """
 faults:
   - name: appliance_runtime
@@ -703,6 +714,58 @@ def test_device_entry_without_limit_rejected(tmp_path: Path) -> None:
 def test_per_device_target_excludes_other_forms(tmp_path: Path) -> None:
     body = _DURATION.replace("per_device: true", 'per_device: true\n      ga: "2/2/229"')
     with pytest.raises(ValueError, match=r"'appliance_runtime'.*target"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def _with_target_name(body: str, form: str, name: str) -> str:
+    """The fixture's target with a name template beside its form."""
+    return body.replace(f"{form}: true", f'{form}: true\n      name: "{name}"')
+
+
+def test_per_device_target_loads_its_name_template(tmp_path: Path) -> None:
+    # The template names the entity as the fault's entity map does, so it
+    # renders to a catalog name — the loader carries it, the generator in
+    # lares resolves it.
+    body = _with_target_name(
+        _DURATION, "per_device", "Schalten.{entity}.Stromwert-Dauerbetrieb-Anomalie"
+    )
+    [fault] = FaultList.load(_write(tmp_path, body))
+    assert fault.target == Target(
+        per_device=True, name="Schalten.{entity}.Stromwert-Dauerbetrieb-Anomalie"
+    )
+
+
+def test_target_name_without_the_entity_placeholder_rejected(tmp_path: Path) -> None:
+    # A template without the placeholder would point every device at one
+    # address, silently.
+    body = _with_target_name(_DURATION, "per_device", "Schalten.Stromwert-Dauerbetrieb-Anomalie")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*target\.name.*\{entity\}"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_empty_target_name_rejected(tmp_path: Path) -> None:
+    body = _with_target_name(_DURATION, "per_device", "")
+    with pytest.raises(ValueError, match=r"'appliance_runtime'.*target\.name"):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_target_name_on_a_main_group_target_rejected(tmp_path: Path) -> None:
+    # Per main group the address is named by the group's Zentral block, not
+    # by a template; the field means one thing.
+    body = _with_target_name(_VALID, "per_main_group", "Zentral.{entity}.Anomalie")
+    with pytest.raises(
+        ValueError, match=r"'channel_silence'.*target\.name.*per_device or per_room"
+    ):
+        FaultList.load(_write(tmp_path, body))
+
+
+def test_target_name_on_a_fixed_address_rejected(tmp_path: Path) -> None:
+    body = _DURATION.replace(
+        "per_device: true", 'ga: "2/2/229"\n      name: "Schalten.{entity}.Anomalie"'
+    )
+    with pytest.raises(
+        ValueError, match=r"'appliance_runtime'.*target\.name.*per_device or per_room"
+    ):
         FaultList.load(_write(tmp_path, body))
 
 
@@ -1043,6 +1106,12 @@ def test_deviation_fault_loads_roles_and_rooms(tmp_path: Path) -> None:
         ),
         RoomRule(match="EG.Flur", min_gap_k=1.0, value="Sensorik.EG.Flur.BWM.%.Temperatur"),
     )
+
+
+def test_per_room_target_loads_its_name_template(tmp_path: Path) -> None:
+    body = _with_target_name(_DEVIATION, "per_room", "Raumklima.{entity}.FBH.Aktiv-Anomalie")
+    [fault] = FaultList.load(_write(tmp_path, body))
+    assert fault.target == Target(per_room=True, name="Raumklima.{entity}.FBH.Aktiv-Anomalie")
 
 
 def test_room_without_a_value_channel_rejected(tmp_path: Path) -> None:
