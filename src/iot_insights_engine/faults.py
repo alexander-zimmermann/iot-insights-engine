@@ -109,12 +109,20 @@ class Target:
     group's Zentral block (channel silence), one address per declared
     device (appliance runtime), or one per declared room (room deviation)
     — resolved via the catalog and the writer rules, never listed here.
+
+    The per-entity forms may carry the address's catalog-name template,
+    `{entity}` standing for the entity as the fault's device or room map
+    names it (`Schalten.{entity}.Stromwert-Standby-Anomalie` renders to
+    `Schalten.Küche.K12-L1.Mikrowelle.Stromwert-Standby-Anomalie`). The
+    engine only validates it: the lares generator resolves it against the
+    catalog into the writer rules, delivery stays the bridge's job.
     """
 
     ga: str | None = None
     per_main_group: bool = False
     per_device: bool = False
     per_room: bool = False
+    name: str | None = None
 
     def __post_init__(self) -> None:
         # Mirrors the schema's oneOf so the union holds for Python-side
@@ -124,6 +132,11 @@ class Target:
             raise ValueError(
                 "target is exactly one of ga, per_main_group, per_device or per_room"
             )
+        # And the loader's name-template rules, for the same reason.
+        if self.name is not None and not (self.per_device or self.per_room):
+            raise ValueError("a name template belongs to a per_device or per_room target")
+        if self.name is not None and "{entity}" not in self.name:
+            raise ValueError("a name template needs an {entity} placeholder")
 
     @property
     def form(self) -> str:
@@ -320,6 +333,7 @@ class FaultList:
             problem = (
                 _check_external(raw)
                 or _check_volume(raw)
+                or _check_target(raw)
                 or _check_devices(raw)
                 or _check_references(raw)
                 or _check_signal(raw)
@@ -382,6 +396,29 @@ def _check_volume(raw: dict[str, Any]) -> str | None:
         return (
             f"fault {raw['name']!r}: scope: a volume fault counts episodes, "
             f"not channels — it declares none"
+        )
+    return None
+
+
+def _check_target(raw: dict[str, Any]) -> str | None:
+    """A name template belongs to the per-entity forms — per main group the
+    Zentral block names the address, a fixed address needs no name — and
+    must keep its placeholder, or every entity would share one address.
+    Checked in the loader because the schema's oneOf error loses the field
+    name; the forms' exclusivity the schema reports by fault and field.
+    """
+    target = raw.get("target", {})
+    if "name" not in target:
+        return None
+    if not (target.get("per_device") or target.get("per_room")):
+        return (
+            f"fault {raw['name']!r}: target.name: "
+            f"a name template belongs to a per_device or per_room target"
+        )
+    if "{entity}" not in target["name"]:
+        return (
+            f"fault {raw['name']!r}: target.name: the template needs an {{entity}} "
+            f"placeholder — without one every entity would share one address"
         )
     return None
 
@@ -544,6 +581,16 @@ def _parse_roles(
     return Roles(reference=roles["reference"], gate=roles.get("gate"))
 
 
+def _parse_target(target: dict[str, Any]) -> Target:
+    return Target(
+        ga=target.get("ga"),
+        per_main_group=target.get("per_main_group", False),
+        per_device=target.get("per_device", False),
+        per_room=target.get("per_room", False),
+        name=target.get("name"),
+    )
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
     scope = raw.get("scope")
     target = raw.get("target")
@@ -566,16 +613,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
             if scope is not None
             else None
         ),
-        target=(
-            Target(
-                ga=target.get("ga"),
-                per_main_group=target.get("per_main_group", False),
-                per_device=target.get("per_device", False),
-                per_room=target.get("per_room", False),
-            )
-            if target is not None
-            else None
-        ),
+        target=_parse_target(target) if target is not None else None,
         devices=tuple(
             DeviceLimit(match=match, max_run_hours=limit["max_run_hours"])
             for match, limit in raw.get("devices", {}).items()

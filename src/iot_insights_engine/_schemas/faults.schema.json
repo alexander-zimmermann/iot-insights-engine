@@ -287,31 +287,21 @@
       "additionalProperties": false
     },
     "target": {
+      "$comment": "Exactly one form. `name` is the target's catalog-name template, `{entity}` standing for the entity as the fault's device or room map names it; the loader pins it to per_device and per_room and requires the placeholder.",
+      "type": "object",
+      "properties": {
+        "ga":             { "type": "string", "pattern": "^[0-9]+/[0-9]+/[0-9]+$" },
+        "per_main_group": { "const": true },
+        "per_device":     { "const": true },
+        "per_room":       { "const": true },
+        "name":           { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false,
       "oneOf": [
-        {
-          "type": "object",
-          "properties": { "ga": { "type": "string", "pattern": "^[0-9]+/[0-9]+/[0-9]+$" } },
-          "required": ["ga"],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": { "per_main_group": { "const": true } },
-          "required": ["per_main_group"],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": { "per_device": { "const": true } },
-          "required": ["per_device"],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": { "per_room": { "const": true } },
-          "required": ["per_room"],
-          "additionalProperties": false
-        }
+        { "required": ["ga"] },
+        { "required": ["per_main_group"] },
+        { "required": ["per_device"] },
+        { "required": ["per_room"] }
       ]
     },
     "dormant": {

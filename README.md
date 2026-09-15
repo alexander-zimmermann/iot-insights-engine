@@ -71,7 +71,11 @@ carries:
   sent are dropped where the scope resolves, logged, not reported.
 - `target` — where the severity goes: one `ga`, or `per_main_group`,
   `per_device`, `per_room`. The addresses behind it are the bridge's
-  writer rules.
+  writer rules. A per-device or per-room target may add `name`, the
+  address's catalog-name template with `{entity}` standing for the
+  entity as the fault's device or room map names it
+  (`Raumklima.{entity}.FBH.Aktiv-Anomalie`); the engine validates it, the
+  lares generator renders it into those rules.
 - `dormant` — optional `reason` and `active_when`; the fault loads and
   validates but does not schedule.
 
