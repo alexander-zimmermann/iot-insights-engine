@@ -298,12 +298,12 @@ def resolve_scope(conn: psycopg.Connection[DictRow], scope: Scope) -> list[Chann
     if scope.dpt:
         clauses.append("dpt = ANY(%(dpt)s)")
         params["dpt"] = list(scope.dpt)
-    if scope.name_like:
-        clauses.append("name LIKE ANY(%(name_like)s)")
-        params["name_like"] = list(scope.name_like)
-    if scope.exclude_name_like:
-        clauses.append("NOT (name LIKE ANY(%(exclude_name_like)s))")
-        params["exclude_name_like"] = list(scope.exclude_name_like)
+    if scope.include:
+        clauses.append("name LIKE ANY(%(include)s)")
+        params["include"] = list(scope.include)
+    if scope.exclude:
+        clauses.append("NOT (name LIKE ANY(%(exclude)s))")
+        params["exclude"] = list(scope.exclude)
     sql = "SELECT ga, name, dpt FROM ga_catalog"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)

@@ -279,9 +279,9 @@
     "scope": {
       "type": "object",
       "properties": {
-        "dpt":               { "$ref": "#/$defs/stringOrList" },
-        "name_like":         { "$ref": "#/$defs/stringOrList" },
-        "exclude_name_like": { "$ref": "#/$defs/stringOrList" }
+        "dpt":     { "$ref": "#/$defs/stringOrList" },
+        "include": { "$ref": "#/$defs/stringOrList" },
+        "exclude": { "$ref": "#/$defs/stringOrList" }
       },
       "minProperties": 1,
       "additionalProperties": false

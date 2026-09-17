@@ -99,8 +99,8 @@ class Scope:
     """
 
     dpt: tuple[str, ...] = ()
-    name_like: tuple[str, ...] = ()
-    exclude_name_like: tuple[str, ...] = ()
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -607,8 +607,8 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         scope=(
             Scope(
                 dpt=_as_tuple(scope.get("dpt")),
-                name_like=_as_tuple(scope.get("name_like")),
-                exclude_name_like=_as_tuple(scope.get("exclude_name_like")),
+                include=_as_tuple(scope.get("include")),
+                exclude=_as_tuple(scope.get("exclude")),
             )
             if scope is not None
             else None

@@ -66,9 +66,10 @@ carries:
 - `kind` — one of the measurement kinds below; `drift` also names its
   `signal`, `deviation` may name an `expectation`.
 - `parameters` — in the channel's own unit (mA, %, h, × the usual pause).
-- `scope` — a catalog query (`name_like`), resolved against `ga_catalog`
-  on every run. Never a hand-written address list. Channels that never
-  sent are dropped where the scope resolves, logged, not reported.
+- `scope` — a catalog query (`dpt`, `include`, `exclude`; the name
+  patterns in SQL `LIKE` form), resolved against `ga_catalog` on every
+  run. Never a hand-written address list. Channels that never sent are
+  dropped where the scope resolves, logged, not reported.
 - `target` — where the severity goes: one `ga`, or `per_main_group`,
   `per_device`, `per_room`. The addresses behind it are the bridge's
   writer rules. A per-device or per-room target may add `name`, the
