@@ -41,7 +41,7 @@ faults:
       gap_factor: 5
       gap_quantile: 0.9
     scope:
-      name_like: "%"
+      include: "%"
     target:
       per_main_group: true
   - name: appliance_standby
@@ -56,7 +56,7 @@ faults:
       min_window_fraction: 0.8
     scope:
       dpt: "7.012"
-      name_like: "%.Stromwert"
+      include: "%.Stromwert"
     references:
       Küche.K15-L1.Gefrierschrank:
         healthy_ma: 48
@@ -109,8 +109,8 @@ def test_scope_is_carried_not_resolved(tmp_path: Path) -> None:
     faults = FaultList.load(_write(tmp_path, _VALID))
     standby = faults.get("appliance_standby")
     assert standby.scope.dpt == ("7.012",)
-    assert standby.scope.name_like == ("%.Stromwert",)
-    assert standby.scope.exclude_name_like == ()
+    assert standby.scope.include == ("%.Stromwert",)
+    assert standby.scope.exclude == ()
 
 
 def test_scope_accepts_lists(tmp_path: Path) -> None:
@@ -127,14 +127,14 @@ def test_scope_accepts_lists(tmp_path: Path) -> None:
               same_within: 0
             scope:
               dpt: ["9.001", "9.007"]
-              exclude_name_like: "%.Alarm%"
+              exclude: "%.Alarm%"
             target:
               ga: "8/0/1"
         """,
     )
     [f] = FaultList.load(path)
     assert f.scope.dpt == ("9.001", "9.007")
-    assert f.scope.exclude_name_like == ("%.Alarm%",)
+    assert f.scope.exclude == ("%.Alarm%",)
 
 
 def test_missing_sentence_names_fault_and_field(tmp_path: Path) -> None:
@@ -149,7 +149,7 @@ def test_missing_sentence_names_fault_and_field(tmp_path: Path) -> None:
               gap_factor: 5
               gap_quantile: 0.9
             scope:
-              name_like: "%"
+              include: "%"
             target:
               per_main_group: true
         """,
@@ -170,7 +170,7 @@ def test_missing_unit_names_fault_and_field(tmp_path: Path) -> None:
               gap_factor: 5
               gap_quantile: 0.9
             scope:
-              name_like: "%"
+              include: "%"
             target:
               per_main_group: true
         """,
@@ -192,7 +192,7 @@ def test_missing_parameter_names_fault_and_field(tmp_path: Path) -> None:
             parameters:
               other: 1
             scope:
-              name_like: "%"
+              include: "%"
             target:
               per_main_group: true
         """,
@@ -259,7 +259,7 @@ def test_quantile_outside_its_range_names_fault_and_field(tmp_path: Path) -> Non
               gap_factor: 5
               gap_quantile: 90
             scope:
-              name_like: "%"
+              include: "%"
             target:
               per_main_group: true
         """,
@@ -279,7 +279,7 @@ def test_empty_parameters_rejected(tmp_path: Path) -> None:
             kind: constancy
             parameters: {}
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -302,7 +302,7 @@ def test_non_numeric_parameter_rejected(tmp_path: Path) -> None:
               same_within: 0
               healthy: "high"
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -323,7 +323,7 @@ def test_unknown_kind_rejected(tmp_path: Path) -> None:
             parameters:
               limit: 1400
             scope:
-              name_like: "%.CO2"
+              include: "%.CO2"
             target:
               ga: "8/0/1"
         """,
@@ -345,7 +345,7 @@ def test_unknown_field_rejected(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
             severity: critical
@@ -368,7 +368,7 @@ def test_target_requires_exactly_one_form(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
               per_main_group: true
@@ -391,7 +391,7 @@ def test_invalid_ga_format_rejected(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2.2.229"
         """,
@@ -434,7 +434,7 @@ def test_duplicate_name_rejected(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
           - name: x
@@ -444,7 +444,7 @@ def test_duplicate_name_rejected(tmp_path: Path) -> None:
             parameters:
               limit: 240
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/230"
         """,
@@ -466,7 +466,7 @@ def test_dormant_loads_but_is_not_schedulable(tmp_path: Path) -> None:
       constant_hours: 24
       same_within: 0
     scope:
-      name_like: "%.Batterie.%"
+      include: "%.Batterie.%"
     target:
       ga: "15/4/40"
     dormant:
@@ -498,7 +498,7 @@ def test_dormant_requires_reason_and_condition(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
             dormant: true
@@ -521,7 +521,7 @@ def test_dormant_missing_active_when_rejected(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
             dormant:
@@ -544,7 +544,7 @@ def test_missing_name_reports_position(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -628,7 +628,7 @@ faults:
       Küche.K15-L1.Gefrierschrank:
         max_run_hours: 6
     scope:
-      name_like: "%.Stromwert"
+      include: "%.Stromwert"
     target:
       per_device: true
 """
@@ -659,7 +659,7 @@ def test_duration_without_devices_rejected(tmp_path: Path) -> None:
             parameters:
               active_hour_fraction: 0.5
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               per_device: true
         """,
@@ -690,7 +690,7 @@ def test_devices_on_other_kind_rejected(tmp_path: Path) -> None:
               Waschmaschine:
                 max_run_hours: 4
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -784,7 +784,7 @@ faults:
       min_window_fraction: 0.8
     scope:
       dpt: "7.012"
-      name_like: "%.Stromwert"
+      include: "%.Stromwert"
     references:
       Küche.K15-L1.Gefrierschrank:
         healthy_ma: 48
@@ -848,7 +848,7 @@ def test_references_on_other_kind_rejected(tmp_path: Path) -> None:
               Waschmaschine:
                 healthy_ma: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -888,7 +888,7 @@ faults:
       on_ma: 120
     scope:
       dpt: "7.012"
-      name_like: "%.Gefrierschrank.Stromwert"
+      include: "%.Gefrierschrank.Stromwert"
     references:
       Küche.K15-L1.Gefrierschrank:
         healthy_duty_pct: 50
@@ -964,7 +964,7 @@ faults:
       extract: "%.KWL.Temperatur-Abluft"
       supply: "%.KWL.Temperatur-Zuluft"
     scope:
-      name_like:
+      include:
         - "%.KWL.Temperatur-Außenluft"
         - "%.KWL.Temperatur-Abluft"
         - "%.KWL.Temperatur-Zuluft"
@@ -1079,7 +1079,7 @@ faults:
         min_gap_k: 1.0
         value: "Sensorik.EG.Flur.BWM.%.Temperatur"
     scope:
-      name_like:
+      include:
         - "Sensorik.%.Sensor.Temperatur"
         - "Sensorik.EG.Flur.BWM.%.Temperatur"
         - "Raumklima.%.FBH.Soll-Temperatur-Status"
@@ -1175,7 +1175,7 @@ def test_rooms_on_other_kind_rejected(tmp_path: Path) -> None:
               EG.Büro:
                 min_gap_k: 1.0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
             target:
               ga: "2/2/229"
         """,
@@ -1244,7 +1244,7 @@ def test_expectation_fault_needs_its_floor(tmp_path: Path) -> None:
 def test_expectation_fault_rejects_a_channel_scope(tmp_path: Path) -> None:
     # It measures against a model, so a catalog query here reads nothing.
     body = _EXPECTATION + """    scope:
-      name_like: "%.Photovoltaik.%"
+      include: "%.Photovoltaik.%"
 """
     with pytest.raises(ValueError, match=r"'pv_underperformance'.*scope"):
         FaultList.load(_write(tmp_path, body))
@@ -1300,7 +1300,7 @@ faults:
     unit: "bar"
     kind: external
     scope:
-      name_like: "%.Gastherme.System-Druck-Anomalie"
+      include: "%.Gastherme.System-Druck-Anomalie"
 """
 
 
@@ -1312,7 +1312,7 @@ def test_external_fault_loads_without_target_and_parameters(tmp_path: Path) -> N
     assert fault.sentence == "Der Systemdruck der Gastherme liegt unter 1,0 bar."
     assert fault.parameters == {}
     assert fault.target is None
-    assert fault.scope.name_like == ("%.Gastherme.System-Druck-Anomalie",)
+    assert fault.scope.include == ("%.Gastherme.System-Druck-Anomalie",)
 
 
 def test_fingerprint_of_an_external_fault_is_its_kind_alone(tmp_path: Path) -> None:
@@ -1359,7 +1359,7 @@ def test_engine_kind_still_requires_target(tmp_path: Path) -> None:
               constant_hours: 48
               same_within: 0
             scope:
-              name_like: "%.Stromwert"
+              include: "%.Stromwert"
         """,
     )
     with pytest.raises(ValueError, match=r"'x'.*target"):
@@ -1402,7 +1402,7 @@ def test_volume_fault_rejects_a_channel_scope(tmp_path: Path) -> None:
         tmp_path,
         _VOLUME
         + """    scope:
-      name_like: "%"
+      include: "%"
 """,
     )
     with pytest.raises(ValueError, match=r"'notification_volume'.*scope"):
