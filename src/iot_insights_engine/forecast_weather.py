@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -32,6 +33,7 @@ import psycopg
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
+from .site import Site
 
 log = get_logger(__name__)
 
@@ -52,12 +54,10 @@ METRIC_MAP: dict[str, str] = {
 HTTP_TIMEOUT_S = 30.0
 
 
-def _build_params(settings: Settings) -> dict[str, str]:
-    if settings.forecast_weather_lat is None or settings.forecast_weather_lon is None:
-        raise ValueError("MCP_FORECAST_WEATHER_LAT / _LON are required")
+def _build_params(settings: Settings, site: Site) -> dict[str, str]:
     return {
-        "latitude": f"{settings.forecast_weather_lat}",
-        "longitude": f"{settings.forecast_weather_lon}",
+        "latitude": f"{site.location.latitude}",
+        "longitude": f"{site.location.longitude}",
         "hourly": ",".join(METRIC_MAP),
         "models": settings.forecast_weather_model,
         "timezone": "UTC",
@@ -120,7 +120,7 @@ def _insert_forecasts(
 
 def run(settings: Settings, _argv: Sequence[str]) -> int:
     try:
-        params = _build_params(settings)
+        params = _build_params(settings, Site.load(Path(settings.site_file)))
     except ValueError:
         log.exception("forecast_weather_config_invalid")
         return 2

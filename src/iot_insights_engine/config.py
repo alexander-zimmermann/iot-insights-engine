@@ -37,8 +37,9 @@ class Settings(BaseSettings):
     db_write_username_file: str | None = None
     db_write_password_file: str | None = None
 
-    # Fault list and site file (mounted from the lares ConfigMap) for the
-    # detect-faults job: what counts as wrong, and what the house is.
+    # Mounted from the lares ConfigMap: the fault list for detect-faults
+    # (what counts as wrong) and the site file every job reads (what the
+    # house is — location, timezone, PV planes).
     faults_file: str = "/etc/iot-insights-engine/faults.yaml"
     site_file: str = "/etc/iot-insights-engine/site.yaml"
 
@@ -50,35 +51,20 @@ class Settings(BaseSettings):
     nats_creds_file: str | None = None
     nats_nkey_seed_file: str | None = None
 
-    # Forecast.Solar — PV-production forecast HTTPS API. Personal-Plus
-    # tier supports up to 2 planes in a single request, so the
-    # homelab's east+west roof fits one hourly call. Planes are
-    # JSON-encoded so adding a 3rd plane is a config change, not a
-    # code change.
+    # Forecast.Solar — PV-production forecast HTTPS API. Location and
+    # planes come from the site file; the account's timezone must be the
+    # site's, as the API returns naive local timestamps.
     forecast_solar_api_key: str = Field(default="", repr=False)
     forecast_solar_api_key_file: str | None = None
-    forecast_solar_lat: float | None = None
-    forecast_solar_lon: float | None = None
-    forecast_solar_planes: str = "[]"
     forecast_solar_base_url: str = "https://api.forecast.solar"
-    # forecast.solar returns naive local timestamps in the account's
-    # configured timezone — must match the account setting so the job
-    # can convert to UTC before writing to `mcp_forecasts.forecast_for`
-    # (TIMESTAMPTZ).
-    forecast_solar_timezone: str = "Europe/Berlin"
 
     # Open-Meteo — keyless weather forecast API. We pin the DWD ICON model
     # (`icon_seamless`) which covers the homelab at ~2 km. Requested with
-    # timezone=UTC, so no local-tz conversion is needed before insert.
-    forecast_weather_lat: float | None = None
-    forecast_weather_lon: float | None = None
+    # timezone=UTC for the site's location, so no local-tz conversion is
+    # needed before insert.
     forecast_weather_base_url: str = "https://api.open-meteo.com/v1/forecast"
     forecast_weather_model: str = "icon_seamless"
     forecast_weather_forecast_hours: int = 48
-
-    # Energy-balance job — timezone whose local midnight bounds the "today"
-    # window for the daily kWh counters (matches the meter/account locale).
-    energy_timezone: str = "Europe/Berlin"
 
     @model_validator(mode="after")
     def _resolve_db_secret_files(self) -> Settings:

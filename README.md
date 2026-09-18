@@ -94,14 +94,15 @@ same ConfigMap and mounted at `MCP_SITE_FILE`, says what the house is:
 `location`, `timezone`, and `pv.planes` keyed by plane name (`West`,
 `Ost`) with the `inverter_id` each plane feeds, its `tilt` and `azimuth`
 (Open-Meteo convention: 0 south, negative east, positive west) and its
-`kwp`. The daily-yield shape reads the plant off it — which inverters
-count, and the most each counter can rise in an hour — so a counter that
-re-bases or reports a 0 is told from production without a fault
-parameter. The forecast jobs still take location and planes from their
-`MCP_FORECAST_*` environment; moving them onto the site file is the site
-build item of the PV-underperformance map. The loader
-([site.py](src/iot_insights_engine/site.py)) validates the file the same
-way the fault list is validated.
+`kwp`. Every job reads it: `forecast-solar` takes the location and the
+planes (and expects the account's timezone to be the site's),
+`forecast-weather` the location, `energy-balance` the timezone whose
+midnight bounds "today", and the daily-yield shape the plant — which
+inverters count, and the most each counter can rise in an hour — so a
+counter that re-bases or reports a 0 is told from production without a
+fault parameter. Nothing about the house lives in a job's environment.
+The loader ([site.py](src/iot_insights_engine/site.py)) validates the
+file the same way the fault list is validated.
 
 ### Measurement kinds
 
@@ -160,10 +161,10 @@ dashboard, and the Basalte Studio faults — those appear here only as
 ## Configuration
 
 All `MCP_*` env vars (kept for compatibility with the existing
-SealedSecret + Kyverno-clone topology shared with iot-mcp-bridge).
-`detect-faults` additionally needs the write credentials
-(`MCP_DB_WRITE_*`, episodes only), `MCP_FAULTS_FILE`, `MCP_SITE_FILE`
-and a NATS identity for `anomaly.*`. See
+SealedSecret + Kyverno-clone topology shared with iot-mcp-bridge). Every
+job reads the site file at `MCP_SITE_FILE`; `detect-faults` additionally
+needs the write credentials (`MCP_DB_WRITE_*`, episodes only),
+`MCP_FAULTS_FILE` and a NATS identity for `anomaly.*`. See
 [config.py](src/iot_insights_engine/config.py) for the full list.
 
 ## Local dev

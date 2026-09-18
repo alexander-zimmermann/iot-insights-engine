@@ -7,6 +7,7 @@ Network calls are mocked with respx; DB writes are not exercised here
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -16,25 +17,51 @@ import respx
 
 from iot_insights_engine import forecast_solar, nats_publisher
 from iot_insights_engine.config import Settings
+from iot_insights_engine.site import Location, Plane, Site
+
+_OST = Plane(key="Ost", inverter_id=2, tilt=17, azimuth=-51, kwp=6.175)
+_WEST = Plane(key="West", inverter_id=1, tilt=17, azimuth=129, kwp=6.435)
 
 
-def _settings(api_key: str = "AAAA-test-key-BBBB", planes: str | None = None) -> Settings:
+def _settings(api_key: str = "AAAA-test-key-BBBB", site_file: str | None = None) -> Settings:
     return Settings(
         db_host="localhost",
         db_name="x",
         db_username="x",
         db_password="x",  # noqa: S106 — test stub
         forecast_solar_api_key=api_key,
-        forecast_solar_lat=50.626,
-        forecast_solar_lon=6.024,
-        forecast_solar_planes=planes
-        or '[{"dec":17,"az":-51,"kwp":6.175},{"dec":17,"az":129,"kwp":6.435}]',
+        site_file=site_file or "/nonexistent/site.yaml",
     )
 
 
+def _site(*planes: Plane) -> Site:
+    return Site(
+        location=Location(latitude=50.626, longitude=6.024),
+        timezone="Europe/Berlin",
+        planes=planes or (_OST, _WEST),
+    )
+
+
+def _site_file(tmp_path: Path) -> Path:
+    path = tmp_path / "site.yaml"
+    path.write_text(
+        """
+        location: {latitude: 50.626, longitude: 6.024}
+        timezone: Europe/Berlin
+        pv:
+          planes:
+            Ost: {inverter_id: 2, tilt: 17, azimuth: -51, kwp: 6.175}
+            West: {inverter_id: 1, tilt: 17, azimuth: 129, kwp: 6.435}
+        """,
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_build_url_two_planes() -> None:
-    s = _settings()
-    url = forecast_solar._build_url(s)
+    # The site's location and planes, in the site's order: forecast.solar
+    # takes tilt/azimuth/kWp per plane and sums them.
+    url = forecast_solar._build_url(_settings(), _site())
     assert url == (
         "https://api.forecast.solar/AAAA-test-key-BBBB/estimate/"
         "50.626/6.024/17/-51/6.175/17/129/6.435"
@@ -42,25 +69,14 @@ def test_build_url_two_planes() -> None:
 
 
 def test_build_url_requires_api_key() -> None:
-    s = _settings(api_key="")
     with pytest.raises(ValueError, match="API_KEY"):
-        forecast_solar._build_url(s)
-
-
-def test_build_url_requires_planes() -> None:
-    s = _settings(planes="[]")
-    with pytest.raises(ValueError, match="PLANES"):
-        forecast_solar._build_url(s)
+        forecast_solar._build_url(_settings(api_key=""), _site())
 
 
 def test_build_url_three_planes_scales() -> None:
-    """Adding a 3rd plane should be a config-only change."""
-    s = _settings(
-        planes='[{"dec":17,"az":-51,"kwp":6.175},'
-        '{"dec":17,"az":129,"kwp":6.435},'
-        '{"dec":30,"az":0,"kwp":2.0}]'
-    )
-    url = forecast_solar._build_url(s)
+    """Adding a 3rd plane is a site.yaml change, nothing here."""
+    third = Plane(key="Garage", inverter_id=3, tilt=30, azimuth=0, kwp=2.0)
+    url = forecast_solar._build_url(_settings(), _site(_OST, _WEST, third))
     assert url.endswith("/17/-51/6.175/17/129/6.435/30/0/2.0")
 
 
@@ -96,12 +112,10 @@ def test_fetch_result_rejects_missing_result() -> None:
             forecast_solar._fetch_result(url)
 
 
-def test_run_strips_api_key_from_log(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_run_strips_api_key_from_log(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """The job logs the URL on every call — make sure the API-key never
     appears in plaintext so a future log shipper can't leak it."""
-    s = _settings(api_key="SECRET123")
+    s = _settings(api_key="SECRET123", site_file=str(_site_file(tmp_path)))
     captured: list[str] = []
 
     def fake_fetch(url: str) -> dict[str, object]:
@@ -129,8 +143,12 @@ def test_to_utc_converts_summer_time() -> None:
     assert got == datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
 
 
-def test_invalid_plane_json_returns_rc_2() -> None:
-    s = _settings(planes="not-json")
+def test_invalid_site_file_returns_rc_2(tmp_path: Path) -> None:
+    # A site file that does not load is a configuration error, the same
+    # exit as a missing API key — not a fetch failure.
+    path = tmp_path / "site.yaml"
+    path.write_text("timezone: Europe/Berlin\n", encoding="utf-8")
+    s = _settings(site_file=str(path))
     with patch.object(forecast_solar, "_fetch_result"):
         rc = forecast_solar.run(s, [])
     assert rc == 2
