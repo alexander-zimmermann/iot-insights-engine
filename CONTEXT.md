@@ -30,8 +30,9 @@ at each hourly **close** is walked step by step, a **rise** of at most
 the plane's kWp times the hours the step spans is credited to the day,
 and a **drop** (the counter re-based) or a rise past that **bound** (a
 bogus reading) is declined — the run record counts the declined steps
-per inverter as `ignored_steps`. Location and orientation are declared
-here already but still read from the forecast jobs' environment.
+per inverter as `ignored_steps`. The forecast jobs read the location,
+the planes' orientation and the timezone off it as well; nothing about
+the house lives in a job's environment.
 
 ## Fingerprint
 

@@ -24,6 +24,7 @@ the source query here changes; the published keys and KNX GAs stay the same.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -32,6 +33,7 @@ from . import nats_publisher
 from .config import Settings
 from .db_write import read_connection
 from .logging_setup import get_logger
+from .site import Site
 
 log = get_logger(__name__)
 
@@ -125,8 +127,10 @@ def _publish(settings: Settings, values: dict[str, float]) -> None:
 
 
 def run(settings: Settings, _argv: Sequence[str]) -> int:
+    # "Today" is the site's day: its local midnight bounds the counters.
+    site = Site.load(Path(settings.site_file))
     with read_connection(settings) as conn:
-        generation, grid_import, grid_export = _today_deltas(conn, settings.energy_timezone)
+        generation, grid_import, grid_export = _today_deltas(conn, site.timezone)
     values = _compute(generation, grid_import, grid_export)
     _publish(settings, values)
     log.info(

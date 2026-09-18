@@ -1,14 +1,14 @@
 """Pull hour-by-hour PV-production forecast from api.forecast.solar.
 
 Personal-Plus tier supports multiple planes in a single request, so the
-homelab's east+west roof fits one hourly call. Forecast values land in
+planes the site file declares fit one hourly call. Forecast values land in
 ``mcp_forecasts`` with model=`forecast_solar`, metric=`pv_production`
 (watts). Each row is keyed on ``(forecast_for, source, metric, model)``
 so a re-pull during the same hour overwrites the existing forecast
 instead of creating a duplicate.
 
-The API returns naive local timestamps (account timezone, see
-``MCP_FORECAST_SOLAR_TIMEZONE``); they are converted to UTC-aware
+The API returns naive local timestamps in the account's timezone — the
+site's, which the account must be set to; they are converted to UTC-aware
 datetimes before insert so ``forecast_for`` (TIMESTAMPTZ) lines up
 with the other forecasts in the same table.
 
@@ -18,9 +18,9 @@ deviation-from-expectation, declared in the fault list — not a job here.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -31,6 +31,7 @@ from . import nats_publisher
 from .config import Settings
 from .db_write import write_connection
 from .logging_setup import get_logger
+from .site import Site
 
 log = get_logger(__name__)
 
@@ -46,30 +47,21 @@ HTTP_TIMEOUT_S = 30.0
 FORECAST_SUBJECT_PREFIX = "forecast.pv"
 
 
-def _build_url(settings: Settings) -> str:
+def _build_url(settings: Settings, site: Site) -> str:
+    """The estimate URL for the site: its location, then each plane as
+    tilt / azimuth / kWp — forecast.solar's azimuth convention is the
+    site file's (0 south, negative east, positive west)."""
     if not settings.forecast_solar_api_key:
         raise ValueError("MCP_FORECAST_SOLAR_API_KEY (or *_FILE) is required")
-    if settings.forecast_solar_lat is None or settings.forecast_solar_lon is None:
-        raise ValueError("MCP_FORECAST_SOLAR_LAT / _LON are required")
-    planes = json.loads(settings.forecast_solar_planes)
-    if not planes:
-        raise ValueError("MCP_FORECAST_SOLAR_PLANES is empty — expected JSON array")
-
     parts: list[str] = [
         settings.forecast_solar_base_url.rstrip("/"),
         settings.forecast_solar_api_key,
         "estimate",
-        f"{settings.forecast_solar_lat}",
-        f"{settings.forecast_solar_lon}",
+        f"{site.location.latitude}",
+        f"{site.location.longitude}",
     ]
-    for plane in planes:
-        parts.extend(
-            (
-                f"{plane['dec']}",
-                f"{plane['az']}",
-                f"{plane['kwp']}",
-            )
-        )
+    for plane in site.planes:
+        parts.extend((f"{plane.tilt}", f"{plane.azimuth}", f"{plane.kwp}"))
     return "/".join(parts)
 
 
@@ -193,8 +185,9 @@ def _publish_scalars(settings: Settings, scalars: dict[str, float]) -> None:
 
 def run(settings: Settings, _argv: Sequence[str]) -> int:
     try:
-        url = _build_url(settings)
-    except (ValueError, KeyError, json.JSONDecodeError):
+        site = Site.load(Path(settings.site_file))
+        url = _build_url(settings, site)
+    except ValueError:
         log.exception("forecast_solar_config_invalid")
         return 2
     # Strip the API-key from the logged URL — keep host + plane path only.
@@ -209,8 +202,8 @@ def run(settings: Settings, _argv: Sequence[str]) -> int:
         log.warning("forecast_solar_empty_response", url=safe_url)
         return 0
     with write_connection(settings) as conn:
-        inserted = _insert_forecasts(conn, watts, settings.forecast_solar_timezone)
-    scalars = _compute_scalars(result, settings.forecast_solar_timezone)
+        inserted = _insert_forecasts(conn, watts, site.timezone)
+    scalars = _compute_scalars(result, site.timezone)
     _publish_scalars(settings, scalars)
     log.info(
         "forecast_solar_done",
