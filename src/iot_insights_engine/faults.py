@@ -13,18 +13,19 @@ faults load fully but are excluded from `schedulable()`.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import jsonschema
-import yaml
+from .declared import SCHEMAS, describe_field, load_declared
 
-_SCHEMA_PATH = Path(__file__).resolve().parent / "_schemas" / "faults.schema.json"
+if TYPE_CHECKING:
+    import jsonschema
+
+_SCHEMA_PATH = SCHEMAS / "faults.schema.json"
 
 
 class MeasurementKind(StrEnum):
@@ -310,19 +311,7 @@ class FaultList:
 
     @classmethod
     def load(cls, path: Path) -> FaultList:
-        raw_text = path.read_text(encoding="utf-8")
-        data: Any = yaml.safe_load(raw_text) or {}
-        if not isinstance(data, dict):
-            raise ValueError(
-                f"{path}: expected a mapping at the top level, got {type(data).__name__}"
-            )
-
-        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-        validator = jsonschema.Draft202012Validator(schema)
-        error = jsonschema.exceptions.best_match(validator.iter_errors(data))
-        if error is not None:
-            raise ValueError(f"{path}: {_describe(error, data)}") from error
-
+        data = load_declared(path, _SCHEMA_PATH, _describe)
         faults: list[Fault] = []
         seen: set[str] = set()
         for raw in data["faults"]:
@@ -359,7 +348,7 @@ def _describe(error: jsonschema.ValidationError, data: Any) -> str:
         field = ".".join(str(p) for p in path[2:])
         prefix = f"fault {label}: " + (f"{field}: " if field else "")
         return prefix + error.message
-    return error.message
+    return describe_field(error, data)
 
 
 def _as_tuple(value: Any) -> tuple[str, ...]:

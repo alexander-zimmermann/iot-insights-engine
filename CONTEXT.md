@@ -18,6 +18,21 @@ A **dormant** fault loads fully but is excluded from the schedule: it
 declares why it cannot run yet and the observable condition under which it
 starts to.
 
+## Site
+
+What the house is, declared in `site.yaml` beside the fault list: where
+it stands, its timezone, and its PV **planes** — each keyed by name
+(`West`, `Ost`) with the inverter it feeds, its orientation and its peak
+power in kWp. The fault list says what counts as wrong; the site says
+what is there, so a fact about the plant is never a fault parameter. The
+daily-yield shape reads the plant off it: an inverter's lifetime counter
+at each hourly **close** is walked step by step, a **rise** of at most
+the plane's kWp times the hours the step spans is credited to the day,
+and a **drop** (the counter re-based) or a rise past that **bound** (a
+bogus reading) is declined — the run record counts the declined steps
+per inverter as `ignored_steps`. Location and orientation are declared
+here already but still read from the forecast jobs' environment.
+
 ## Fingerprint
 
 The rule a fault measures by — its kind, with the signal or expectation
