@@ -5,7 +5,7 @@ lives (`ga_catalog` in TSDB — never a hand-written address list), measures,
 folds the observations into episodes behind the pure pipeline seam, and
 reconciles the result with the episodes the database already holds. What
 leaves the engine is a severity 0–3 per main group on
-`anomaly.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
+`fault.<fault>.<main_group>`; the knx-nats-bridge writer rules carry it
 to the group's Zentral diagnosis address, where Basalte owns the text.
 
 Every kind runs in one shape: a `runner.Kind` declares how its series is

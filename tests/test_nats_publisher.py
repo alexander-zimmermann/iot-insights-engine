@@ -1,4 +1,4 @@
-"""The NATS adapter: one publish per anomaly, on the subject the
+"""The NATS adapter: one publish per fault, on the subject the
 knx-nats-bridge writer rules pin (`tests/test_slug` locks the entity token).
 """
 
@@ -25,5 +25,5 @@ def test_publish_anomaly_slugs_the_raw_entity_once() -> None:
     with patch.object(nats_publisher, "publish") as pub:
         publish_anomaly(settings, "appliance_runtime", "warning", {}, entity="2/1/197")
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    assert call.args[1] == "fault.appliance_runtime.2-1-197"
     assert call.args[2]["entity"] == "2-1-197"

@@ -63,8 +63,8 @@ def publish_anomaly(
     entity: str | None = None,
     firing: bool = True,
 ) -> None:
-    """Publish one anomaly. Subject is **stable per routing target** —
-    `anomaly.<uc>` for a 1:1 UC, `anomaly.<uc>.<entity>` for a grouped one —
+    """Publish one fault severity. Subject is **stable per routing target** —
+    `fault.<uc>` for a 1:1 UC, `fault.<uc>.<entity>` for a grouped one —
     so the knx-nats-bridge writer-rules map exactly one rule per KNX-GA.
 
     The entity arrives raw (a GA, a room slug, a main group); this adapter
@@ -77,7 +77,7 @@ def publish_anomaly(
     name-side value.
     """
     token = entity_slug(entity) if entity else None
-    subject = f"anomaly.{uc}.{token}" if token else f"anomaly.{uc}"
+    subject = f"fault.{uc}.{token}" if token else f"fault.{uc}"
     body = {
         "firing": firing,
         "uc": uc,

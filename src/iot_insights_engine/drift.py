@@ -669,7 +669,7 @@ class Exchanger:
     @property
     def slug(self) -> str:
         """Episode subject and NATS entity in one: the writer rules pin
-        `anomaly.<fault>.<slug>` to the exchanger's fault address."""
+        `fault.<fault>.<slug>` to the exchanger's fault address."""
         return entity_slug(self.label)
 
     @property

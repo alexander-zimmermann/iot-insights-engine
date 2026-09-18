@@ -107,7 +107,7 @@ log = get_logger(__name__)
 class Room:
     """One monitored room: its channel triple and declared threshold. The
     slug doubles as episode subject and NATS entity — the writer rules pin
-    `anomaly.<fault>.<slug>` to the room's anomaly address."""
+    `fault.<fault>.<slug>` to the room's fault address."""
 
     label: str
     slug: str
@@ -465,7 +465,7 @@ YIELD_POLICY = EpisodePolicy(bucket=DAY, quiet_runs=1, promote_after_runs=3)
 
 # The one subject. The forecast models both roof planes in a single curve,
 # so there is nothing to fan out over; the plant's own anomaly address
-# carries it, and the writer rule pins the bare `anomaly.<fault>` subject
+# carries it, and the writer rule pins the bare `fault.<fault>` subject
 # — a 1:1 subject with no entity token, like the volume watchdog's.
 PLANT = "pv"
 

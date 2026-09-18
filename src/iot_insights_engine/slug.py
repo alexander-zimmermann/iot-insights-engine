@@ -1,4 +1,4 @@
-"""The entity slug: the last token of an `anomaly.<fault>.<entity>` subject.
+"""The entity slug: the last token of a `fault.<fault>.<entity>` subject.
 
 A device is named by its group address (`2/1/27` -> `2-1-27`), a room by
 its entry in the fault's room map (`EG.Flur` -> `eg-flur`), an exchanger by
