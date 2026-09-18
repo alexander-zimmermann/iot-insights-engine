@@ -226,7 +226,7 @@ def test_publish_group_carries_severity_level_and_channels() -> None:
             NatsPublisher(settings), "channel_silence", plan.publishes, silence.group_payload
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.channel_silence.2"
+    assert call.args[1] == "fault.channel_silence.2"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -243,7 +243,7 @@ def test_publish_clear_forces_level_zero() -> None:
             silence.group_payload,
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.channel_silence.15"
+    assert call.args[1] == "fault.channel_silence.15"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
@@ -273,7 +273,7 @@ def test_publish_constancy_group_names_what_each_channel_is_stuck_at() -> None:
         )
     (call,) = pub.call_args_list
     # The same per-main-group shape silence delivers in.
-    assert call.args[1] == "anomaly.channel_constancy.15"
+    assert call.args[1] == "fault.channel_constancy.15"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["stuck_channels"] == 1
@@ -295,7 +295,7 @@ def test_publish_constancy_clear_forces_level_zero() -> None:
             constancy.group_payload,
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.channel_constancy.15"
+    assert call.args[1] == "fault.channel_constancy.15"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["firing"] is False
     assert call.args[2]["stuck_channels"] == 0
@@ -317,7 +317,7 @@ def test_publish_device_carries_run_details_on_the_slug_subject() -> None:
             NatsPublisher(settings), "appliance_runtime", (publish,), duration.payload
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    assert call.args[1] == "fault.appliance_runtime.2-1-197"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -342,7 +342,7 @@ def test_publish_device_clear_forces_level_zero() -> None:
             NatsPublisher(settings), "appliance_runtime", (publish,), duration.payload
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.appliance_runtime.2-1-197"
+    assert call.args[1] == "fault.appliance_runtime.2-1-197"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
@@ -365,7 +365,7 @@ def test_publish_standby_carries_drift_details_on_the_slug_subject() -> None:
             NatsPublisher(settings), "appliance_standby", (publish,), drift.payload_standby
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.appliance_standby.2-2-227"
+    assert call.args[1] == "fault.appliance_standby.2-2-227"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -392,7 +392,7 @@ def test_publish_duty_cycle_carries_drift_details_on_the_slug_subject() -> None:
             NatsPublisher(settings), "freezer_icing", (publish,), drift.payload_duty_cycle
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.freezer_icing.2-2-227"
+    assert call.args[1] == "fault.freezer_icing.2-2-227"
     payload = call.args[2]
     assert payload["severity_level"] == 1
     assert payload["firing"] is True
@@ -418,7 +418,7 @@ def test_publish_room_carries_cold_details_on_the_slug_subject() -> None:
     with patch.object(nats_publisher, "publish") as pub:
         publish_subjects(NatsPublisher(settings), "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.fbh_cold.eg-buero"
+    assert call.args[1] == "fault.fbh_cold.eg-buero"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -443,7 +443,7 @@ def test_publish_room_clear_forces_level_zero() -> None:
     with patch.object(nats_publisher, "publish") as pub:
         publish_subjects(NatsPublisher(settings), "fbh_cold", (publish,), deviation.payload)
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.fbh_cold.eg-buero"
+    assert call.args[1] == "fault.fbh_cold.eg-buero"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
@@ -465,7 +465,7 @@ def test_publish_exchanger_carries_recovery_details_on_the_slug_subject() -> Non
             NatsPublisher(settings), "heat_recovery_decay", (publish,), drift.payload_recovery
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
+    assert call.args[1] == "fault.heat_recovery_decay.kwl"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -492,7 +492,7 @@ def test_publish_exchanger_clear_forces_level_zero() -> None:
             NatsPublisher(settings), "heat_recovery_decay", (publish,), drift.payload_recovery
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.heat_recovery_decay.kwl"
+    assert call.args[1] == "fault.heat_recovery_decay.kwl"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
@@ -525,7 +525,7 @@ def test_publish_volume_carries_the_week_on_the_house_wide_subject() -> None:
         )
     (call,) = pub.call_args_list
     # One house-wide address, so a 1:1 subject with no entity token.
-    assert call.args[1] == "anomaly.notification_volume"
+    assert call.args[1] == "fault.notification_volume"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -545,7 +545,7 @@ def test_publish_volume_clear_forces_level_zero() -> None:
             volume.payload,
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.notification_volume"
+    assert call.args[1] == "fault.notification_volume"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False
@@ -579,7 +579,7 @@ def test_publish_plant_carries_the_day_against_its_expectation() -> None:
     (call,) = pub.call_args_list
     # One plant-wide address, so a 1:1 subject with no entity token — the
     # writer rule pins exactly this string to 15/4/11.
-    assert call.args[1] == "anomaly.pv_underperformance"
+    assert call.args[1] == "fault.pv_underperformance"
     payload = call.args[2]
     assert payload["severity_level"] == 2
     assert payload["firing"] is True
@@ -601,7 +601,7 @@ def test_publish_plant_clear_forces_level_zero() -> None:
             deviation.payload_yield,
         )
     (call,) = pub.call_args_list
-    assert call.args[1] == "anomaly.pv_underperformance"
+    assert call.args[1] == "fault.pv_underperformance"
     assert call.args[2]["severity_level"] == 0
     assert call.args[2]["severity"] is None
     assert call.args[2]["firing"] is False

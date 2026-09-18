@@ -144,7 +144,7 @@ wall-clock time.
 ## Delivery
 
 How a verdict leaves the engine: one publish per moved subject on
-`anomaly.<fault>[.<entity>]`, carrying a numeric `severity_level` the
+`fault.<fault>[.<entity>]`, carrying a numeric `severity_level` the
 knx-nats-bridge writer rules route to a KNX group address, where Basalte
 owns the text. The subject shape is pinned by those writer rules. A fault
 declares its **target** — one address, one per main group, one per device,

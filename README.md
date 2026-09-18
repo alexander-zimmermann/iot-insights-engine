@@ -21,7 +21,7 @@ faults.yaml + site.yaml (lares)       ├─► iot-insights-engine
 api.forecast.solar / api.open-meteo   ┘     │
                                             ├─► TSDB (mcp_forecasts, episodes)
                                             ▼
-                             NATS (forecast.pv.*, energy.pv.*, anomaly.*)
+                             NATS (forecast.pv.*, energy.pv.*, fault.*)
                                             │
                                             ▼
                              knx-nats-bridge (writer rules) ─► KNX GA ─► Basalte
@@ -45,7 +45,7 @@ iot-insights-engine <subcommand>
 | `forecast-solar`   | `15 * * * *`                  | Pull PV forecast → `mcp_forecasts`, publish `forecast.pv.*` |
 | `forecast-weather` | `20 * * * *`                  | Pull Open-Meteo (ICON) forecast → `mcp_forecasts` |
 | `energy-balance`   | `*/15 * * * *`                | Today's kWh counters → `energy.pv.*` |
-| `detect-faults`    | `20 * * * *`                  | Run the fault list: resolve scope, measure, fold into episodes, reconcile, publish `anomaly.*` |
+| `detect-faults`    | `20 * * * *`                  | Run the fault list: resolve scope, measure, fold into episodes, reconcile, publish `fault.*` |
 
 `detect-faults --dry-run` computes and logs everything and touches
 neither the database nor NATS. One failing fault does not take the
@@ -146,7 +146,7 @@ anew.
 
 ### Delivery
 
-One publish per moved subject on `anomaly.<fault>[.<entity>]` with a
+One publish per moved subject on `fault.<fault>[.<entity>]` with a
 numeric `severity_level`. The knx-nats-bridge writer rules carry it to
 the group address; Basalte owns the text and the channel: 3 pushes,
 1–2 shows an indicator, 0 clears, and every situation gets an e-mail.
@@ -164,7 +164,7 @@ All `MCP_*` env vars (kept for compatibility with the existing
 SealedSecret + Kyverno-clone topology shared with iot-mcp-bridge). Every
 job reads the site file at `MCP_SITE_FILE`; `detect-faults` additionally
 needs the write credentials (`MCP_DB_WRITE_*`, episodes only),
-`MCP_FAULTS_FILE` and a NATS identity for `anomaly.*`. See
+`MCP_FAULTS_FILE` and a NATS identity for `fault.*`. See
 [config.py](src/iot_insights_engine/config.py) for the full list.
 
 ## Local dev

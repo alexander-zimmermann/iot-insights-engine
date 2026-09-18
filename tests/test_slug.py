@@ -1,6 +1,6 @@
 """The entity slug the package exports.
 
-The slug is the last token of the `anomaly.<fault>.<entity>` subject, pinned
+The slug is the last token of the `fault.<fault>.<entity>` subject, pinned
 by the knx-nats-bridge writer rules — and the lares generator imports it at
 the deployed tag to write those rules, so both the mapping and the import
 path are locked here.
