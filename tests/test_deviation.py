@@ -28,10 +28,13 @@ from iot_insights_engine.deviation import (
     classify,
     classify_yield,
     cold_buckets,
+    counter_bounds,
     daily_energy,
     daily_yield,
     dead_value_gas,
     deviation_observations,
+    fold_closes,
+    inverter_yields,
     judged_days,
     payload_yield,
     publish_for,
@@ -43,6 +46,7 @@ from iot_insights_engine.deviation import (
 from iot_insights_engine.episodes import EpisodePolicy, fold_observations
 from iot_insights_engine.faults import DeviationExpectation, Roles, RoomRule
 from iot_insights_engine.silence import Channel
+from iot_insights_engine.site import Location, Plane, Site
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
@@ -470,37 +474,151 @@ class TestDailyEnergy:
         assert daily_energy(_curve()) == {}
 
 
+def _closes(*points: tuple[int, int, float]) -> dict[datetime, float]:
+    """Hourly counter closes as (day offset, hour, Wh) triples."""
+    return {_day(n) + hour * _HOUR: wh for n, hour, wh in points}
+
+
+# The west inverter, 6.435 kWp: what its counter can physically rise in an
+# hour, in Wh.
+_WEST_BOUND = 6_435.0
+
+
+class TestFoldCloses:
+    def test_a_counter_that_drops_late_in_the_day_keeps_the_day_and_the_next(self) -> None:
+        # The west inverter on 2026-09-05..07: it rose to 6 254 382 Wh by
+        # 19:00 on the 6th, came back 12 762 Wh *lower* in the 20:00 bucket
+        # and counted on from there. The day's rises are its production
+        # (16.8 kWh); the drop is a re-base, neither loss nor production;
+        # the next day is measured from the lower value and reads 16.4 kWh.
+        closes = _closes(
+            (0, 19, 6_237_536),
+            (1, 6, 6_238_000),
+            (1, 8, 6_241_000),
+            (1, 10, 6_245_000),
+            (1, 12, 6_249_000),
+            (1, 14, 6_252_000),
+            (1, 17, 6_254_000),
+            (1, 19, 6_254_382),
+            (1, 20, 6_241_620),
+            (2, 13, 6_253_028),
+            (2, 19, 6_258_027),
+        )
+        folded = fold_closes(closes, _WEST_BOUND)
+        assert folded.kwh == pytest.approx({_day(1): 16.846, _day(2): 16.407})
+        assert folded.drops == 1
+        assert folded.over_bound == 0
+
+    def test_a_zero_between_two_true_readings_credits_neither_step(self) -> None:
+        # A bucket that closed on a 0 is a bogus reading: the step down to
+        # it is a drop, the step back up is a rise no plane can make in an
+        # hour. Both are ignored; the rises around them stay.
+        closes = _closes(
+            (0, 19, 100_000),
+            (1, 8, 102_000),
+            (1, 9, 104_000),
+            (1, 10, 0),
+            (1, 11, 108_000),
+            (1, 12, 110_000),
+        )
+        folded = fold_closes(closes, _WEST_BOUND)
+        assert folded.kwh == pytest.approx({_day(1): 6.0})
+        assert folded.drops == 1
+        assert folded.over_bound == 1
+
+    def test_a_rise_up_to_the_bound_over_a_gap_is_credited_and_one_past_it_is_not(
+        self,
+    ) -> None:
+        # The bound scales with the hours a step spans: an outage of the
+        # reading path across three daylight hours still yields a plausible
+        # rise, and one rise more than the plane can make in that time is a
+        # bogus reading.
+        at_bound = _closes((0, 19, 100_000), (1, 9, 100_000), (1, 12, 100_000 + 3 * 6_435))
+        assert fold_closes(at_bound, _WEST_BOUND).kwh == pytest.approx({_day(1): 19.305})
+        past_bound = _closes((0, 19, 100_000), (1, 9, 100_000), (1, 12, 100_001 + 3 * 6_435))
+        folded = fold_closes(past_bound, _WEST_BOUND)
+        assert folded.kwh == pytest.approx({_day(1): 0.0})
+        assert folded.over_bound == 1
+
+
+_BOUNDS = {1: _WEST_BOUND, 2: 6_175.0}
+
+
+def test_the_bound_is_the_planes_peak_power_per_hour() -> None:
+    site = Site(
+        location=Location(latitude=50.62598, longitude=6.02435),
+        timezone="Europe/Berlin",
+        planes=(
+            Plane(key="West", inverter_id=1, tilt=17.0, azimuth=129.0, kwp=6.435),
+            Plane(key="Ost", inverter_id=2, tilt=17.0, azimuth=-51.0, kwp=6.175),
+        ),
+    )
+    assert counter_bounds(site) == _BOUNDS
+
+
+def _plant(closes: dict[int, dict[datetime, float]]) -> dict[datetime, float]:
+    return daily_yield(inverter_yields(closes, _BOUNDS))
+
+
 class TestDailyYield:
     def test_a_day_is_measured_from_the_previous_days_close(self) -> None:
-        # An inverter powers down at night, so its first reading of the day
-        # already includes the first daylight hour; only the previous day's
-        # closing counter puts that hour back in the right day.
-        counters = {1: {_day(0): 1_000.0, _day(1): 31_000.0, _day(2): 55_000.0}}
-        assert daily_yield(counters) == {_day(1): 30.0, _day(2): 24.0}
+        # An inverter powers down at night, so its first close of the day
+        # already includes the first daylight hour; only the step from the
+        # previous day's last close puts that hour in the right day.
+        closes = {
+            1: _closes(
+                (0, 19, 1_000),
+                (1, 6, 11_000),
+                (1, 19, 31_000),
+                (2, 6, 40_000),
+                (2, 19, 55_000),
+            )
+        }
+        assert _plant(closes) == pytest.approx({_day(1): 30.0, _day(2): 24.0})
 
     def test_the_inverters_sum(self) -> None:
-        counters = {
-            1: {_day(0): 0.0, _day(1): 20_000.0},
-            2: {_day(0): 5_000.0, _day(1): 17_000.0},
+        closes = {
+            1: _closes((0, 19, 0), (1, 12, 20_000)),
+            2: _closes((0, 19, 5_000), (1, 12, 17_000)),
         }
-        assert daily_yield(counters) == {_day(1): 32.0}
+        assert _plant(closes) == pytest.approx({_day(1): 32.0})
 
     def test_a_day_whose_predecessor_is_missing_is_left_out(self) -> None:
         # Crediting the gap to the day that followed it would invent a
         # record day and hide the outage.
-        counters = {1: {_day(0): 1_000.0, _day(2): 61_000.0, _day(3): 81_000.0}}
-        assert daily_yield(counters) == {_day(3): 20.0}
+        closes = {1: _closes((0, 19, 1_000), (2, 12, 61_000), (3, 12, 81_000))}
+        assert _plant(closes) == pytest.approx({_day(3): 20.0})
 
-    def test_a_counter_reset_floors_at_zero(self) -> None:
-        counters = {1: {_day(0): 900_000.0, _day(1): 2_000.0, _day(2): 22_000.0}}
-        assert daily_yield(counters) == {_day(1): 0.0, _day(2): 20.0}
+    def test_a_counter_reset_never_yields_a_negative_or_a_record_day(self) -> None:
+        closes = {1: _closes((0, 19, 900_000), (1, 12, 2_000), (2, 12, 22_000))}
+        assert _plant(closes) == pytest.approx({_day(1): 0.0, _day(2): 20.0})
 
     def test_one_inverter_missing_a_day_does_not_drop_the_other(self) -> None:
-        counters = {
-            1: {_day(0): 0.0, _day(1): 20_000.0},
-            2: {_day(1): 5_000.0},
+        closes = {
+            1: _closes((0, 19, 0), (1, 12, 20_000)),
+            2: _closes((1, 12, 5_000)),
         }
-        assert daily_yield(counters) == {_day(1): 20.0}
+        assert _plant(closes) == pytest.approx({_day(1): 20.0})
+
+    def test_an_inverter_the_site_does_not_declare_does_not_contribute(self) -> None:
+        # The plant is what the site file says it is: a counter the
+        # aggregate carries for an inverter no plane names is not the
+        # plant's production.
+        closes = {
+            1: _closes((0, 19, 0), (1, 12, 20_000)),
+            3: _closes((0, 19, 0), (1, 12, 9_000)),
+        }
+        assert _plant(closes) == pytest.approx({_day(1): 20.0})
+
+    def test_the_per_inverter_result_carries_its_ignored_steps(self) -> None:
+        closes = {
+            1: _closes((0, 19, 100_000), (1, 12, 90_000), (1, 13, 0), (1, 14, 92_000)),
+            2: _closes((0, 19, 5_000), (1, 12, 17_000)),
+        }
+        yields = inverter_yields(closes, _BOUNDS)
+        assert (yields[1].drops, yields[1].over_bound) == (2, 1)
+        assert (yields[2].drops, yields[2].over_bound) == (0, 0)
+        assert yields[2].kwh == pytest.approx({_day(1): 12.0})
 
 
 class TestJudgedDays:

@@ -53,15 +53,23 @@ in the file and a function here, and nothing else moves.
 
 Whole days, not hours: a cloud passing at noon is not a fault, and the
 counter arithmetic over a full day is exact where an hourly ratio is noise.
-A day is judged only once the aggregate has moved past it — the frontier
-here is the newest *complete* day, so the engine speaks about yesterday and
-never about a day still in progress — and only when enough was expected of
-it for a percentage to mean anything. A day that expected almost nothing
-(deep overcast, or a forecast that never arrived) is unmeasured rather than
-quiet, which is what keeps a dead forecast job from clearing a standing
-fault. Days are UTC days: nothing is produced across a UTC midnight at this
-latitude, so a local day holds the same yield and needs a timezone nobody
-has to agree on.
+The day's production is still read off the hourly closes of each
+inverter's lifetime counter, because that counter is not monotonic — an
+inverter has come back from a reboot 12.8 kWh lower and counted on from
+there — so a day is the sum of the plausible rises between consecutive
+closes, not its last close minus the previous day's: a drop is a re-base,
+a rise past what the plane can physically make in the hours it spans is a
+bogus reading, and neither is production or loss. What a plane can make
+comes from the site file (`site.yaml`, what the house is), never from a
+fault parameter. A day is judged only once the aggregate has moved past
+it — the frontier here is the newest *complete* day, so the engine speaks
+about yesterday and never about a day still in progress — and only when
+enough was expected of it for a percentage to mean anything. A day that
+expected almost nothing (deep overcast, or a forecast that never arrived)
+is unmeasured rather than quiet, which is what keeps a dead forecast job
+from clearing a standing fault. Days are UTC days: nothing is produced
+across a UTC midnight at this latitude, so a local day holds the same
+yield and needs a timezone nobody has to agree on.
 """
 
 from __future__ import annotations
@@ -82,7 +90,7 @@ from .silence import BUCKET, DEAD_MIN_BUCKETS, hourly_averages, like_match, reso
 from .slug import entity_slug
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     import psycopg
     from psycopg.rows import DictRow
@@ -90,6 +98,7 @@ if TYPE_CHECKING:
     from .episode_store import OpenEpisodeRow
     from .faults import Fault, RoomRule
     from .silence import Channel
+    from .site import Site
 
 log = get_logger(__name__)
 
@@ -532,50 +541,113 @@ def yield_frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
     return row["frontier"] if row else None
 
 
-def daily_counters(
-    conn: psycopg.Connection[DictRow], window_start: datetime
+def counter_bounds(site: Site) -> dict[int, float]:
+    """What each declared inverter's counter can physically rise in an hour,
+    in Wh: the peak power of the plane that feeds it. A property of the
+    plant, not of any fault — which is why it comes from the site file and
+    not from a parameter."""
+    return {plane.inverter_id: plane.kwp * 1000.0 for plane in site.planes}
+
+
+def hourly_closes(
+    conn: psycopg.Connection[DictRow], window_start: datetime, inverter_ids: Iterable[int]
 ) -> dict[int, dict[datetime, float]]:
-    """Each inverter's lifetime energy counter, in Wh, as it stood at the
-    close of every day since `window_start`. A counter is exact and cheap
-    where a power integral is neither, and closing readings are all the
-    day's production can be read from."""
+    """Each declared inverter's lifetime energy counter, in Wh, as it stood
+    at the close of every hourly bucket since `window_start`. A counter is
+    exact and cheap where a power integral is neither; hourly and not daily
+    closes, because the counter is not monotonic and only the steps between
+    closes can tell production from a re-base."""
     rows = conn.execute(
         """
-        SELECT time_bucket(INTERVAL '1 day', bucket) AS day,
-               inverter_id,
-               last(energytotal_last, bucket) AS wh
+        SELECT bucket, inverter_id, energytotal_last AS wh
         FROM solaredge_inverter_1h
-        WHERE bucket >= %(start)s AND energytotal_last IS NOT NULL
-        GROUP BY day, inverter_id
-        ORDER BY inverter_id, day
+        WHERE bucket >= %(start)s
+          AND inverter_id = ANY(%(inverters)s)
+          AND energytotal_last IS NOT NULL
+        ORDER BY inverter_id, bucket
         """,
-        {"start": window_start},
+        {"start": window_start, "inverters": list(inverter_ids)},
     ).fetchall()
-    counters: dict[int, dict[datetime, float]] = {}
+    closes: dict[int, dict[datetime, float]] = {}
     for row in rows:
-        counters.setdefault(int(row["inverter_id"]), {})[row["day"]] = float(row["wh"])
-    return counters
+        closes.setdefault(int(row["inverter_id"]), {})[row["bucket"]] = float(row["wh"])
+    return closes
 
 
-def daily_yield(counters: Mapping[int, Mapping[datetime, float]]) -> dict[datetime, float]:
-    """What the plant produced per day, in kWh: every inverter's advance
-    from the *previous* day's closing counter, summed. The previous day's
-    close and not the day's own first reading, because an inverter that
-    powers down at night has no reading until it is already producing —
-    measuring from its own first bucket would lose the first daylight hour
-    of every day. A day whose predecessor is missing has no measurable
-    advance and is left out rather than credited with the whole gap, and a
-    counter reset floors at zero rather than inventing a record day.
+@dataclass(frozen=True, slots=True)
+class InverterYield:
+    """One inverter's hourly counter closes folded: kWh per judged UTC day,
+    and how many steps between closes the fold declined — drops (the
+    counter re-based) and rises past what the plane can physically make
+    (a bogus reading) — so a noisy counter is visible without a query."""
+
+    kwh: Mapping[datetime, float]
+    drops: int
+    over_bound: int
+
+
+def fold_closes(closes: Mapping[datetime, float], bound_wh_per_hour: float) -> InverterYield:
+    """One inverter's production per UTC day, out of its lifetime counter
+    at every hourly close. The counter is not monotonic: an inverter has
+    come back from a reboot 12.8 kWh *lower* and counted on from there, so
+    a day is not its last close minus the previous day's, but the sum of
+    the plausible rises between consecutive closes. Each step is judged on
+    its own: a rise of at most the plane's peak power times the hours the
+    step spans is production, credited to the day of the later close; a
+    drop is a re-base — neither production nor loss — and the next step is
+    measured from the lower value; a rise past the bound is a bogus reading
+    (a 0 followed by the true counter) and is ignored as well.
+
+    A day is judged only if the inverter also closed on the day before: an
+    inverter that powers down at night has no reading until it is already
+    producing, so its first daylight hour lives in the step from the
+    previous day's last close, and a day whose predecessor is missing would
+    be credited with the whole gap.
     """
     energy: dict[datetime, float] = defaultdict(float)
-    measured: set[datetime] = set()
-    for series in counters.values():
-        for previous, day in pairwise(sorted(series)):
-            if day - previous != DAY:
-                continue
-            measured.add(day)
-            energy[day] += max(series[day] - series[previous], 0.0) / 1000.0
-    return {day: energy[day] for day in sorted(measured)}
+    drops = over_bound = 0
+    for (start, before), (end, after) in pairwise(sorted(closes.items())):
+        rise = after - before
+        if rise < 0:
+            drops += 1
+            continue
+        if rise > bound_wh_per_hour * ((end - start) / BUCKET):
+            over_bound += 1
+            continue
+        energy[utc_day(end)] += rise / 1000.0
+    days = {utc_day(moment) for moment in closes}
+    judged = sorted(day for day in days if day - DAY in days)
+    return InverterYield(
+        kwh={day: energy[day] for day in judged}, drops=drops, over_bound=over_bound
+    )
+
+
+def inverter_yields(
+    closes: Mapping[int, Mapping[datetime, float]], bounds: Mapping[int, float]
+) -> dict[int, InverterYield]:
+    """Every declared inverter's closes folded, by inverter id. The plant is
+    what the site file says it is: `bounds` names its inverters with the
+    Wh their counter can rise per hour, and a counter the aggregate carries
+    for an inverter no plane names is not the plant's production. A
+    declared inverter without closes folds to nothing — no judged day, and
+    no step to decline — so a silent plane still shows up in the record.
+    """
+    return {
+        inverter_id: fold_closes(closes.get(inverter_id, {}), bound)
+        for inverter_id, bound in bounds.items()
+    }
+
+
+def daily_yield(yields: Mapping[int, InverterYield]) -> dict[datetime, float]:
+    """What the plant produced per day, in kWh: the inverters' judged days
+    summed. A day one inverter could not judge still counts the others'
+    production, as the per-inverter shape already left that inverter out.
+    """
+    energy: dict[datetime, float] = defaultdict(float)
+    for folded in yields.values():
+        for day, kwh in folded.kwh.items():
+            energy[day] += kwh
+    return {day: energy[day] for day in sorted(energy)}
 
 
 def forecast_curve(
@@ -765,9 +837,13 @@ def measure_yield(
     fault: Fault,
     window: Window,
     _open_rows: Sequence[OpenEpisodeRow],
+    *,
+    site: Site,
 ) -> Measured[YieldState]:
     """The daily-yield shape's whole measurement: what the plant produced
-    per day against what its declared expectation says it should have.
+    per day against what its declared expectation says it should have. The
+    site says which inverters the plant has and what each can make in an
+    hour; the fault says only what counts as short.
     """
     expectation = fault.expectation
     if expectation is None:
@@ -782,8 +858,11 @@ def measure_yield(
     min_shortfall = float(fault.parameters["min_shortfall_pct"])
     min_expected = float(fault.parameters["min_expected_kwh"])
 
+    bounds = counter_bounds(site)
+    closes = hourly_closes(conn, window.start, inverter_ids=bounds.keys())
+    yields = inverter_yields(closes, bounds)
     days = judged_days(
-        daily_yield(daily_counters(conn, window.start)),
+        daily_yield(yields),
         expected_kwh(conn, window.start),
         min_expected_kwh=min_expected,
         frontier=window.frontier,
@@ -804,5 +883,11 @@ def measure_yield(
             "judged_days": len(days),
             "short_days": len(short_days(days, min_shortfall)),
             "short_since": state.short_since.isoformat() if state.short_since else None,
+            # The steps each inverter's counter fold declined: a noisy
+            # counter should be visible in the log without a query.
+            "ignored_steps": {
+                str(inverter_id): {"drops": folded.drops, "over_bound": folded.over_bound}
+                for inverter_id, folded in yields.items()
+            },
         },
     )

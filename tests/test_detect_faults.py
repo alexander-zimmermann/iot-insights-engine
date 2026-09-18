@@ -9,6 +9,7 @@ The SQL and NATS edges stay thin; the cluster smoke test covers them.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from unittest.mock import patch
 
 from iot_insights_engine import (
@@ -44,6 +45,7 @@ from iot_insights_engine.silence import (
     SilenceState,
     plan_run,
 )
+from iot_insights_engine.site import Location, Plane, Site
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
@@ -617,17 +619,27 @@ def _deviation_fault(expectation: DeviationExpectation | None) -> Fault:
     )
 
 
+_SITE = Site(
+    location=Location(latitude=50.62598, longitude=6.02435),
+    timezone="Europe/Berlin",
+    planes=(Plane(key="West", inverter_id=1, tilt=17.0, azimuth=129.0, kwp=6.435),),
+)
+
+
 def test_a_named_expectation_picks_the_daily_yield_shape() -> None:
-    # The one thing that decides which of the kind's two shapes runs.
-    kind = _kind_for(_deviation_fault(DeviationExpectation.FORECAST_SOLAR))
+    # The one thing that decides which of the kind's two shapes runs — and
+    # the shape measures the plant the site file declares.
+    kind = _kind_for(_deviation_fault(DeviationExpectation.FORECAST_SOLAR), _SITE)
     assert kind is not None
-    assert kind.measure is deviation.measure_yield
+    assert isinstance(kind.measure, partial)
+    assert kind.measure.func is deviation.measure_yield
+    assert kind.measure.keywords == {"site": _SITE}
     assert kind.frontier is deviation.yield_frontier
     assert kind.policy.bucket == deviation.DAY
 
 
 def test_a_deviation_without_an_expectation_stays_the_room_shape() -> None:
-    kind = _kind_for(_deviation_fault(None))
+    kind = _kind_for(_deviation_fault(None), _SITE)
     assert kind is not None
     assert kind.measure is deviation.measure
     assert kind.policy.bucket == timedelta(hours=1)
@@ -642,7 +654,8 @@ def test_the_silence_kind_stamps_with_its_own_fingerprint() -> None:
             kind=MeasurementKind.SILENCE,
             parameters={"gap_factor": 5, "gap_quantile": 0.95},
             target=Target(per_main_group=True),
-        )
+        ),
+        _SITE,
     )
     assert kind is not None
     assert kind.fingerprint is silence.fingerprint
@@ -657,7 +670,8 @@ def test_a_constancy_fault_runs_the_per_main_group_shape() -> None:
             kind=MeasurementKind.CONSTANCY,
             parameters={"constant_hours": 48, "same_within": 0},
             target=Target(per_main_group=True),
-        )
+        ),
+        _SITE,
     )
     assert kind is not None
     assert kind.measure is constancy.measure

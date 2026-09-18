@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ from .runner import (
     NatsPublisher,
     run_subjects,
 )
+from .site import Site
 
 log = get_logger(__name__)
 
@@ -155,18 +157,22 @@ _KINDS: Mapping[MeasurementKind, Kind[Any, Any]] = {
 }
 
 
-# The deviation kind's other shape: a fault that names an expectation
-# measures the plant's whole-day yield against it, in daily buckets, on the
-# plant's one declared address.
-_DAILY_YIELD: Kind[Any, Any] = Kind(
-    event="daily_yield_run",
-    delivery="ga",
-    frontier=deviation.yield_frontier,
-    measure=deviation.measure_yield,
-    publish_for=deviation.publish_for_plant,
-    payload=deviation.payload_yield,
-    policy=deviation.YIELD_POLICY,
-)
+def _daily_yield(site: Site) -> Kind[Any, Any]:
+    """The deviation kind's other shape: a fault that names an expectation
+    measures the plant's whole-day yield against it, in daily buckets, on
+    the plant's one declared address. The plant is what the site file
+    declares — which inverters, and what each can make in an hour — so the
+    shape is built around the loaded site rather than declared once.
+    """
+    return Kind(
+        event="daily_yield_run",
+        delivery="ga",
+        frontier=deviation.yield_frontier,
+        measure=partial(deviation.measure_yield, site=site),
+        publish_for=deviation.publish_for_plant,
+        payload=deviation.payload_yield,
+        policy=deviation.YIELD_POLICY,
+    )
 
 
 # The drift kind runs one shape per signal: same CUSUM, different series,
@@ -208,6 +214,7 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     args = parser.parse_args(argv)
 
     fault_list = FaultList.load(Path(settings.faults_file))
+    site = Site.load(Path(settings.site_file))
     for fault in fault_list:
         if fault.dormant is not None:
             log.info("fault_dormant", fault=fault.name, active_when=fault.dormant.active_when)
@@ -218,7 +225,7 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
         # the rest of the list — the volume watchdog last of all — still
         # runs. The job still exits non-zero, so the CronJob shows it.
         try:
-            _run_fault(settings, fault, dry_run=args.dry_run)
+            _run_fault(settings, fault, site, dry_run=args.dry_run)
         except Exception:
             log.exception("fault_run_failed", fault=fault.name, kind=str(fault.kind))
             failed.append(fault.name)
@@ -228,25 +235,25 @@ def run(settings: Settings, argv: Sequence[str]) -> int:
     return 0
 
 
-def _kind_for(fault: Fault) -> Kind[Any, Any] | None:
+def _kind_for(fault: Fault, site: Site) -> Kind[Any, Any] | None:
     """The shape this fault runs in, if it has one. Drift picks it by the
     signal the file declares — the loader rejects one without, so a fault
     that got here signalless is a new kind of drift nobody wired up, and it
     fails rather than reporting nothing. Deviation picks it by whether the
-    fault names an expectation: with one it measures a daily yield against
-    that model, without one a room against its setpoint.
+    fault names an expectation: with one it measures the declared site's
+    daily yield against that model, without one a room against its setpoint.
     """
     if fault.kind is MeasurementKind.DRIFT:
         if fault.signal is None:
             raise ValueError(f"fault {fault.name}: a drift fault declares which series it walks")
         return _DRIFT_SIGNALS[fault.signal]
     if fault.kind is MeasurementKind.DEVIATION and fault.expectation is not None:
-        return _DAILY_YIELD
+        return _daily_yield(site)
     return _KINDS.get(fault.kind)
 
 
-def _run_fault(settings: Settings, fault: Fault, *, dry_run: bool) -> None:
-    kind = _kind_for(fault)
+def _run_fault(settings: Settings, fault: Fault, site: Site, *, dry_run: bool) -> None:
+    kind = _kind_for(fault, site)
     if kind is None:
         # Arrives with its own ticket; a declared fault must not fail
         # the ones already running.

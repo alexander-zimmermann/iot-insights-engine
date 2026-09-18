@@ -18,6 +18,16 @@ A **dormant** fault loads fully but is excluded from the schedule: it
 declares why it cannot run yet and the observable condition under which it
 starts to.
 
+## Site
+
+What the house is, declared once in `site.yaml` beside the fault list:
+where it stands, the timezone its days are counted in, and its PV
+**planes** — each keyed by name (`West`, `Ost`) with the inverter it
+feeds, its orientation and its peak power. The fault list says what
+counts as wrong; the site says what is there, so a fact about the plant
+(which inverters, how much a counter can rise in an hour) is never a
+fault parameter.
+
 ## Fingerprint
 
 The rule a fault measures by — its kind, with the signal or expectation

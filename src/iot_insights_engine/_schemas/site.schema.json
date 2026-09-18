@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alexander-zimmermann/iot-insights-engine/schemas/site.schema.json",
+  "title": "Site",
+  "description": "Declares what the house is: where it stands, which timezone its days are counted in, and the PV planes with the inverter each of them feeds. The fault list says what counts as wrong; this file only says what is there.",
+  "type": "object",
+  "properties": {
+    "location": {
+      "type": "object",
+      "properties": {
+        "latitude":  { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 }
+      },
+      "required": ["latitude", "longitude"],
+      "additionalProperties": false
+    },
+    "timezone": { "type": "string", "minLength": 1 },
+    "pv": {
+      "type": "object",
+      "properties": {
+        "planes": {
+          "$comment": "Keyed by the plane's name as the anomaly addresses carry it (West, Ost): the key travels into payloads and writer rules unchanged.",
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9-]*$" },
+          "additionalProperties": { "$ref": "#/$defs/plane" }
+        }
+      },
+      "required": ["planes"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["location", "timezone", "pv"],
+  "additionalProperties": false,
+  "$defs": {
+    "plane": {
+      "type": "object",
+      "properties": {
+        "inverter_id": { "type": "integer", "minimum": 1 },
+        "tilt":        { "type": "number", "minimum": 0, "maximum": 90 },
+        "azimuth":     {
+          "$comment": "Open-Meteo convention, the one forecast.solar uses too: 0 south, negative east, positive west.",
+          "type": "number", "minimum": -180, "maximum": 180
+        },
+        "kwp":         { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "required": ["inverter_id", "tilt", "azimuth", "kwp"],
+      "additionalProperties": false
+    }
+  }
+}

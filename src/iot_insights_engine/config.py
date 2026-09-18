@@ -37,8 +37,10 @@ class Settings(BaseSettings):
     db_write_username_file: str | None = None
     db_write_password_file: str | None = None
 
-    # Fault list (mounted from the lares ConfigMap) for the detect-faults job.
+    # Fault list and site file (mounted from the lares ConfigMap) for the
+    # detect-faults job: what counts as wrong, and what the house is.
     faults_file: str = "/etc/iot-insights-engine/faults.yaml"
+    site_file: str = "/etc/iot-insights-engine/site.yaml"
 
     # NATS — jobs publish their results on `forecast.pv.*` / `energy.pv.*`.
     nats_servers: str | None = None
