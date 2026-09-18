@@ -97,8 +97,11 @@ same ConfigMap and mounted at `MCP_SITE_FILE`, says what the house is:
 `kwp`. The daily-yield shape reads the plant off it — which inverters
 count, and the most each counter can rise in an hour — so a counter that
 re-bases or reports a 0 is told from production without a fault
-parameter. The loader ([site.py](src/iot_insights_engine/site.py))
-validates it the same way the fault list is validated.
+parameter. The forecast jobs still take location and planes from their
+`MCP_FORECAST_*` environment; moving them onto the site file is the site
+build item of the PV-underperformance map. The loader
+([site.py](src/iot_insights_engine/site.py)) validates the file the same
+way the fault list is validated.
 
 ### Measurement kinds
 

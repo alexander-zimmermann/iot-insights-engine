@@ -28,12 +28,11 @@ from iot_insights_engine.deviation import (
     classify,
     classify_yield,
     cold_buckets,
-    counter_bounds,
+    credit_rises,
     daily_energy,
     daily_yield,
     dead_value_gas,
     deviation_observations,
-    fold_closes,
     inverter_yields,
     judged_days,
     payload_yield,
@@ -46,7 +45,7 @@ from iot_insights_engine.deviation import (
 from iot_insights_engine.episodes import EpisodePolicy, fold_observations
 from iot_insights_engine.faults import DeviationExpectation, Roles, RoomRule
 from iot_insights_engine.silence import Channel
-from iot_insights_engine.site import Location, Plane, Site
+from iot_insights_engine.site import Plane
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)
@@ -484,7 +483,7 @@ def _closes(*points: tuple[int, int, float]) -> dict[datetime, float]:
 _WEST_BOUND = 6_435.0
 
 
-class TestFoldCloses:
+class TestCreditRises:
     def test_a_counter_that_drops_late_in_the_day_keeps_the_day_and_the_next(self) -> None:
         # The west inverter on 2026-09-05..07: it rose to 6 254 382 Wh by
         # 19:00 on the 6th, came back 12 762 Wh *lower* in the 20:00 bucket
@@ -504,10 +503,10 @@ class TestFoldCloses:
             (2, 13, 6_253_028),
             (2, 19, 6_258_027),
         )
-        folded = fold_closes(closes, _WEST_BOUND)
-        assert folded.kwh == pytest.approx({_day(1): 16.846, _day(2): 16.407})
-        assert folded.drops == 1
-        assert folded.over_bound == 0
+        west = credit_rises(closes, _WEST_BOUND)
+        assert west.kwh == pytest.approx({_day(1): 16.846, _day(2): 16.407})
+        assert west.drops == 1
+        assert west.over_bound == 0
 
     def test_a_zero_between_two_true_readings_credits_neither_step(self) -> None:
         # A bucket that closed on a 0 is a bogus reading: the step down to
@@ -521,10 +520,10 @@ class TestFoldCloses:
             (1, 11, 108_000),
             (1, 12, 110_000),
         )
-        folded = fold_closes(closes, _WEST_BOUND)
-        assert folded.kwh == pytest.approx({_day(1): 6.0})
-        assert folded.drops == 1
-        assert folded.over_bound == 1
+        credited = credit_rises(closes, _WEST_BOUND)
+        assert credited.kwh == pytest.approx({_day(1): 6.0})
+        assert credited.drops == 1
+        assert credited.over_bound == 1
 
     def test_a_rise_up_to_the_bound_over_a_gap_is_credited_and_one_past_it_is_not(
         self,
@@ -534,30 +533,23 @@ class TestFoldCloses:
         # rise, and one rise more than the plane can make in that time is a
         # bogus reading.
         at_bound = _closes((0, 19, 100_000), (1, 9, 100_000), (1, 12, 100_000 + 3 * 6_435))
-        assert fold_closes(at_bound, _WEST_BOUND).kwh == pytest.approx({_day(1): 19.305})
+        assert credit_rises(at_bound, _WEST_BOUND).kwh == pytest.approx({_day(1): 19.305})
         past_bound = _closes((0, 19, 100_000), (1, 9, 100_000), (1, 12, 100_001 + 3 * 6_435))
-        folded = fold_closes(past_bound, _WEST_BOUND)
-        assert folded.kwh == pytest.approx({_day(1): 0.0})
-        assert folded.over_bound == 1
+        credited = credit_rises(past_bound, _WEST_BOUND)
+        assert credited.kwh == pytest.approx({_day(1): 0.0})
+        assert credited.over_bound == 1
 
 
-_BOUNDS = {1: _WEST_BOUND, 2: 6_175.0}
-
-
-def test_the_bound_is_the_planes_peak_power_per_hour() -> None:
-    site = Site(
-        location=Location(latitude=50.62598, longitude=6.02435),
-        timezone="Europe/Berlin",
-        planes=(
-            Plane(key="West", inverter_id=1, tilt=17.0, azimuth=129.0, kwp=6.435),
-            Plane(key="Ost", inverter_id=2, tilt=17.0, azimuth=-51.0, kwp=6.175),
-        ),
-    )
-    assert counter_bounds(site) == _BOUNDS
+# The two planes as the site file declares them: the bound per inverter
+# is the plane's kWp, as Wh per hour.
+_PLANES = (
+    Plane(key="West", inverter_id=1, tilt=17.0, azimuth=129.0, kwp=6.435),
+    Plane(key="Ost", inverter_id=2, tilt=17.0, azimuth=-51.0, kwp=6.175),
+)
 
 
 def _plant(closes: dict[int, dict[datetime, float]]) -> dict[datetime, float]:
-    return daily_yield(inverter_yields(closes, _BOUNDS))
+    return daily_yield(inverter_yields(closes, _PLANES))
 
 
 class TestDailyYield:
@@ -615,7 +607,7 @@ class TestDailyYield:
             1: _closes((0, 19, 100_000), (1, 12, 90_000), (1, 13, 0), (1, 14, 92_000)),
             2: _closes((0, 19, 5_000), (1, 12, 17_000)),
         }
-        yields = inverter_yields(closes, _BOUNDS)
+        yields = inverter_yields(closes, _PLANES)
         assert (yields[1].drops, yields[1].over_bound) == (2, 1)
         assert (yields[2].drops, yields[2].over_bound) == (0, 0)
         assert yields[2].kwh == pytest.approx({_day(1): 12.0})

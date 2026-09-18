@@ -14,16 +14,16 @@ A plane is keyed by its name as the anomaly addresses carry it (`West`,
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import jsonschema
-import yaml
+from .declared import SCHEMAS, load_declared
 
-_SCHEMA_PATH = Path(__file__).resolve().parent / "_schemas" / "site.schema.json"
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_SCHEMA_PATH = SCHEMAS / "site.schema.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,22 +54,9 @@ class Site:
 
     @classmethod
     def load(cls, path: Path) -> Site:
-        raw_text = path.read_text(encoding="utf-8")
-        data: Any = yaml.safe_load(raw_text) or {}
-        if not isinstance(data, dict):
-            raise ValueError(
-                f"{path}: expected a mapping at the top level, got {type(data).__name__}"
-            )
+        data = load_declared(path, _SCHEMA_PATH)
 
-        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-        validator = jsonschema.Draft202012Validator(schema)
-        error = jsonschema.exceptions.best_match(validator.iter_errors(data))
-        if error is not None:
-            field = ".".join(str(p) for p in error.absolute_path)
-            prefix = f"{field}: " if field else ""
-            raise ValueError(f"{path}: {prefix}{error.message}") from error
-
-        timezone = str(data["timezone"])
+        timezone = data["timezone"]
         try:
             ZoneInfo(timezone)
         except ZoneInfoNotFoundError as exc:
@@ -78,10 +65,10 @@ class Site:
         planes = tuple(
             Plane(
                 key=key,
-                inverter_id=int(raw["inverter_id"]),
-                tilt=float(raw["tilt"]),
-                azimuth=float(raw["azimuth"]),
-                kwp=float(raw["kwp"]),
+                inverter_id=raw["inverter_id"],
+                tilt=raw["tilt"],
+                azimuth=raw["azimuth"],
+                kwp=raw["kwp"],
             )
             for key, raw in data["pv"]["planes"].items()
         )
@@ -97,8 +84,8 @@ class Site:
             by_inverter[plane.inverter_id] = plane
         return cls(
             location=Location(
-                latitude=float(data["location"]["latitude"]),
-                longitude=float(data["location"]["longitude"]),
+                latitude=data["location"]["latitude"],
+                longitude=data["location"]["longitude"],
             ),
             timezone=timezone,
             planes=planes,

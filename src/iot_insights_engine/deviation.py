@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     from .episode_store import OpenEpisodeRow
     from .faults import Fault, RoomRule
     from .silence import Channel
-    from .site import Site
+    from .site import Plane, Site
 
 log = get_logger(__name__)
 
@@ -541,14 +541,6 @@ def yield_frontier(conn: psycopg.Connection[DictRow]) -> datetime | None:
     return row["frontier"] if row else None
 
 
-def counter_bounds(site: Site) -> dict[int, float]:
-    """What each declared inverter's counter can physically rise in an hour,
-    in Wh: the peak power of the plane that feeds it. A property of the
-    plant, not of any fault — which is why it comes from the site file and
-    not from a parameter."""
-    return {plane.inverter_id: plane.kwp * 1000.0 for plane in site.planes}
-
-
 def hourly_closes(
     conn: psycopg.Connection[DictRow], window_start: datetime, inverter_ids: Iterable[int]
 ) -> dict[int, dict[datetime, float]]:
@@ -576,17 +568,18 @@ def hourly_closes(
 
 @dataclass(frozen=True, slots=True)
 class InverterYield:
-    """One inverter's hourly counter closes folded: kWh per judged UTC day,
-    and how many steps between closes the fold declined — drops (the
-    counter re-based) and rises past what the plane can physically make
-    (a bogus reading) — so a noisy counter is visible without a query."""
+    """One inverter's production, credited from its hourly counter closes:
+    kWh per judged UTC day, and how many steps between closes were
+    declined — drops (the counter re-based) and rises past what the plane
+    can physically make (a bogus reading) — so a noisy counter is visible
+    without a query."""
 
     kwh: Mapping[datetime, float]
     drops: int
     over_bound: int
 
 
-def fold_closes(closes: Mapping[datetime, float], bound_wh_per_hour: float) -> InverterYield:
+def credit_rises(closes: Mapping[datetime, float], bound_wh_per_hour: float) -> InverterYield:
     """One inverter's production per UTC day, out of its lifetime counter
     at every hourly close. The counter is not monotonic: an inverter has
     come back from a reboot 12.8 kWh *lower* and counted on from there, so
@@ -596,7 +589,7 @@ def fold_closes(closes: Mapping[datetime, float], bound_wh_per_hour: float) -> I
     step spans is production, credited to the day of the later close; a
     drop is a re-base — neither production nor loss — and the next step is
     measured from the lower value; a rise past the bound is a bogus reading
-    (a 0 followed by the true counter) and is ignored as well.
+    (a 0 followed by the true counter) and is declined as well.
 
     A day is judged only if the inverter also closed on the day before: an
     inverter that powers down at night has no reading until it is already
@@ -623,18 +616,19 @@ def fold_closes(closes: Mapping[datetime, float], bound_wh_per_hour: float) -> I
 
 
 def inverter_yields(
-    closes: Mapping[int, Mapping[datetime, float]], bounds: Mapping[int, float]
+    closes: Mapping[int, Mapping[datetime, float]], planes: Iterable[Plane]
 ) -> dict[int, InverterYield]:
-    """Every declared inverter's closes folded, by inverter id. The plant is
-    what the site file says it is: `bounds` names its inverters with the
-    Wh their counter can rise per hour, and a counter the aggregate carries
-    for an inverter no plane names is not the plant's production. A
-    declared inverter without closes folds to nothing — no judged day, and
-    no step to decline — so a silent plane still shows up in the record.
+    """Every declared inverter's production, by inverter id. The plant is
+    what the site file says it is: each plane names the inverter it feeds
+    and, in its kWp, the most that inverter's counter can rise in an hour —
+    a property of the plant, never a fault parameter. A counter the
+    aggregate carries for an inverter no plane names is not the plant's
+    production, and a declared inverter without closes has no judged day
+    and no declined step, so a silent plane still shows up in the record.
     """
     return {
-        inverter_id: fold_closes(closes.get(inverter_id, {}), bound)
-        for inverter_id, bound in bounds.items()
+        plane.inverter_id: credit_rises(closes.get(plane.inverter_id, {}), plane.kwp * 1000.0)
+        for plane in planes
     }
 
 
@@ -644,8 +638,8 @@ def daily_yield(yields: Mapping[int, InverterYield]) -> dict[datetime, float]:
     production, as the per-inverter shape already left that inverter out.
     """
     energy: dict[datetime, float] = defaultdict(float)
-    for folded in yields.values():
-        for day, kwh in folded.kwh.items():
+    for inverter in yields.values():
+        for day, kwh in inverter.kwh.items():
             energy[day] += kwh
     return {day: energy[day] for day in sorted(energy)}
 
@@ -858,9 +852,8 @@ def measure_yield(
     min_shortfall = float(fault.parameters["min_shortfall_pct"])
     min_expected = float(fault.parameters["min_expected_kwh"])
 
-    bounds = counter_bounds(site)
-    closes = hourly_closes(conn, window.start, inverter_ids=bounds.keys())
-    yields = inverter_yields(closes, bounds)
+    closes = hourly_closes(conn, window.start, [plane.inverter_id for plane in site.planes])
+    yields = inverter_yields(closes, site.planes)
     days = judged_days(
         daily_yield(yields),
         expected_kwh(conn, window.start),
@@ -883,11 +876,11 @@ def measure_yield(
             "judged_days": len(days),
             "short_days": len(short_days(days, min_shortfall)),
             "short_since": state.short_since.isoformat() if state.short_since else None,
-            # The steps each inverter's counter fold declined: a noisy
-            # counter should be visible in the log without a query.
+            # The steps declined per inverter: a noisy counter should be
+            # visible in the log without a query.
             "ignored_steps": {
-                str(inverter_id): {"drops": folded.drops, "over_bound": folded.over_bound}
-                for inverter_id, folded in yields.items()
+                str(inverter_id): {"drops": inverter.drops, "over_bound": inverter.over_bound}
+                for inverter_id, inverter in yields.items()
             },
         },
     )

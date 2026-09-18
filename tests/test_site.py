@@ -5,11 +5,13 @@ typed site, or a load error naming the field.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import jsonschema
 import pytest
 
-from iot_insights_engine.site import Location, Plane, Site
+from iot_insights_engine.site import _SCHEMA_PATH, Location, Plane, Site
 
 # The shape the lares site file uses: the two roof planes with the inverter
 # each of them feeds, in the Open-Meteo azimuth convention.
@@ -90,3 +92,8 @@ def test_site_is_frozen(tmp_path: Path) -> None:
     site = Site.load(_write(tmp_path, _VALID))
     with pytest.raises(AttributeError):
         site.timezone = "UTC"  # type: ignore[misc]
+
+
+def test_bundled_schema_is_valid() -> None:
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
