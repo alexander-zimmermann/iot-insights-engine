@@ -50,8 +50,9 @@ async def _publish_async(settings: Settings, subject: str, payload: dict[str, An
 
 
 def publish(settings: Settings, subject: str, payload: dict[str, Any]) -> None:
-    """Synchronous wrapper — each job invocation publishes a handful of
-    events, so we open/close per call rather than wiring an event loop."""
+    """Synchronous wrapper — a job invocation publishes a handful of
+    messages (the moved subjects, and the episode events the run recorded),
+    so we open/close per call rather than wiring an event loop."""
     asyncio.run(_publish_async(settings, subject, payload))
 
 
@@ -91,14 +92,9 @@ def publish_anomaly(
 
 
 def publish_episode_event(settings: Settings, event: EpisodeEvent) -> None:
-    """Publish one episode event on `episode.<kind>` — appeared, escalated
-    or ended. `ended` goes out like the others so the stream is complete and
-    a consumer filters rather than guessing what it missed.
-
-    The payload is a pointer, not a report: which episode, of which fault,
-    on which channel, at which tier and when. The sentence, the parameters
-    and the evidence are fetched from the episode the id names — the one
-    place they cannot go stale.
+    """Publish one `EpisodeEvent` as the pointer it is, on `episode.<kind>`.
+    `ended` goes out like the others so the stream is complete and a
+    consumer filters rather than guessing what it missed.
     """
     publish(
         settings,

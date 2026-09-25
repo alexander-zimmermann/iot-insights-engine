@@ -135,7 +135,10 @@ def apply(
         ).fetchone()
         if inserted is None:  # INSERT … RETURNING always yields the row
             raise RuntimeError(f"episode insert for {episode.subject} returned no id")
-        recorded += _write_details(conn, inserted["id"], fault_name, episode)
+        _write_evidence(conn, inserted["id"], episode)
+        recorded += _record_events(
+            conn, inserted["id"], fault_name, episode.subject, episode.events
+        )
     for episode_id, episode in updates:
         conn.execute(
             """
@@ -156,7 +159,10 @@ def apply(
                 "fingerprint": fingerprint,
             },
         )
-        recorded += _write_details(conn, episode_id, fault_name, episode)
+        _write_evidence(conn, episode_id, episode)
+        recorded += _record_events(
+            conn, episode_id, fault_name, episode.subject, episode.events
+        )
     for episode_id, ended_at in orphan_closes:
         # The subject comes back off the close: the plan carries only the
         # row id, and the pointer on the bus names the channel.
@@ -176,15 +182,10 @@ def apply(
     return tuple(recorded)
 
 
-def _write_details(
-    conn: psycopg.Connection[DictRow],
-    episode_id: int,
-    fault_name: str,
-    episode: Episode,
-) -> list[EpisodeEvent]:
-    """The episode's evidence and its notification events under the row,
-    and back the events that were not there before.
-    """
+def _write_evidence(
+    conn: psycopg.Connection[DictRow], episode_id: int, episode: Episode
+) -> None:
+    """The episode's per-bucket evidence rows under its own row."""
     with conn.cursor() as cur:
         cur.executemany(
             """
@@ -203,7 +204,6 @@ def _write_details(
                 for row in episode.evidence
             ],
         )
-    return _record_events(conn, episode_id, fault_name, episode.subject, episode.events)
 
 
 def _record_events(

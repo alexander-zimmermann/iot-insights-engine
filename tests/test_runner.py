@@ -465,3 +465,22 @@ def test_a_fault_that_is_not_explained_keeps_its_episode_events_off_the_bus() ->
     assert events == ["read", "publish", "apply"]
     assert publisher.episode_events == []
     assert len(publisher.published) == 1
+
+
+def test_a_pointer_that_cannot_be_published_fails_the_run() -> None:
+    # The rows are written by then, so a later run's conflict clause filters
+    # the event away rather than offering it again: the event is lost, and
+    # the run says so instead of reporting a clean pass.
+    events: list[str] = []
+    store = _Store(events, recorded=(_APPEARED,))
+
+    class _DeadBus(_Publisher):
+        def publish_episode_event(self, _event: EpisodeEvent) -> None:
+            raise ConnectionError("no route to nats")
+
+    publisher = _DeadBus(events)
+    with pytest.raises(ConnectionError):
+        run_subjects(store, publisher, _fault(), _kind(observations=_FIRING), dry_run=False)
+
+    assert store.applied is not None  # the write went through first
+    assert publisher.episode_events == []

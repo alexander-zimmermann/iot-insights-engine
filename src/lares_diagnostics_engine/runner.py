@@ -288,13 +288,29 @@ def publish_subjects[P: SubjectPublish](
         )
 
 
-def publish_episode_events(publisher: Publisher, events: Iterable[EpisodeEvent]) -> None:
-    """One pointer per episode event, on `episode.<kind>`: what happened to
-    which episode, for whoever explains it. Never the evidence — that is
-    fetched from the episode the pointer names.
+def publish_episode_events(
+    publisher: Publisher, fault: Fault, events: Iterable[EpisodeEvent]
+) -> None:
+    """One pointer per recorded episode event, on `episode.<kind>` — for a
+    fault declared `explain`, and for nothing else.
+
+    A failure here is a loss, not a delay: the rows are already written, so
+    every later run's conflict clause filters the event away rather than
+    offering it again. It is named before the run fails on it.
     """
+    if not fault.explain:
+        return
     for event in events:
-        publisher.publish_episode_event(event)
+        try:
+            publisher.publish_episode_event(event)
+        except Exception:
+            log.exception(
+                "episode_event_lost",
+                fault=fault.name,
+                episode=event.episode_id,
+                kind=str(event.kind),
+            )
+            raise
 
 
 def run_subjects[S, P: SubjectPublish](
@@ -378,8 +394,7 @@ def run_subjects[S, P: SubjectPublish](
         fingerprint=fingerprint,
         externally_delivered=kind.externally_delivered,
     )
-    if fault.explain:
-        publish_episode_events(publisher, recorded)
+    publish_episode_events(publisher, fault, recorded)
 
 
 def _plan_for[S, P: SubjectPublish](
