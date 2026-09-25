@@ -19,6 +19,12 @@ A **dormant** fault loads fully but is excluded from the schedule: it
 declares why it cannot run yet and the observable condition under which it
 starts to.
 
+A fault also declares whether it is **explained**: whether its episode
+events go on the bus for an agent to pick up. On by default for every kind
+the engine measures itself, off for `external` — Basalte detected that one
+and its own sentence already is the explanation — and overridable per
+fault with one line.
+
 ## Site
 
 What the house is, declared in `site.yaml` beside the fault list: where
@@ -103,6 +109,23 @@ the per-bucket evidence rows that formed it and at most three
 only stored artifact — everything else is recomputed from history on every
 run, so a redeploy cannot corrupt or lose state.
 
+## Episode event
+
+One of an episode's three notification events — appearing, escalating,
+ending — as it reached a row, which is what gives it an episode id and
+says it is new. Each one the write records leaves the engine as a message
+on `episode.<kind>`, for every fault declared explained: `episode_id`,
+`fault`, `subject` (the episode's own subject column — the channel, device
+or room the fault was measured on), `severity`, `kind` and `time`.
+`ended` goes out like the others so the stream is complete and a consumer
+filters rather than guessing what it missed.
+
+The payload is a **pointer**, never a report: the sentence, the parameters
+and the evidence are fetched from the episode the id names, the one place
+they cannot go stale. An event an earlier run already recorded is never
+announced twice, so an hourly recompute of a month-old episode stays
+silent.
+
 ## Fold
 
 Turning repeated observations into episodes: the pure seam
@@ -168,4 +191,6 @@ kind's own cadence, reconciliation, run record, dry-run gating, and the
 publish-before-write tail. It touches the world through two injected ends, the **store** and
 the **publisher**, so those guarantees are testable through fakes.
 Publishes go out before the database writes: a failed run then repeats the
-same publish instead of losing it behind an already-updated database.
+same publish instead of losing it behind an already-updated database. The
+episode events are the one thing published *after* it, because the row is
+what gives an event its id and what says it is new.

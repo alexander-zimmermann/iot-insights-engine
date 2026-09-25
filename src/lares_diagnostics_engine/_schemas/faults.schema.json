@@ -32,6 +32,7 @@
         "references": { "$ref": "#/$defs/references" },
         "roles":      { "oneOf": [ { "$ref": "#/$defs/roles" }, { "$ref": "#/$defs/exchangerRoles" } ] },
         "rooms":      { "$ref": "#/$defs/rooms" },
+        "explain":    { "type": "boolean" },
         "scope":      { "$ref": "#/$defs/scope" },
         "target":     { "$ref": "#/$defs/target" },
         "dormant":    { "$ref": "#/$defs/dormant" }

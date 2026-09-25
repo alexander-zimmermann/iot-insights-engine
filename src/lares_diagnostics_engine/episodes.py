@@ -12,7 +12,8 @@ quiet runs, never at the first, so a flickering fault stays one incident.
 Each episode emits at most three notification events: appearing, escalating,
 ending. The escalation budget spends at the first rise; later worsening
 rides the severity written to the bus, never a new notification. The numeric
-tiers are the delivery contract in `severity`.
+tiers are the delivery contract in `severity`. An event that reached a row
+becomes an `EpisodeEvent`, the pointer the bus carries.
 """
 
 from __future__ import annotations
@@ -103,6 +104,23 @@ class EvidenceRow:
 
 @dataclass(frozen=True, slots=True)
 class NotificationEvent:
+    kind: EventKind
+    time: datetime
+    severity: int
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeEvent:
+    """A notification event as the database recorded it: the row's own id and
+    the fault and subject it belongs to, beside the event. That is what makes
+    it addressable from outside the engine, and it is exactly what goes on
+    `episode.<kind>` — a pointer, never the evidence. Whoever wants the
+    sentence, the parameters or the observations fetches the episode by id.
+    """
+
+    episode_id: int
+    fault: str
+    subject: str
     kind: EventKind
     time: datetime
     severity: int

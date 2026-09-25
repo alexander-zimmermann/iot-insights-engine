@@ -1432,3 +1432,39 @@ def test_measuring_kinds_still_require_a_scope(tmp_path: Path) -> None:
 def test_bundled_schema_is_valid() -> None:
     schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
+
+
+def test_a_measured_fault_is_explained_unless_it_says_otherwise(tmp_path: Path) -> None:
+    # `explain` decides whether an episode event of this fault reaches the
+    # bus at all. On by default for everything the engine measures itself:
+    # nobody has said what is wrong yet, which is the whole reason to ask.
+    faults = FaultList.load(_write(tmp_path, _VALID))
+    assert faults.get("channel_silence").explain is True
+    assert faults.get("appliance_standby").explain is True
+
+
+def test_every_measured_kind_defaults_to_explained(tmp_path: Path) -> None:
+    for body in (_CONSTANCY, _DURATION, _DRIFT, _RECOVERY, _DEVIATION, _EXPECTATION, _VOLUME):
+        for fault in FaultList.load(_write(tmp_path, body)):
+            assert fault.explain is True, f"{fault.name} ({fault.kind})"
+
+
+def test_an_external_fault_is_not_explained_by_default(tmp_path: Path) -> None:
+    # Basalte detected it and its own sentence is the explanation; a second
+    # one would say the same thing twice.
+    [fault] = FaultList.load(_write(tmp_path, _EXTERNAL))
+    assert fault.explain is False
+
+
+def test_a_fault_overrides_the_default_with_one_line(tmp_path: Path) -> None:
+    quiet = FaultList.load(_write(tmp_path, _VOLUME.rstrip() + "\n    explain: false\n"))
+    assert quiet.get("notification_volume").explain is False
+
+    loud = FaultList.load(_write(tmp_path, _EXTERNAL.rstrip() + "\n    explain: true\n"))
+    assert loud.get("system_pressure_low").explain is True
+
+
+def test_a_non_boolean_explain_names_fault_and_field(tmp_path: Path) -> None:
+    path = _write(tmp_path, _VOLUME.rstrip() + "\n    explain: sometimes\n")
+    with pytest.raises(ValueError, match=r"'notification_volume'.*explain"):
+        FaultList.load(path)
