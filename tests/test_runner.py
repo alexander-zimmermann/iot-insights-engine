@@ -16,11 +16,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import Episode, EpisodePolicy, Observation
-from iot_insights_engine.faults import Fault, MeasurementKind, Target
-from iot_insights_engine.reconcile import Measured, Plan, Window
-from iot_insights_engine.runner import LOOKBACK, Kind, run_subjects
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import Episode, EpisodePolicy, Observation
+from lares_diagnostics_engine.faults import Fault, MeasurementKind, Target
+from lares_diagnostics_engine.reconcile import Measured, Plan, Window
+from lares_diagnostics_engine.runner import LOOKBACK, Kind, run_subjects
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence

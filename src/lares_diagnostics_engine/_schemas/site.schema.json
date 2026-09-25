@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/alexander-zimmermann/iot-insights-engine/schemas/site.schema.json",
+  "$id": "https://github.com/alexander-zimmermann/lares-diagnostics-engine/schemas/site.schema.json",
   "title": "Site",
   "description": "Declares what the house is: where it stands, which timezone its days are counted in, and the PV planes with the inverter each of them feeds. The fault list says what counts as wrong; this file only says what is there.",
   "type": "object",

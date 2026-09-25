@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from iot_insights_engine.deviation import (
+from lares_diagnostics_engine.deviation import (
     DAY,
     PLANT,
     YIELD_POLICY,
@@ -42,10 +42,10 @@ from iot_insights_engine.deviation import (
     room_series,
     yield_observations,
 )
-from iot_insights_engine.episodes import EpisodePolicy, fold_observations
-from iot_insights_engine.faults import DeviationExpectation, Roles, RoomRule
-from iot_insights_engine.silence import Channel
-from iot_insights_engine.site import Plane
+from lares_diagnostics_engine.episodes import EpisodePolicy, fold_observations
+from lares_diagnostics_engine.faults import DeviationExpectation, Roles, RoomRule
+from lares_diagnostics_engine.silence import Channel
+from lares_diagnostics_engine.site import Plane
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)

@@ -1,8 +1,9 @@
 # Domain model
 
-The vocabulary this codebase is written in. Terms here are the names used
-in module docstrings, log records and tests — a new module should reach
-for one of these before inventing its own.
+The vocabulary `lares-diagnostics-engine` (formerly `iot-insights-engine`)
+is written in. Terms here are the names used in module docstrings, log
+records and tests — a new module should reach for one of these before
+inventing its own.
 
 ## Fault
 

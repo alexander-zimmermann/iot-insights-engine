@@ -11,7 +11,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from iot_insights_engine.site import _SCHEMA_PATH, Location, Plane, Site
+from lares_diagnostics_engine.site import _SCHEMA_PATH, Location, Plane, Site
 
 # The shape the lares site file uses: the two roof planes with the inverter
 # each of them feeds, in the Open-Meteo azimuth convention.

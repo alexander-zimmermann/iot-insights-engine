@@ -8,7 +8,7 @@ path are locked here.
 
 from __future__ import annotations
 
-from iot_insights_engine import entity_slug
+from lares_diagnostics_engine import entity_slug
 
 
 def test_entity_slug_renders_the_documented_examples() -> None:

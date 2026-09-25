@@ -13,15 +13,15 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import Episode, EventKind, NotificationEvent
-from iot_insights_engine.external import (
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import Episode, EventKind, NotificationEvent
+from lares_diagnostics_engine.external import (
     SeverityWrite,
     drop_processed,
     fold_severity_writes,
     plan,
 )
-from iot_insights_engine.reconcile import Measured, Plan
+from lares_diagnostics_engine.reconcile import Measured, Plan
 
 _T0 = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)

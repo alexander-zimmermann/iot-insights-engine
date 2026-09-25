@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from .config import load_settings
 from .logging_setup import configure_logging, get_logger
 
-# Each subcommand maps to a sibling module `iot_insights_engine.<module>`
+# Each subcommand maps to a sibling module `lares_diagnostics_engine.<module>`
 # that exposes `def run(settings, argv) -> int`. The dispatcher fails
 # with a clear message if a subcommand listed here has no module yet.
 SUBCOMMANDS: tuple[str, ...] = (
@@ -20,7 +20,7 @@ SUBCOMMANDS: tuple[str, ...] = (
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="iot-insights-engine")
+    parser = argparse.ArgumentParser(prog="lares-diagnostics-engine")
     parser.add_argument("subcommand", choices=SUBCOMMANDS)
     parser.add_argument("rest", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -31,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     module_name = args.subcommand.replace("-", "_")
     try:
-        module = importlib.import_module(f"iot_insights_engine.{module_name}")
+        module = importlib.import_module(f"lares_diagnostics_engine.{module_name}")
     except ImportError as exc:
         log.error("subcommand_not_implemented", subcommand=args.subcommand, error=str(exc))
         return 2
