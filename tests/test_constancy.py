@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from iot_insights_engine.constancy import (
+from lares_diagnostics_engine.constancy import (
     ConstancyState,
     ConstantRun,
     Reading,
@@ -24,9 +24,9 @@ from iot_insights_engine.constancy import (
     constant_runs,
     report_for,
 )
-from iot_insights_engine.episodes import EpisodePolicy, fold_observations
-from iot_insights_engine.reconcile import Window
-from iot_insights_engine.silence import Channel
+from lares_diagnostics_engine.episodes import EpisodePolicy, fold_observations
+from lares_diagnostics_engine.reconcile import Window
+from lares_diagnostics_engine.silence import Channel
 
 _T0 = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)

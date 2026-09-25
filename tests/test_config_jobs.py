@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from iot_insights_engine.config import Settings
+from lares_diagnostics_engine.config import Settings
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def test_db_dsns_url_encode_password(base_env: pytest.MonkeyPatch) -> None:
 def test_optional_fields_have_sane_defaults(base_env: pytest.MonkeyPatch) -> None:
     s = Settings()  # type: ignore[call-arg]
     assert s.nats_servers is None
-    assert s.site_file == "/etc/iot-insights-engine/site.yaml"
+    assert s.site_file == "/etc/lares-diagnostics-engine/site.yaml"
 
 
 def test_nats_secret_file_resolves(base_env: pytest.MonkeyPatch, tmp_path: Path) -> None:

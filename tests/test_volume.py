@@ -13,14 +13,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import (
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import (
     EpisodePolicy,
     EventKind,
     fold_observations,
 )
-from iot_insights_engine.reconcile import Plan, subject_plan
-from iot_insights_engine.volume import (
+from lares_diagnostics_engine.reconcile import Plan, subject_plan
+from lares_diagnostics_engine.volume import (
     SUBJECT,
     WINDOW,
     EpisodeStart,

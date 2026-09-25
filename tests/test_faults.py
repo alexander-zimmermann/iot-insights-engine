@@ -13,7 +13,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from iot_insights_engine.faults import (
+from lares_diagnostics_engine.faults import (
     _SCHEMA_PATH,
     DeviationExpectation,
     DeviceLimit,

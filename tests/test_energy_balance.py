@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from iot_insights_engine import energy_balance, nats_publisher
-from iot_insights_engine.config import Settings
+from lares_diagnostics_engine import energy_balance, nats_publisher
+from lares_diagnostics_engine.config import Settings
 
 
 def _settings() -> Settings:

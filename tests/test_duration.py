@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from iot_insights_engine.duration import (
+from lares_diagnostics_engine.duration import (
     Device,
     DevicePublish,
     DeviceState,
@@ -21,9 +21,9 @@ from iot_insights_engine.duration import (
     publish_for,
     resolve_devices,
 )
-from iot_insights_engine.episodes import EpisodePolicy, fold_observations
-from iot_insights_engine.faults import DeviceLimit
-from iot_insights_engine.silence import Channel
+from lares_diagnostics_engine.episodes import EpisodePolicy, fold_observations
+from lares_diagnostics_engine.faults import DeviceLimit
+from lares_diagnostics_engine.silence import Channel
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib
 
-from iot_insights_engine.__main__ import SUBCOMMANDS
+from lares_diagnostics_engine.__main__ import SUBCOMMANDS
 
 
 def test_no_per_detector_jobs_remain() -> None:
@@ -23,5 +23,5 @@ def test_no_per_detector_jobs_remain() -> None:
 
 def test_every_subcommand_resolves_to_a_module() -> None:
     for subcommand in SUBCOMMANDS:
-        module = importlib.import_module(f"iot_insights_engine.{subcommand.replace('-', '_')}")
+        module = importlib.import_module(f"lares_diagnostics_engine.{subcommand.replace('-', '_')}")
         assert callable(module.run)

@@ -31,4 +31,4 @@ COPY --from=builder /opt/venv /opt/venv
 USER app
 WORKDIR /app
 
-ENTRYPOINT ["iot-insights-engine"]
+ENTRYPOINT ["lares-diagnostics-engine"]

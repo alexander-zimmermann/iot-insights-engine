@@ -15,9 +15,9 @@ import httpx
 import pytest
 import respx
 
-from iot_insights_engine import forecast_solar, nats_publisher
-from iot_insights_engine.config import Settings
-from iot_insights_engine.site import Location, Plane, Site
+from lares_diagnostics_engine import forecast_solar, nats_publisher
+from lares_diagnostics_engine.config import Settings
+from lares_diagnostics_engine.site import Location, Plane, Site
 
 _OST = Plane(key="Ost", inverter_id=2, tilt=17, azimuth=-51, kwp=6.175)
 _WEST = Plane(key="West", inverter_id=1, tilt=17, azimuth=129, kwp=6.435)

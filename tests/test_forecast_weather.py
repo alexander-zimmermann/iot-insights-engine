@@ -12,9 +12,9 @@ import httpx
 import pytest
 import respx
 
-from iot_insights_engine import forecast_weather
-from iot_insights_engine.config import Settings
-from iot_insights_engine.site import Location, Plane, Site
+from lares_diagnostics_engine import forecast_weather
+from lares_diagnostics_engine.config import Settings
+from lares_diagnostics_engine.site import Location, Plane, Site
 
 
 def _settings() -> Settings:

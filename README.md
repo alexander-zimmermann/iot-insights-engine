@@ -1,10 +1,12 @@
-# iot-insights-engine
+# lares-diagnostics-engine
+
+_Formerly `iot-insights-engine`._
 
 TSDB-backed background jobs for the homelab: external forecast pulls,
 the daily energy balance, and the declared fault list — history faults
 measured over the hourly aggregates and delivered as a severity 0–3 on a
 KNX group address.
-Companion to [iot-mcp-bridge](https://github.com/alexander-zimmermann/iot-mcp-bridge)
+Companion to [lares-mcp-bridge](https://github.com/alexander-zimmermann/lares-mcp-bridge)
 (the MCP server, read-only — where verdicts are given) and
 [knx-nats-bridge](https://github.com/alexander-zimmermann/knx-nats-bridge)
 (KNX ↔ NATS, owns the GA catalog and the writer rules).
@@ -17,7 +19,7 @@ log records and tests use those names.
 
 ```
 TSDB (hourly aggregates, ga_catalog) ─┐
-faults.yaml + site.yaml (lares)       ├─► iot-insights-engine
+faults.yaml + site.yaml (lares)       ├─► lares-diagnostics-engine
 api.forecast.solar / api.open-meteo   ┘     │
                                             ├─► TSDB (mcp_forecasts, episodes)
                                             ▼
@@ -28,7 +30,7 @@ api.forecast.solar / api.open-meteo   ┘     │
                                              3 = push · 1–2 = indicator · 0 = clear · e-mail for all
 ```
 
-Downstream of the episodes: iot-mcp-bridge lists them and takes the
+Downstream of the episodes: lares-mcp-bridge lists them and takes the
 binary verdict ("real" / "nonsense") per episode; the Grafana
 `knx-episodes` dashboard replaced the weekly mail.
 
@@ -37,7 +39,7 @@ binary verdict ("real" / "nonsense") per episode; the Grafana
 Run via the single entrypoint:
 
 ```
-iot-insights-engine <subcommand>
+lares-diagnostics-engine <subcommand>
 ```
 
 | Subcommand         | Schedule (Kubernetes CronJob) | What it does |
@@ -57,7 +59,7 @@ others down; the job still exits non-zero so the CronJob shows it.
 
 Faults are declared, not coded. The list lives in lares beside the GA
 catalog and the writer rules
-(`kubernetes/applications/iot-insights-engine/base/config/faults.yaml`)
+(`kubernetes/applications/lares-diagnostics-engine/base/config/faults.yaml`)
 and is mounted into the CronJob at `MCP_FAULTS_FILE`. Every entry
 carries:
 
@@ -80,11 +82,11 @@ carries:
 - `dormant` — optional `reason` and `active_when`; the fault loads and
   validates but does not schedule.
 
-The loader ([faults.py](src/iot_insights_engine/faults.py)) validates
+The loader ([faults.py](src/lares_diagnostics_engine/faults.py)) validates
 the file against the bundled JSON Schema and freezes it into
 dataclasses; a missing sentence, unit or parameter fails at load, naming
 the fault and the field. Check an edit before shipping with
-`task insights:validate-faults` in lares. Tuning a threshold is a
+`task diagnostics:validate-faults` in lares. Tuning a threshold is a
 one-line PR there, not an engine release.
 
 ### The site file
@@ -101,7 +103,7 @@ midnight bounds "today", and the daily-yield shape the plant — which
 inverters count, and the most each counter can rise in an hour — so a
 counter that re-bases or reports a 0 is told from production without a
 fault parameter. Nothing about the house lives in a job's environment.
-The loader ([site.py](src/iot_insights_engine/site.py)) validates the
+The loader ([site.py](src/lares_diagnostics_engine/site.py)) validates the
 file the same way the fault list is validated.
 
 ### Measurement kinds
@@ -153,7 +155,7 @@ the group address; Basalte owns the text and the channel: 3 pushes,
 Publishes go out before the database write, so a failed run repeats the
 same publish instead of losing it.
 
-Not in this repo: verdicts (iot-mcp-bridge `set_episode_verdict` →
+Not in this repo: verdicts (lares-mcp-bridge `set_episode_verdict` →
 `episode_verdicts`; collected and shown, never acted on), the Grafana
 dashboard, and the Basalte Studio faults — those appear here only as
 `external` entries.
@@ -161,11 +163,11 @@ dashboard, and the Basalte Studio faults — those appear here only as
 ## Configuration
 
 All `MCP_*` env vars (kept for compatibility with the existing
-SealedSecret + Kyverno-clone topology shared with iot-mcp-bridge). Every
+SealedSecret + Kyverno-clone topology shared with lares-mcp-bridge). Every
 job reads the site file at `MCP_SITE_FILE`; `detect-faults` additionally
 needs the write credentials (`MCP_DB_WRITE_*`, episodes only),
 `MCP_FAULTS_FILE` and a NATS identity for `fault.*`. See
-[config.py](src/iot_insights_engine/config.py) for the full list.
+[config.py](src/lares_diagnostics_engine/config.py) for the full list.
 
 ## Local dev
 

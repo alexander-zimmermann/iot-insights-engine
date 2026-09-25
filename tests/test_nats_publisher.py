@@ -6,9 +6,9 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from iot_insights_engine import nats_publisher
-from iot_insights_engine.config import Settings
-from iot_insights_engine.nats_publisher import publish_anomaly
+from lares_diagnostics_engine import nats_publisher
+from lares_diagnostics_engine.config import Settings
+from lares_diagnostics_engine.nats_publisher import publish_anomaly
 
 
 def test_publish_anomaly_slugs_the_raw_entity_once() -> None:

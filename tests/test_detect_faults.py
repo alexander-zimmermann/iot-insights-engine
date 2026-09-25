@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from unittest.mock import patch
 
-from iot_insights_engine import (
+from lares_diagnostics_engine import (
     constancy,
     deviation,
     drift,
@@ -21,31 +21,31 @@ from iot_insights_engine import (
     silence,
     volume,
 )
-from iot_insights_engine.config import Settings
-from iot_insights_engine.detect_faults import _kind_for
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import (
+from lares_diagnostics_engine.config import Settings
+from lares_diagnostics_engine.detect_faults import _kind_for
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import (
     Episode,
     EventKind,
     EvidenceRow,
     NotificationEvent,
 )
-from iot_insights_engine.faults import (
+from lares_diagnostics_engine.faults import (
     DeviationExpectation,
     Fault,
     MeasurementKind,
     Target,
 )
-from iot_insights_engine.groups import GroupPublish
-from iot_insights_engine.reconcile import Measured, Plan
-from iot_insights_engine.runner import NatsPublisher, publish_subjects
-from iot_insights_engine.silence import (
+from lares_diagnostics_engine.groups import GroupPublish
+from lares_diagnostics_engine.reconcile import Measured, Plan
+from lares_diagnostics_engine.runner import NatsPublisher, publish_subjects
+from lares_diagnostics_engine.silence import (
     Channel,
     ChannelState,
     SilenceState,
     plan_run,
 )
-from iot_insights_engine.site import Location, Plane, Site
+from lares_diagnostics_engine.site import Location, Plane, Site
 
 _T0 = datetime(2026, 8, 30, 10, 0, tzinfo=UTC)
 _HOUR = timedelta(hours=1)

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from iot_insights_engine.episodes import (
+from lares_diagnostics_engine.episodes import (
     Episode,
     EpisodePolicy,
     EventKind,

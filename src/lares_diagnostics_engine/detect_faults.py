@@ -209,7 +209,7 @@ _DRIFT_SIGNALS: Mapping[DriftSignal, Kind[Any, Any]] = {
 
 
 def run(settings: Settings, argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(prog="iot-insights-engine detect-faults")
+    parser = argparse.ArgumentParser(prog="lares-diagnostics-engine detect-faults")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 

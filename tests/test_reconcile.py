@@ -10,9 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import Episode
-from iot_insights_engine.reconcile import (
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import Episode
+from lares_diagnostics_engine.reconcile import (
     measurement_reaches,
     reconcile,
     subject_plan,

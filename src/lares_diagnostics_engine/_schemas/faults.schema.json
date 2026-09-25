@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/alexander-zimmermann/iot-insights-engine/schemas/faults.schema.json",
+  "$id": "https://github.com/alexander-zimmermann/lares-diagnostics-engine/schemas/faults.schema.json",
   "title": "Fault list",
   "description": "Declares the faults the engine detects. Per fault: the sentence with its unit, a measurement kind with parameters in the channel's own unit, the target group address, and the channel scope as a catalog query.",
   "type": "object",

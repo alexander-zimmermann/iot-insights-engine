@@ -17,12 +17,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
-from iot_insights_engine.episode_store import OpenEpisodeRow
-from iot_insights_engine.episodes import EpisodePolicy
-from iot_insights_engine.faults import Fault, MeasurementKind, Target
-from iot_insights_engine.groups import GroupPublish
-from iot_insights_engine.reconcile import Measured, Plan, Window
-from iot_insights_engine.silence import (
+from lares_diagnostics_engine.episode_store import OpenEpisodeRow
+from lares_diagnostics_engine.episodes import EpisodePolicy
+from lares_diagnostics_engine.faults import Fault, MeasurementKind, Target
+from lares_diagnostics_engine.groups import GroupPublish
+from lares_diagnostics_engine.reconcile import Measured, Plan, Window
+from lares_diagnostics_engine.silence import (
     BUCKET,
     RULE_REVISION,
     Channel,

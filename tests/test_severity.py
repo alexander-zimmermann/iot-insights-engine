@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from iot_insights_engine.severity import severity_level
+from lares_diagnostics_engine.severity import severity_level
 
 
 def test_severity_level() -> None:

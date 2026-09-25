@@ -1,4 +1,4 @@
-"""Settings for the iot-insights-engine jobs (forecast pulls +
+"""Settings for the lares-diagnostics-engine jobs (forecast pulls +
 energy balance). MCP_-prefixed env vars kept as the de-facto homelab
 convention — same SealedSecrets and Kyverno-clone topology the MCP
 server uses already inject these into the namespace.
@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     # Mounted from the lares ConfigMap: the fault list for detect-faults
     # (what counts as wrong) and the site file every job reads (what the
     # house is — location, timezone, PV planes).
-    faults_file: str = "/etc/iot-insights-engine/faults.yaml"
-    site_file: str = "/etc/iot-insights-engine/site.yaml"
+    faults_file: str = "/etc/lares-diagnostics-engine/faults.yaml"
+    site_file: str = "/etc/lares-diagnostics-engine/site.yaml"
 
     # NATS — jobs publish their results on `forecast.pv.*` / `energy.pv.*`.
     nats_servers: str | None = None
