@@ -1,29 +1,79 @@
 """The NATS adapter: one publish per fault, on the subject the
-knx-nats-bridge writer rules pin (`tests/test_slug` locks the entity token).
+knx-nats-bridge writer rules pin (`tests/test_slug` locks the entity token),
+and one pointer per episode event on `episode.<kind>`.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from lares_diagnostics_engine import nats_publisher
 from lares_diagnostics_engine.config import Settings
-from lares_diagnostics_engine.nats_publisher import publish_anomaly
+from lares_diagnostics_engine.episodes import EpisodeEvent, EventKind
+from lares_diagnostics_engine.nats_publisher import publish_anomaly, publish_episode_event
 
 
-def test_publish_anomaly_slugs_the_raw_entity_once() -> None:
-    # Kinds hand the entity over raw (a GA, a room label); this adapter is
-    # the one place that speaks NATS dialect — subject token and payload
-    # `entity` carry the same slug.
-    settings = Settings(
+def _settings() -> Settings:
+    return Settings(
         db_host="localhost",
         db_name="x",
         db_username="x",
         db_password="x",  # noqa: S106 — test stub
         nats_servers="nats://localhost:4222",
     )
+
+
+def test_publish_anomaly_slugs_the_raw_entity_once() -> None:
+    # Kinds hand the entity over raw (a GA, a room label); this adapter is
+    # the one place that speaks NATS dialect — subject token and payload
+    # `entity` carry the same slug.
+    settings = _settings()
     with patch.object(nats_publisher, "publish") as pub:
         publish_anomaly(settings, "appliance_runtime", "warning", {}, entity="2/1/197")
     (call,) = pub.call_args_list
     assert call.args[1] == "fault.appliance_runtime.2-1-197"
     assert call.args[2]["entity"] == "2-1-197"
+
+
+def test_an_episode_event_goes_out_as_a_pointer_on_its_own_subject() -> None:
+    # The kind names the subject, the payload names the episode: whoever
+    # explains it fetches the sentence and the evidence by that id.
+    event = EpisodeEvent(
+        episode_id=15510,
+        fault="appliance_runtime",
+        subject="2/1/197",
+        kind=EventKind.ESCALATED,
+        time=datetime(2026, 9, 25, 14, 20, tzinfo=UTC),
+        severity=3,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_episode_event(_settings(), event)
+    (call,) = pub.call_args_list
+    assert call.args[1] == "episode.escalated"
+    assert call.args[2] == {
+        "episode_id": 15510,
+        "fault": "appliance_runtime",
+        "subject": "2/1/197",
+        "severity": 3,
+        "kind": "escalated",
+        "time": "2026-09-25T14:20:00+00:00",
+    }
+
+
+def test_the_subject_is_the_episode_row_not_a_slugged_address_token() -> None:
+    # The fault severities slug their entity because a KNX writer rule is
+    # pinned to the token. An episode event addresses no rule: its subject
+    # is the episode's own column, so a consumer can look the row up by it.
+    event = EpisodeEvent(
+        episode_id=42,
+        fault="room_deviation",
+        subject="EG.Flur",
+        kind=EventKind.APPEARED,
+        time=datetime(2026, 9, 25, 14, 20, tzinfo=UTC),
+        severity=2,
+    )
+    with patch.object(nats_publisher, "publish") as pub:
+        publish_episode_event(_settings(), event)
+    (call,) = pub.call_args_list
+    assert call.args[2]["subject"] == "EG.Flur"

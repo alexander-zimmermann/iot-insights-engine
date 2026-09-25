@@ -7,6 +7,7 @@ from typing import Any
 import nats
 
 from .config import Settings
+from .episodes import EpisodeEvent
 from .logging_setup import get_logger
 from .severity import severity_level
 from .slug import entity_slug
@@ -87,3 +88,27 @@ def publish_anomaly(
         **payload,
     }
     publish(settings, subject, body)
+
+
+def publish_episode_event(settings: Settings, event: EpisodeEvent) -> None:
+    """Publish one episode event on `episode.<kind>` — appeared, escalated
+    or ended. `ended` goes out like the others so the stream is complete and
+    a consumer filters rather than guessing what it missed.
+
+    The payload is a pointer, not a report: which episode, of which fault,
+    on which channel, at which tier and when. The sentence, the parameters
+    and the evidence are fetched from the episode the id names — the one
+    place they cannot go stale.
+    """
+    publish(
+        settings,
+        f"episode.{event.kind.value}",
+        {
+            "episode_id": event.episode_id,
+            "fault": event.fault,
+            "subject": event.subject,
+            "severity": event.severity,
+            "kind": event.kind.value,
+            "time": event.time.isoformat(),
+        },
+    )

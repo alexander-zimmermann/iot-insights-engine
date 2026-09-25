@@ -242,7 +242,8 @@ class Fault:
     Basalte, the scope names the address whose writes come back. A volume
     fault carries no scope: it measures the episode stream, not channels,
     and neither does a deviation fault that names an `expectation` — it
-    measures a yield against that model.
+    measures a yield against that model. `explain` is whether an episode
+    event of this fault goes on the bus for an agent to explain.
     """
 
     name: str
@@ -259,6 +260,7 @@ class Fault:
     roles: Roles | ExchangerRoles | None = None
     rooms: tuple[RoomRule, ...] = ()
     expectation: DeviationExpectation | None = None
+    explain: bool = True
 
     @property
     def fingerprint(self) -> str:
@@ -580,7 +582,18 @@ def _parse_target(target: dict[str, Any]) -> Target:
     )
 
 
+def _explained_by_default(kind: MeasurementKind) -> bool:
+    """Whether an episode of this kind reaches the bus for an agent to
+    explain, where the fault itself says nothing. On for every kind the
+    engine measures: nobody has said yet what is wrong, which is the whole
+    reason to ask. Off for external, where Basalte detected the fault and
+    its own sentence already is the explanation.
+    """
+    return kind is not MeasurementKind.EXTERNAL
+
+
 def _parse_fault(raw: dict[str, Any]) -> Fault:
+    kind = MeasurementKind(raw["kind"])
     scope = raw.get("scope")
     target = raw.get("target")
     dormant = raw.get("dormant")
@@ -590,7 +603,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         name=raw["name"],
         sentence=raw["sentence"],
         unit=raw["unit"],
-        kind=MeasurementKind(raw["kind"]),
+        kind=kind,
         parameters=MappingProxyType(dict(raw.get("parameters", {}))),
         signal=signal,
         scope=(
@@ -616,6 +629,7 @@ def _parse_fault(raw: dict[str, Any]) -> Fault:
         expectation=(
             DeviationExpectation(raw["expectation"]) if "expectation" in raw else None
         ),
+        explain=raw.get("explain", _explained_by_default(kind)),
         dormant=(
             Dormant(reason=dormant["reason"], active_when=dormant["active_when"])
             if dormant is not None

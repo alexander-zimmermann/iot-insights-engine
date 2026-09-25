@@ -13,7 +13,8 @@ guarantees are testable through fakes:
 * the **store end** — one read connection for the measurement, the open
   rows and score history behind it, and the transactional apply of a
   plan's row changes;
-* the **publisher end** — one anomaly publish per moved subject.
+* the **publisher end** — one anomaly publish per moved subject, and one
+  episode-event pointer per event the write recorded.
 
 Two adapters sit at each seam: the database and NATS in production, an
 in-memory recorder in the runner's tests.
@@ -26,6 +27,12 @@ failed run then repeats the same publish (same value, Basalte's change
 detector ignores it) instead of losing it behind an already-updated
 database. `--dry-run` computes and logs everything and touches neither
 write side.
+
+The episode events go the other way round, *after* the write, and for one
+reason: the row is what gives an event its id and what says it is new at
+all. Only the events the write recorded reach the bus, and only for a fault
+declared `explain` — the severities Basalte routes are untouched by that
+flag.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from . import episode_store, nats_publisher
 from .db_write import read_connection, write_connection
-from .episodes import Episode, EpisodePolicy, fold_observations
+from .episodes import Episode, EpisodeEvent, EpisodePolicy, fold_observations
 from .logging_setup import get_logger
 from .reconcile import Measured, Plan, SubjectPublish, Window, subject_plan
 from .severity import severity_name
@@ -86,15 +93,17 @@ class Store(Protocol):
         *,
         fingerprint: str,
         externally_delivered: bool,
-    ) -> None:
+    ) -> Sequence[EpisodeEvent]:
         """One plan's row changes, in one transaction; the rows it makes or
         re-makes stamped with the fingerprint of the rule the run measured
-        by."""
+        by. What comes back are the episode events the write recorded — the
+        new ones, with the ids their rows just got."""
         ...
 
 
 class Publisher(Protocol):
-    """The publisher end: one anomaly publish per moved subject."""
+    """The publisher end: one anomaly publish per moved subject, and one
+    pointer per recorded episode event."""
 
     def publish_anomaly(
         self,
@@ -105,6 +114,8 @@ class Publisher(Protocol):
         entity: str | None,
         firing: bool,
     ) -> None: ...
+
+    def publish_episode_event(self, event: EpisodeEvent) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +147,9 @@ class DbStore:
         *,
         fingerprint: str,
         externally_delivered: bool,
-    ) -> None:
+    ) -> Sequence[EpisodeEvent]:
         with write_connection(self.settings) as conn, conn.transaction():
-            episode_store.apply(
+            return episode_store.apply(
                 conn,
                 fault_name,
                 inserts,
@@ -167,6 +178,9 @@ class NatsPublisher:
         nats_publisher.publish_anomaly(
             self.settings, fault_name, severity, payload, entity=entity, firing=firing
         )
+
+    def publish_episode_event(self, event: EpisodeEvent) -> None:
+        nats_publisher.publish_episode_event(self.settings, event)
 
 
 def declared_fingerprint(fault: Fault) -> str:
@@ -274,6 +288,15 @@ def publish_subjects[P: SubjectPublish](
         )
 
 
+def publish_episode_events(publisher: Publisher, events: Iterable[EpisodeEvent]) -> None:
+    """One pointer per episode event, on `episode.<kind>`: what happened to
+    which episode, for whoever explains it. Never the evidence — that is
+    fetched from the episode the pointer names.
+    """
+    for event in events:
+        publisher.publish_episode_event(event)
+
+
 def run_subjects[S, P: SubjectPublish](
     store: Store, publisher: Publisher, fault: Fault, kind: Kind[S, P], *, dry_run: bool
 ) -> None:
@@ -335,6 +358,7 @@ def run_subjects[S, P: SubjectPublish](
         orphan_closes=len(plan.orphan_closes),
         stale_opens=list(plan.stale_opens),
         publishes=len(plan.publishes),
+        explain=fault.explain,
         dry_run=dry_run,
     )
 
@@ -346,7 +370,7 @@ def run_subjects[S, P: SubjectPublish](
         if kind.payload is None:
             raise ValueError(f"kind {kind.event}: publishes without a payload declaration")
         publish_subjects(publisher, fault.name, plan.publishes, kind.payload)
-    store.apply(
+    recorded = store.apply(
         fault.name,
         plan.inserts,
         plan.updates,
@@ -354,6 +378,8 @@ def run_subjects[S, P: SubjectPublish](
         fingerprint=fingerprint,
         externally_delivered=kind.externally_delivered,
     )
+    if fault.explain:
+        publish_episode_events(publisher, recorded)
 
 
 def _plan_for[S, P: SubjectPublish](

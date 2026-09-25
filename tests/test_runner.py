@@ -17,7 +17,13 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from lares_diagnostics_engine.episode_store import OpenEpisodeRow
-from lares_diagnostics_engine.episodes import Episode, EpisodePolicy, Observation
+from lares_diagnostics_engine.episodes import (
+    Episode,
+    EpisodeEvent,
+    EpisodePolicy,
+    EventKind,
+    Observation,
+)
 from lares_diagnostics_engine.faults import Fault, MeasurementKind, Target
 from lares_diagnostics_engine.reconcile import Measured, Plan, Window
 from lares_diagnostics_engine.runner import LOOKBACK, Kind, run_subjects
@@ -37,10 +43,14 @@ class _Store:
     """In-memory store end; every interaction lands in the shared event log."""
 
     def __init__(
-        self, events: list[str], open_rows: list[OpenEpisodeRow] | None = None
+        self,
+        events: list[str],
+        open_rows: list[OpenEpisodeRow] | None = None,
+        recorded: tuple[EpisodeEvent, ...] = (),
     ) -> None:
         self.events = events
         self._open_rows = open_rows or []
+        self._recorded = recorded
         self.applied: _Applied | None = None
         self.fingerprint: str | None = None
         self.externally_delivered = False
@@ -65,11 +75,12 @@ class _Store:
         *,
         fingerprint: str,
         externally_delivered: bool,
-    ) -> None:
+    ) -> tuple[EpisodeEvent, ...]:
         self.events.append("apply")
         self.applied = (tuple(inserts), tuple(updates), tuple(orphan_closes))
         self.fingerprint = fingerprint
         self.externally_delivered = externally_delivered
+        return self._recorded
 
 
 class _Publisher:
@@ -78,6 +89,7 @@ class _Publisher:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.published: list[tuple[str, str | None, dict[str, Any], str | None, bool]] = []
+        self.episode_events: list[EpisodeEvent] = []
 
     def publish_anomaly(
         self,
@@ -90,6 +102,10 @@ class _Publisher:
     ) -> None:
         self.events.append("publish")
         self.published.append((fault_name, severity, payload, entity, firing))
+
+    def publish_episode_event(self, event: EpisodeEvent) -> None:
+        self.events.append("publish_episode")
+        self.episode_events.append(event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +125,7 @@ _PER_DEVICE = Target(per_device=True)
 _HOURLY = EpisodePolicy()
 
 
-def _fault(target: Target | None = _PER_DEVICE) -> Fault:
+def _fault(target: Target | None = _PER_DEVICE, *, explain: bool = True) -> Fault:
     return Fault(
         name="test_fault",
         sentence="a device runs longer than declared",
@@ -117,6 +133,7 @@ def _fault(target: Target | None = _PER_DEVICE) -> Fault:
         kind=MeasurementKind.DURATION,
         parameters={},
         target=target,
+        explain=explain,
     )
 
 
@@ -218,6 +235,7 @@ def test_a_dry_run_touches_neither_write_side() -> None:
 
     assert events == ["read"]
     assert publisher.published == []
+    assert publisher.episode_events == []
     assert store.applied is None
 
 
@@ -399,3 +417,51 @@ def test_a_kind_folds_in_its_own_cadence() -> None:
     inserts, _, _ = store.applied
     (episode,) = inserts
     assert episode.ended_at is None
+
+
+_APPEARED = EpisodeEvent(
+    episode_id=15510,
+    fault="test_fault",
+    subject="2/1/197",
+    kind=EventKind.APPEARED,
+    time=_FRONTIER,
+    severity=2,
+)
+_ENDED = EpisodeEvent(
+    episode_id=15509,
+    fault="test_fault",
+    subject="2/1/198",
+    kind=EventKind.ENDED,
+    time=_FRONTIER,
+    severity=0,
+)
+
+
+def test_each_episode_event_the_write_recorded_is_published_once_after_it() -> None:
+    # The pointer goes out after the rows, because the row is what gives the
+    # event its episode id — and only for what the write actually recorded,
+    # so a rerun over the same window repeats no event.
+    events: list[str] = []
+    store = _Store(events, recorded=(_APPEARED, _ENDED))
+    publisher = _Publisher(events)
+
+    run_subjects(store, publisher, _fault(), _kind(observations=_FIRING), dry_run=False)
+
+    assert events == ["read", "publish", "apply", "publish_episode", "publish_episode"]
+    assert publisher.episode_events == [_APPEARED, _ENDED]
+
+
+def test_a_fault_that_is_not_explained_keeps_its_episode_events_off_the_bus() -> None:
+    # `explain: false` is about the episode events alone — the fault
+    # severities Basalte routes go out either way.
+    events: list[str] = []
+    store = _Store(events, recorded=(_APPEARED,))
+    publisher = _Publisher(events)
+
+    run_subjects(
+        store, publisher, _fault(explain=False), _kind(observations=_FIRING), dry_run=False
+    )
+
+    assert events == ["read", "publish", "apply"]
+    assert publisher.episode_events == []
+    assert len(publisher.published) == 1

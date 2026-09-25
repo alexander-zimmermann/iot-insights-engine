@@ -5,6 +5,12 @@ Everything here is idempotent — evidence and events land with ON CONFLICT
 DO NOTHING on their natural keys, and the row updates only ever raise
 severity and peak and re-stamp the fingerprint, so a rerun after a
 half-applied failure converges instead of duplicating.
+
+That idempotence is also what says which episode events are *new*: `apply`
+reports back the event rows the conflict clause let through, and a rerun
+over the same window reports none. The runner turns exactly those into the
+pointers on the bus, so an hourly recompute of a month-old episode
+announces it once, on the run that first saw it.
 """
 
 from __future__ import annotations
@@ -16,7 +22,8 @@ from typing import TYPE_CHECKING
 import psycopg
 from psycopg.rows import DictRow
 
-from .episodes import Episode, EventKind
+from .episodes import Episode, EpisodeEvent, EventKind, NotificationEvent
+from .severity import CLEAR
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -90,14 +97,19 @@ def apply(
     *,
     fingerprint: str,
     externally_delivered: bool = False,
-) -> None:
+) -> tuple[EpisodeEvent, ...]:
     """`fingerprint` names the rule this run measured by, stamped on every
     row it makes or re-makes — never on a row it merely closes — so a later
     rule can tell its own rows from this one's. `externally_delivered`
     marks episodes whose fault Basalte already delivered itself — the
     engine only records them, and nothing downstream may notify a second
     time.
+
+    What comes back are the episode events this call actually wrote, each
+    with the id of the row it hangs under — the new ones, and nothing a
+    previous run already recorded.
     """
+    recorded: list[EpisodeEvent] = []
     for episode in inserts:
         inserted = conn.execute(
             """
@@ -123,7 +135,7 @@ def apply(
         ).fetchone()
         if inserted is None:  # INSERT … RETURNING always yields the row
             raise RuntimeError(f"episode insert for {episode.subject} returned no id")
-        _write_details(conn, inserted["id"], episode)
+        recorded += _write_details(conn, inserted["id"], fault_name, episode)
     for episode_id, episode in updates:
         conn.execute(
             """
@@ -144,25 +156,35 @@ def apply(
                 "fingerprint": fingerprint,
             },
         )
-        _write_details(conn, episode_id, episode)
+        recorded += _write_details(conn, episode_id, fault_name, episode)
     for episode_id, ended_at in orphan_closes:
-        conn.execute(
-            "UPDATE episodes SET ended_at = %(ended_at)s WHERE id = %(id)s",
+        # The subject comes back off the close: the plan carries only the
+        # row id, and the pointer on the bus names the channel.
+        closed = conn.execute(
+            "UPDATE episodes SET ended_at = %(ended_at)s WHERE id = %(id)s RETURNING subject",
             {"id": episode_id, "ended_at": ended_at},
+        ).fetchone()
+        if closed is None:  # the row was read open in this same transaction
+            raise RuntimeError(f"episode close for id {episode_id} matched no row")
+        recorded += _record_events(
+            conn,
+            episode_id,
+            fault_name,
+            closed["subject"],
+            (NotificationEvent(EventKind.ENDED, ended_at, CLEAR),),
         )
-        conn.execute(
-            """
-            INSERT INTO episode_events (episode_id, kind, time, severity)
-            VALUES (%(id)s, %(kind)s, %(time)s, 0)
-            ON CONFLICT (episode_id, kind) DO NOTHING
-            """,
-            {"id": episode_id, "kind": EventKind.ENDED.value, "time": ended_at},
-        )
+    return tuple(recorded)
 
 
 def _write_details(
-    conn: psycopg.Connection[DictRow], episode_id: int, episode: Episode
-) -> None:
+    conn: psycopg.Connection[DictRow],
+    episode_id: int,
+    fault_name: str,
+    episode: Episode,
+) -> list[EpisodeEvent]:
+    """The episode's evidence and its notification events under the row,
+    and back the events that were not there before.
+    """
     with conn.cursor() as cur:
         cur.executemany(
             """
@@ -181,19 +203,46 @@ def _write_details(
                 for row in episode.evidence
             ],
         )
-        cur.executemany(
+    return _record_events(conn, episode_id, fault_name, episode.subject, episode.events)
+
+
+def _record_events(
+    conn: psycopg.Connection[DictRow],
+    episode_id: int,
+    fault_name: str,
+    subject: str,
+    events: Sequence[NotificationEvent],
+) -> list[EpisodeEvent]:
+    """One statement per event rather than one for all three: the conflict
+    clause is what tells a new event from one an earlier run already wrote,
+    and only a per-row RETURNING says which was which.
+    """
+    recorded: list[EpisodeEvent] = []
+    for event in events:
+        row = conn.execute(
             """
             INSERT INTO episode_events (episode_id, kind, time, severity)
             VALUES (%(id)s, %(kind)s, %(time)s, %(severity)s)
             ON CONFLICT (episode_id, kind) DO NOTHING
+            RETURNING episode_id
             """,
-            [
-                {
-                    "id": episode_id,
-                    "kind": event.kind.value,
-                    "time": event.time,
-                    "severity": event.severity,
-                }
-                for event in episode.events
-            ],
+            {
+                "id": episode_id,
+                "kind": event.kind.value,
+                "time": event.time,
+                "severity": event.severity,
+            },
+        ).fetchone()
+        if row is None:  # an earlier run already announced this one
+            continue
+        recorded.append(
+            EpisodeEvent(
+                episode_id=episode_id,
+                fault=fault_name,
+                subject=subject,
+                kind=event.kind,
+                time=event.time,
+                severity=event.severity,
+            )
         )
+    return recorded
