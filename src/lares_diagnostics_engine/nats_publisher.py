@@ -21,10 +21,12 @@ class PublishRejectedError(RuntimeError):
 
     Core NATS acknowledges nothing, so a refusal is not a failed call: it
     arrives as an asynchronous `-ERR` that nats-py hands to the connection's
-    error callback and otherwise shrugs off. Without this the engine logged
-    the publish as done and the run passed, while the message was dropped —
-    which is what happened for eight runs on 2026-09-26, between the engine
-    release and the nkey gaining `episode.>`.
+    error callback and otherwise shrugs off. Without this the engine logs the
+    publish as done and the run passes while the message is dropped — the
+    state it ran in for eight hours on 2026-09-26, between the release that
+    began publishing `episode.*` and the nkey gaining the right to it. No
+    episode event fell due in that window, so nothing was lost, which is
+    precisely what nobody could have told from the logs.
     """
 
 
