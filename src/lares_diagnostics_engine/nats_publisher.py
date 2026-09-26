@@ -15,6 +15,19 @@ from .slug import entity_slug
 log = get_logger(__name__)
 
 
+class PublishRejectedError(RuntimeError):
+    """The server refused a publish — an nkey without the right to that
+    subject, in every case seen so far.
+
+    Core NATS acknowledges nothing, so a refusal is not a failed call: it
+    arrives as an asynchronous `-ERR` that nats-py hands to the connection's
+    error callback and otherwise shrugs off. Without this the engine logged
+    the publish as done and the run passed, while the message was dropped —
+    which is what happened for eight runs on 2026-09-26, between the engine
+    release and the nkey gaining `episode.>`.
+    """
+
+
 def _connect_opts(settings: Settings) -> dict[str, Any]:
     """Auth precedence: creds-file → NKey-seed-file → user/password →
     anonymous. Mirrors the knx-nats-bridge publisher so operators swap
@@ -39,11 +52,28 @@ def _connect_opts(settings: Settings) -> dict[str, Any]:
 
 
 async def _publish_async(settings: Settings, subject: str, payload: dict[str, Any]) -> None:
-    nc = await nats.connect(**_connect_opts(settings))
+    """One message on one connection, and the refusal made observable.
+
+    The flush is what turns an asynchronous `-ERR` into something this
+    function can see: the server reads PUB and PING in the order they were
+    written, so it answers the publish's error before the ping's pong, and
+    nats-py delivers both to its reader in that same order. Anything the
+    callback collected by the time the flush returns therefore belongs to
+    this publish — which is exactly what the connection-per-publish shape
+    buys, and why it is worth keeping.
+    """
+    refusals: list[Exception] = []
+
+    async def collect(error: Exception) -> None:
+        refusals.append(error)
+
+    nc = await nats.connect(**_connect_opts(settings), error_cb=collect)
     try:
         body = json.dumps(payload, default=str).encode("utf-8")
         await nc.publish(subject, body)
         await nc.flush(timeout=5)
+        if refusals:
+            raise PublishRejectedError(f"{subject}: {refusals[0]}") from refusals[0]
         log.info("nats_publish", subject=subject, bytes=len(body))
     finally:
         await nc.close()

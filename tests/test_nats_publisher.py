@@ -5,13 +5,22 @@ and one pointer per episode event on `episode.<kind>`.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from lares_diagnostics_engine import nats_publisher
 from lares_diagnostics_engine.config import Settings
 from lares_diagnostics_engine.episodes import EpisodeEvent, EventKind
-from lares_diagnostics_engine.nats_publisher import publish_anomaly, publish_episode_event
+from lares_diagnostics_engine.nats_publisher import (
+    PublishRejectedError,
+    publish,
+    publish_anomaly,
+    publish_episode_event,
+)
 
 
 def _settings() -> Settings:
@@ -77,3 +86,66 @@ def test_the_subject_is_the_episode_row_not_a_slugged_address_token() -> None:
         publish_episode_event(_settings(), event)
     (call,) = pub.call_args_list
     assert call.args[2]["subject"] == "EG.Flur"
+
+
+class _FakeClient:
+    """A NATS connection that answers a flush, and hands over an async error
+    while doing so when the server refused what was published."""
+
+    def __init__(self, refusal: Exception | None) -> None:
+        self._refusal = refusal
+        self.error_cb: Any = None
+        self.published: list[tuple[str, bytes]] = []
+        self.flushed = False
+        self.closed = False
+
+    async def publish(self, subject: str, body: bytes) -> None:
+        self.published.append((subject, body))
+
+    async def flush(self, **_kwargs: Any) -> None:
+        # The server answers the PUB's error before the PING's pong, so a
+        # refusal is in hand by the time the flush returns.
+        if self._refusal is not None:
+            await self.error_cb(self._refusal)
+        self.flushed = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _with_bus(refusal: Exception | None) -> tuple[Any, _FakeClient]:
+    client = _FakeClient(refusal)
+
+    async def connect(**opts: Any) -> _FakeClient:
+        client.error_cb = opts["error_cb"]
+        return client
+
+    return connect, client
+
+
+def test_a_refused_publish_raises_instead_of_reporting_success() -> None:
+    # Core NATS acknowledges nothing, so a publish the server refuses — an
+    # nkey without the right to that subject — comes back as an asynchronous
+    # error, never as a failed call. Left unchecked the engine logged
+    # `nats_publish` as if it had worked (it did, for eight runs on
+    # 2026-09-26). The flush's round trip is what makes the refusal visible.
+    connect, client = _with_bus(
+        PermissionError('nats: Permissions Violation for Publication to "episode.appeared"')
+    )
+    with (
+        patch.object(nats_publisher.nats, "connect", connect),
+        pytest.raises(PublishRejectedError, match="episode.appeared"),
+    ):
+        publish(_settings(), "episode.appeared", {"episode_id": 1})
+    assert client.closed is True  # the connection is not leaked by the raise
+
+
+def test_an_accepted_publish_goes_out_and_the_connection_closes() -> None:
+    connect, client = _with_bus(None)
+    with patch.object(nats_publisher.nats, "connect", connect):
+        publish(_settings(), "episode.appeared", {"episode_id": 15510})
+    ((subject, body),) = client.published
+    assert subject == "episode.appeared"
+    assert json.loads(body) == {"episode_id": 15510}
+    assert client.flushed is True
+    assert client.closed is True
